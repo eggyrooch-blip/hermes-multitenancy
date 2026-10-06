@@ -59,6 +59,46 @@ def _ticket_fingerprint(ticket: Any) -> str:
     return _fingerprint(f"{ticket.namespace}\x1f{ticket.event_key}\x1f{ticket.signature}")
 
 
+def _ticket_type_for_adapter(adapter: Any) -> type | None:
+    """Return the ticket class owned by the adapter that issued the ticket.
+
+    The bundled platform loader imports Feishu below a synthetic module name.
+    A later materialization can replace that name in ``sys.modules`` while an
+    already-created adapter still executes methods from the previous module
+    object. Resolving the class through ``load_feishu_module()`` in that state
+    compares an authentic ticket with an unrelated, freshly-created class.
+
+    The issuer method's globals are immutable provenance for the adapter
+    instance: its ``TrustedFeishuIngressTicket`` is the exact class used by
+    ``_issue_trusted_ingress_ticket``. Legacy/test adapters without the core
+    issuer keep the normal module lookup fallback.
+    """
+    issuer = getattr(type(adapter), "_issue_trusted_ingress_ticket", None)
+    issuer_globals = getattr(issuer, "__globals__", None)
+    if isinstance(issuer_globals, dict):
+        ticket_type = issuer_globals.get("TrustedFeishuIngressTicket")
+        if isinstance(ticket_type, type):
+            return ticket_type
+    module = load_feishu_module()
+    ticket_type = getattr(module, "TrustedFeishuIngressTicket", None)
+    return ticket_type if isinstance(ticket_type, type) else None
+
+
+def _deny(reason: str, ticket: Any = None, *, stage: str = "admission") -> None:
+    """Log a stable fail-closed reason without exposing Feishu identifiers."""
+    actor = str(getattr(ticket, "actor_id", "") or "")
+    chat = str(getattr(ticket, "chat_id", "") or "")
+    event = str(getattr(ticket, "event_key", "") or "")
+    logger.warning(
+        "[trusted-ingress] denied stage=%s reason=%s actor_fp=%s chat_fp=%s event_fp=%s",
+        stage,
+        reason,
+        _fingerprint(actor) if actor else "none",
+        _fingerprint(chat) if chat else "none",
+        _fingerprint(event) if event else "none",
+    )
+
+
 def _ticket_is_fresh(ticket: Any, *, now: float | None = None) -> bool:
     checked_at = float(time.time() if now is None else now)
     try:
@@ -245,14 +285,16 @@ def _admit_bot_ticket(
 
 def admit_trusted_feishu_ingress(*, ticket: Any, adapter: Any) -> TrustedFeishuAdmission | None:
     """Bind an authentic ticket to exactly one active route and tool identity."""
-    module = load_feishu_module()
-    ticket_type = getattr(module, "TrustedFeishuIngressTicket", None)
+    ticket_type = _ticket_type_for_adapter(adapter)
     account_id = str(getattr(adapter, "_app_id", "") or "")
     if ticket_type is None or type(ticket) is not ticket_type:
+        _deny("ticket_type", ticket)
         return None
     if not ticket.is_valid(account_id=account_id) or not _ticket_is_fresh(ticket):
+        _deny("ticket_auth_or_freshness", ticket)
         return None
     if ticket.event_kind in {"comment", "vc"}:
+        _deny("bridge_disabled", ticket)
         return None
     if ticket.principal_kind == "bot":
         self_ids = frozenset(
@@ -266,20 +308,25 @@ def admit_trusted_feishu_ingress(*, ticket: Any, adapter: Any) -> TrustedFeishuA
         )
         return _admit_bot_ticket(ticket=ticket, account_id=account_id, self_ids=self_ids)
     if ticket.principal_kind != "human":
+        _deny("principal_kind", ticket)
         return None
 
     from .router import _get_routing_table, _profile_name_to_home
 
     table = _get_routing_table()
     if table is None:
+        _deny("no_routing_table", ticket)
         return None
     context, credential_subject, actor_subject = _resolve_ticket_context(table, ticket)
     if context is None:
+        _deny("no_route_context", ticket)
         return None
     profile_home = _profile_name_to_home(context.profile_name)
     if not profile_home.is_dir():
+        _deny("missing_profile_home", ticket)
         return None
     if not _claim_once(ticket):
+        _deny("claim_once_duplicate", ticket)
         return None
 
     return TrustedFeishuAdmission(
@@ -361,21 +408,28 @@ def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
     ticket = getattr(event, "trusted_feishu_ingress_ticket", None)
     admission = getattr(event, "trusted_feishu_ingress_admission", None)
     if not isinstance(admission, TrustedFeishuAdmission) or not admission.is_authentic():
+        _deny("missing_or_inauthentic_admission", ticket, stage="validation")
         return False
 
-    module = load_feishu_module()
-    ticket_type = getattr(module, "TrustedFeishuIngressTicket", None)
-    if ticket_type is None or type(ticket) is not ticket_type:
-        return False
-    expected_account = ticket.account_id
+    adapter = None
     if gateway is not None:
         from .router import _get_feishu_adapter
 
         adapter = _get_feishu_adapter(gateway)
         if adapter is None:
+            _deny("missing_gateway_adapter", ticket, stage="validation")
             return False
+    ticket_type = _ticket_type_for_adapter(adapter) if adapter is not None else getattr(
+        load_feishu_module(), "TrustedFeishuIngressTicket", None
+    )
+    if ticket_type is None or type(ticket) is not ticket_type:
+        _deny("ticket_type", ticket, stage="validation")
+        return False
+    expected_account = ticket.account_id
+    if adapter is not None:
         expected_account = str(getattr(adapter, "_app_id", "") or "")
     if not ticket.is_valid(account_id=expected_account) or not _ticket_is_fresh(ticket):
+        _deny("ticket_auth_or_freshness", ticket, stage="validation")
         return False
     if getattr(admission, "actor_kind", "user") == "bot":
         return _validate_bot_admission(admission, ticket, event, source)
@@ -404,8 +458,10 @@ def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
         or admission.chat_id != ticket.chat_id
         or admission.message_id != ticket.message_id
     ):
+        _deny("event_binding", ticket, stage="validation")
         return False
     if admission.ticket_fingerprint != _ticket_fingerprint(ticket):
+        _deny("ticket_fingerprint", ticket, stage="validation")
         return False
 
     from .router import _get_routing_table
@@ -418,7 +474,7 @@ def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
     event_is_group = chat_type in {"group", "topic", "group_chat"}
     event_is_direct = chat_type in {"dm", "p2p", "private"}
     expected_scope = "feishu:bot" if context and context.is_group else "feishu:user"
-    return bool(
+    valid = bool(
         context
         and (event_is_group or event_is_direct)
         and event_is_group == context.is_group
@@ -429,6 +485,9 @@ def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
         and admission.credential_subject == expected_subject
         and admission.tool_scope == expected_scope
     )
+    if not valid:
+        _deny("route_or_scope_recheck", ticket, stage="validation")
+    return valid
 
 
 def install_trusted_feishu_ingress_admission() -> None:
