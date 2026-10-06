@@ -209,6 +209,18 @@ def _start_credential_renewal_subsystem() -> None:
         return
 
     try:
+        from .router import repair_group_profile_feishu_platforms
+
+        repair = repair_group_profile_feishu_platforms(shared_home=shared_home)
+        if repair["updated"]:
+            logger.info(
+                "[multitenancy] disabled duplicate Feishu listeners for %d group profile(s)",
+                repair["updated"],
+            )
+    except Exception:
+        logger.exception("[multitenancy] group Feishu listener repair failed")
+
+    try:
         mt.run_startup_audit(shared_home)
     except Exception:
         logger.exception("[credential_renewal] L5 startup audit failed")

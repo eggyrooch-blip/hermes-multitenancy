@@ -147,6 +147,33 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_p
     assert ("run_broker_server", None) in calls
 
 
+def test_router_startup_repairs_group_feishu_listeners_before_credential_workers(monkeypatch, tmp_path):
+    import hermes_multitenancy
+    from hermes_multitenancy import feishu_uat_auth, plugin_entry, router
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        router,
+        "repair_group_profile_feishu_platforms",
+        lambda **kwargs: calls.append(("repair", kwargs["shared_home"])) or {"updated": 2},
+    )
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "run_startup_audit",
+        lambda home: calls.append(("audit", home)),
+    )
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "ensure_renewal_worker_started",
+        lambda home: calls.append(("worker", home)),
+    )
+
+    plugin_entry._start_credential_renewal_subsystem()
+
+    assert calls == [("repair", tmp_path), ("audit", tmp_path), ("worker", tmp_path)]
+
+
 def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_media_retry(monkeypatch):
     import hermes_multitenancy
     from hermes_multitenancy import feishu_clarify_cards, feishu_media_retry
