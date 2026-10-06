@@ -3,9 +3,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import logging
 import sys
 import time
-from types import ModuleType, SimpleNamespace as NS
+from types import FunctionType, ModuleType, SimpleNamespace as NS
 
 import pytest
 
@@ -122,6 +123,58 @@ def test_group_route_binds_bot_scope(routes, tmp_path):
     assert admission.profile_name == "profile_group"
     assert admission.credential_subject == "cli_trusted"
     assert admission.tool_scope == "feishu:bot"
+
+
+def test_ticket_type_is_bound_to_issuing_adapter_not_reloaded_module(routes, monkeypatch):
+    """A synthetic-module replacement must not invalidate an authentic ticket."""
+
+    def issuer_template(self):
+        return TrustedFeishuIngressTicket
+
+    issuer = FunctionType(
+        issuer_template.__code__,
+        {"TrustedFeishuIngressTicket": FakeTicket},
+        name=issuer_template.__name__,
+    )
+    bound_adapter_type = type(
+        "BoundAdapter",
+        (),
+        {
+            "_app_id": "cli_trusted",
+            "_issue_trusted_ingress_ticket": issuer,
+        },
+    )
+    replacement_ticket_type = type("ReplacementTicket", (), {})
+    monkeypatch.setattr(
+        ingress,
+        "load_feishu_module",
+        lambda: NS(TrustedFeishuIngressTicket=replacement_ticket_type),
+    )
+
+    admission = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_a", "evt_module_replaced"),
+        adapter=bound_adapter_type(),
+    )
+
+    assert admission is not None
+    assert admission.profile_name == "profile_a"
+
+
+def test_human_denial_logs_only_reason_and_fingerprints(routes, caplog):
+    caplog.set_level(logging.WARNING, logger=ingress.logger.name)
+    actor_id = "ou_raw_identifier_must_not_leak"
+    chat_id = "oc_raw_identifier_must_not_leak"
+
+    assert ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket(actor_id, "evt_redacted", chat_id=chat_id),
+        adapter=FakeAdapter(),
+    ) is None
+
+    assert "reason=no_route_context" in caplog.text
+    assert "actor_fp=" in caplog.text
+    assert "chat_fp=" in caplog.text
+    assert actor_id not in caplog.text
+    assert chat_id not in caplog.text
 
 
 @pytest.mark.parametrize(
