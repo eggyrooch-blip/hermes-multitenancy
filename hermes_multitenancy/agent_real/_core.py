@@ -4610,13 +4610,7 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
         from tools import env_passthrough as env_passthrough_mod
 
         env_passthrough_mod.register_env_passthrough(env_names)
-        # Hermes' passthrough registry is ContextVar-backed. Tool execution can
-        # hop into worker threads, where that context is not always inherited, so
-        # credential env vars also need a process-level allowlist entry.
-        config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
-        merged = set(config_passthrough or ())
-        merged.update(env_names)
-        setattr(env_passthrough_mod, "_config_passthrough", frozenset(merged))
+        _merge_process_wide_env_passthrough(env_passthrough_mod, env_names)
         logger.info(
             "[multitenancy] registered credential env passthrough profile=%s count=%d",
             profile_home.name,
@@ -4633,10 +4627,39 @@ def _register_env_passthrough_process_wide(env_names: list[str]) -> None:
     from tools import env_passthrough as env_passthrough_mod
 
     env_passthrough_mod.register_env_passthrough(env_names)
+    _merge_process_wide_env_passthrough(env_passthrough_mod, env_names)
+
+
+def _merge_process_wide_env_passthrough(env_passthrough_mod: Any, env_names: list[str]) -> None:
+    """Extend Hermes' worker-thread fallback without changing its cache shape.
+
+    Hermes <=0.21.2 exposed a single ``frozenset`` here. Newer releases cache
+    one frozenset per HERMES_HOME. Replacing the newer dict with a frozenset
+    makes every terminal/execute_code spawn fail at ``.get(home_key)``.
+    """
     # Hermes' passthrough registry is ContextVar-backed. Tool execution can hop
     # into worker threads, where that context is not always inherited, so these
     # broker-managed handle env vars also need a process-level allowlist entry.
     config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
+    if isinstance(config_passthrough, dict):
+        try:
+            from hermes_constants import hermes_home_key
+
+            home_key = hermes_home_key()
+        except ImportError:
+            # Transitional Hermes builds gained the home-keyed dict before
+            # exporting hermes_home_key(). Match its normalized path key.
+            from hermes_constants import get_hermes_home
+
+            home_key = os.path.normcase(
+                str(get_hermes_home().expanduser().resolve(strict=False))
+            )
+        except (RuntimeError, OSError):
+            home_key = ""
+        merged = set(config_passthrough.get(home_key) or ())
+        merged.update(env_names)
+        config_passthrough[home_key] = frozenset(merged)
+        return
     merged = set(config_passthrough or ())
     merged.update(env_names)
     setattr(env_passthrough_mod, "_config_passthrough", frozenset(merged))

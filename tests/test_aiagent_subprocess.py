@@ -1233,6 +1233,31 @@ credentials:
     )
 
 
+def test_process_wide_env_passthrough_preserves_home_keyed_cache(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    registered: list[list[str]] = []
+    home_cache: dict[str, frozenset[str]] = {}
+    fake_env_passthrough = SimpleNamespace(
+        register_env_passthrough=lambda names: registered.append(list(names)),
+        _config_passthrough=home_cache,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
+
+    agent_real._register_env_passthrough_process_wide(["GOOGLE_TENANTS_FILE"])
+
+    assert registered == [["GOOGLE_TENANTS_FILE"]]
+    assert fake_env_passthrough._config_passthrough is home_cache
+    assert list(home_cache.values()) == [frozenset({"GOOGLE_TENANTS_FILE"})]
+
+
 def test_apply_runtime_env_for_aiagent_restores_credential_env(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.credentials import CredentialStore
@@ -6126,6 +6151,63 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
     assert observed["async_delivery_supported"] is False
 
 
+def test_run_with_aiagent_marks_feishu_session_async_delivery_unsupported(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+    observed: dict[str, object] = {}
+    async_delivery_state = contextvars.ContextVar("async_delivery_state", default=True)
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(kwargs)
+        return async_delivery_state.set(bool(kwargs.get("async_delivery", True)))
+
+    def clear_session_vars(token):
+        async_delivery_state.reset(token)
+
+    def async_delivery_supported():
+        return async_delivery_state.get()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=clear_session_vars,
+        async_delivery_supported=async_delivery_supported,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            from gateway.session_context import async_delivery_supported
+
+            observed["async_delivery_supported"] = async_delivery_supported()
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
+    assert captured_session_vars
+    assert captured_session_vars[0]["async_delivery"] is False
+    assert observed["async_delivery_supported"] is False
+
+
 def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.run_models import RunRequest
@@ -6562,7 +6644,7 @@ def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypa
     assert "Local image path for tools: uploads/receipt.png" in user_message
 
 
-def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tmp_path: Path):
+def test_run_with_aiagent_disables_async_delivery_for_feishu_oneshot(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -6603,7 +6685,7 @@ def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tm
 
     assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
     assert captured_session_vars
-    assert captured_session_vars[0]["async_delivery"] is True
+    assert captured_session_vars[0]["async_delivery"] is False
 
 
 def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(

@@ -396,7 +396,10 @@ def _run_with_aiagent(
                 "user_id": str(getattr(source, "user_id", "") or "") if source else "",
                 "user_name": str(getattr(source, "user_name", "") or "") if source else "",
                 "session_key": str(gateway_session_key),
-                "async_delivery": (platform_key != "webui"),
+                # Every routed turn runs inside a one-shot AIAgent subprocess.
+                # Detached delegate_task workers die with that subprocess, so
+                # all platforms must join delegated work before returning.
+                "async_delivery": False,
             }
             try:
                 session_tokens = set_session_vars(**session_var_kwargs)
