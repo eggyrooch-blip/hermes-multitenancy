@@ -6562,7 +6562,7 @@ def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypa
     assert "Local image path for tools: uploads/receipt.png" in user_message
 
 
-def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tmp_path: Path):
+def test_run_with_aiagent_disables_async_delivery_for_feishu_oneshot(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -6603,7 +6603,7 @@ def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tm
 
     assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
     assert captured_session_vars
-    assert captured_session_vars[0]["async_delivery"] is True
+    assert captured_session_vars[0]["async_delivery"] is False
 
 
 def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(
