@@ -108,6 +108,23 @@ def test_todo_write_only_pushes_one_tool_event():
     assert len(adapter.tool_started_calls) == 1
 
 
+def test_todo_list_write_only_pushes_one_tool_event():
+    adapter = _FakeAdapter()
+    _run(
+        _update_feishu_stream_tool_event(
+            adapter,
+            "chat-1",
+            "msg-1",
+            {"name": "todo_list", "args": {"todos": _todos("completed", "in_progress")}},
+            mode="card",
+            completed=False,
+        )
+    )
+    assert adapter.status_calls == []
+    assert len(adapter.tool_started_calls) == 1
+    assert adapter.tool_started_calls[0]["tool_name"] == "todo_list"
+
+
 def test_non_todo_tool_and_todo_read_never_touch_status():
     adapter = _FakeAdapter()
     _run(
@@ -267,6 +284,88 @@ def test_repeated_todo_writes_update_one_tool_row(monkeypatch):
     capped_panel = json.dumps(build_live_tool_use_panel(state["tools"]), ensure_ascii=False)
     assert capped_panel.count("**Todo") == 1
     assert "任务进度 3/3 ✅✅✅" in capped_panel
+
+
+def test_todo_list_and_legacy_todo_share_one_stable_tool_row(monkeypatch):
+    writes: list[tuple[str, str]] = []
+
+    async def fake_element(_adapter, _card_id, element_id, content, _sequence):
+        writes.append((element_id, content))
+
+    async def body_write_must_not_run(*_args, **_kwargs):
+        raise AssertionError("todo progress must not write streaming_content")
+
+    monkeypatch.setattr(streaming_mod, "_stream_cardkit_element", fake_element)
+    monkeypatch.setattr(streaming_mod, "_stream_cardkit_content", body_write_must_not_run)
+
+    async def exercise():
+        adapter = SimpleNamespace()
+        state = _new_state()
+        state["card_id"] = "card-1"
+        _states(adapter)["msg-1"] = state
+
+        await streaming_mod._update_streaming_card_tool_started(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo_list",
+            args={"todos": _todos("in_progress", "pending")},
+        )
+        first_progress = state["tools"][0]["todo_progress"]
+
+        # A todo_list read has no todos payload and must retain the current row.
+        await streaming_mod._update_streaming_card_tool_started(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo_list",
+            args=None,
+        )
+        assert state["tools"][0]["todo_progress"] == first_progress
+
+        await streaming_mod._update_streaming_card_tool_started(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo_list",
+            args={"todos": _todos("completed", "in_progress")},
+        )
+        await streaming_mod._update_streaming_card_tool_completed(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo_list",
+            duration=0.01,
+        )
+
+        # A legacy event must resolve to the same canonical progress row.
+        await streaming_mod._update_streaming_card_tool_started(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo",
+            args={"todos": _todos("completed", "completed")},
+        )
+        await streaming_mod._update_streaming_card_tool_completed(
+            adapter,
+            chat_id="chat-1",
+            message_id="msg-1",
+            tool_name="todo",
+            duration=0.02,
+        )
+        return state
+
+    state = _run(exercise())
+    assert len(state["tools"]) == 1
+    assert state["tools"][0]["name"] == "todo"
+    assert state["tools"][0]["status"] == "done"
+    assert state["tools"][0]["todo_progress"].startswith("任务进度 2/2 ✅✅")
+    assert len(writes) == 6
+    assert {element_id for element_id, _content in writes} == {"tool_calls"}
+
+    final_panel = json.dumps(build_live_tool_use_panel(state["tools"]), ensure_ascii=False)
+    assert final_panel.count("**Todo") == 1
+    assert "任务进度 2/2 ✅✅" in final_panel
 
 
 def test_malformed_todo_replaces_stale_progress_with_ordinary_row(monkeypatch):

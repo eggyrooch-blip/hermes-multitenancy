@@ -78,6 +78,12 @@ from .unavailable_guard import UnavailableGuard
 logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
 _FLUSH_CONTROLLERS_ATTR = "_hermes_mt_streaming_flush_controllers"
 _NATIVE_RECOVERY_WRAPPED_ATTR = "_hermes_mt_native_streaming_recovery_wrapped"
+_TODO_TOOL_NAMES = frozenset({"todo", "todo_list"})
+
+
+def _canonical_streaming_tool_name(tool_name: str) -> str:
+    """Keep old and Hermes 0.21 todo events on the same display row."""
+    return "todo" if tool_name in _TODO_TOOL_NAMES else tool_name
 
 
 def _is_terminal_state(state: dict[str, Any]) -> bool:
@@ -529,7 +535,7 @@ async def _update_streaming_card_tool_started(
     async with _card_write_lock(state):
         if _is_terminal_state(state):
             return _result(True, message_id=str(message_id))
-        name = str(tool_name or "tool")
+        name = _canonical_streaming_tool_name(str(tool_name or "tool"))
         row = {
             "name": name,
             "status": "running",
@@ -598,7 +604,7 @@ async def _update_streaming_card_tool_completed(
     async with _card_write_lock(state):
         if _is_terminal_state(state):
             return _result(True, message_id=str(message_id))
-        name = str(tool_name or "tool")
+        name = _canonical_streaming_tool_name(str(tool_name or "tool"))
         for tool in reversed(state["tools"]):
             if tool.get("name") == name and (
                 name == "todo" or tool.get("status") == "running"

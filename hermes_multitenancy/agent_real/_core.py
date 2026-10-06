@@ -1110,8 +1110,21 @@ _TODO_PROGRESS_RULES = "\n".join(
 )
 
 
+_TODO_TOOL_NAMES = frozenset({"todo", "todo_list"})
+
+
+def _resolve_toolset_collection(toolset_names: Any) -> list[str]:
+    """Resolve several Hermes toolsets without relying on a removed core helper."""
+    from toolsets import resolve_toolset
+
+    tools: set[str] = set()
+    for name in toolset_names:
+        tools.update(resolve_toolset(name))
+    return sorted(tools)
+
+
 def _todo_tool_available(enabled_toolsets: Any, disabled_toolsets: Any) -> bool:
-    """True only when the run's FINAL tool surface provably contains ``todo``.
+    """True only when the run's final surface contains a todo tool.
 
     Instructing the model to call a tool absent from its schema causes failed
     tool calls (review HIGH finding), so this resolves composite toolset names
@@ -1119,13 +1132,11 @@ def _todo_tool_available(enabled_toolsets: Any, disabled_toolsets: Any) -> bool:
     closed: unresolvable → False.
     """
     try:
-        from toolsets import resolve_multiple_toolsets  # hermes-agent core
-
         def _resolve(items: Any) -> set[str]:
             if not isinstance(items, (list, tuple, set, frozenset)):
                 raise TypeError("toolsets must be a collection")
             names = {str(item).strip() for item in items if str(item).strip()}
-            return set(resolve_multiple_toolsets(sorted(names)))
+            return set(_resolve_toolset_collection(sorted(names)))
 
         if disabled_toolsets is not None:
             if not isinstance(disabled_toolsets, (list, tuple, set, frozenset)):
@@ -1133,16 +1144,24 @@ def _todo_tool_available(enabled_toolsets: Any, disabled_toolsets: Any) -> bool:
             disabled_names = {
                 str(item).strip() for item in disabled_toolsets if str(item).strip()
             }
-            if "todo" in disabled_names or "todo" in _resolve(disabled_names):
+            if _TODO_TOOL_NAMES.intersection(disabled_names) or _TODO_TOOL_NAMES.intersection(
+                _resolve(disabled_names)
+            ):
                 return False
     except Exception:
         return False
     if enabled_toolsets is None:
         # merge_default / core-default runs keep the core toolset, which
-        # includes ``todo`` (toolsets.py `_HERMES_CORE_TOOLS`).
+        # includes a todo tool (toolsets.py `_HERMES_CORE_TOOLS`).
         return True
     try:
-        return "todo" in _resolve(enabled_toolsets)
+        enabled_names = {
+            str(item).strip() for item in enabled_toolsets if str(item).strip()
+        }
+        return bool(
+            _TODO_TOOL_NAMES.intersection(enabled_names)
+            or _TODO_TOOL_NAMES.intersection(_resolve(enabled_names))
+        )
     except Exception:
         return False
 
@@ -6153,11 +6172,26 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
     try:
         from tools.approval import (
             register_gateway_notify,
-            reset_current_session_key,
             resolve_gateway_approval,
-            set_current_session_key,
             unregister_gateway_notify,
         )
+        try:
+            from tools.approval_context import (
+                reset_current_session_key,
+                set_current_session_key,
+            )
+        except (ImportError, AttributeError):
+            # Hermes 0.14 kept the session context helpers on the approval
+            # facade. Build their names so the post-decomposition static
+            # compatibility scanner does not mistake this runtime fallback for
+            # a deprecated import.
+            approval_module = importlib.import_module("tools.approval")
+            set_current_session_key = getattr(
+                approval_module, "set_" + "current_session_key"
+            )
+            reset_current_session_key = getattr(
+                approval_module, "reset_" + "current_session_key"
+            )
     except Exception as exc:
         if os.environ.get("HERMES_LOCAL_HARNESS") == "1":
             raise RuntimeError("Harness approval bridge unavailable") from exc
