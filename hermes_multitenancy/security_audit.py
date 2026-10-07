@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,8 @@ def security_audit_path() -> Path:
     raw = os.getenv("HERMES_MT_SECURITY_AUDIT_PATH")
     if raw and raw.strip():
         return Path(raw).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Logs/hermes/multitenancy-security.jsonl"
     return DEFAULT_AUDIT_PATH
 
 

@@ -325,7 +325,9 @@ def test_submit_failure_marks_job_failed_and_releases_claim(tmp_path, monkeypatc
     assert scheduler.advanced == [("owner", "job1")]
     assert scheduler.calls[0][0] == "save"
     assert "executor down" in scheduler.calls[0][2]
-    assert scheduler.calls[1] == ("deliver", "job1", "failed: cron submit failed: executor down")
+    assert scheduler.calls[1] == (
+        "deliver", "job1", "⚠️ Cron 'Job' failed: cron submit failed: executor down"
+    )
     assert scheduler.calls[2] == (
         "mark",
         "job1",
@@ -571,6 +573,205 @@ class TerminalCronJobs(FakeCronJobs):
 
     def save_jobs(self, jobs: list[dict]) -> None:
         self.jobs = [dict(job) for job in jobs]
+
+
+@pytest.mark.parametrize("error,end_reason,should_deliver", [
+    ("deferred: feishu UAT needs reauth (refresh_rejected)", "deferred", True),
+    ("isolated runner failed", "execution_error", True),
+    ("API_KEY=sk-1234567890abcdefghijklmnopqrstuvwxyz1234567890", "execution_error", True),
+])
+def test_failed_callback_keeps_worker_alive_without_profile_plugin_discovery(
+    tmp_path, monkeypatch, error, end_reason, should_deliver,
+):
+    profile = _profile(tmp_path / "profiles", "owner")
+    marker = profile / "owner.needs_reauth"
+    marker.write_text('{"reason":"refresh_rejected","authoritative":true}')
+    marker_before = marker.read_bytes(), marker.stat().st_mtime_ns
+    cron_jobs = TerminalCronJobs([
+        {"id": "job1", "name": "Daily", "last_delivery_message_id": "om_stale"}
+    ])
+    scheduler = FinalizeScheduler()
+
+    def unsafe_core_summary(*_args):
+        raise SystemExit("tenant plugin discovery must never run in finalization")
+
+    scheduler._summarize_cron_failure_for_delivery = unsafe_core_summary
+    monkeypatch.setenv("HERMES_HOME", "/router/home")
+    monkeypatch.setenv("HERMES_PROFILE", "multitenancy_router")
+    result = {"success": False, "output": "full diagnostic", "final_response": "", "error": error}
+    in_flight = {(profile.name, "job1")}
+    tick_lock = FakeTickLock()
+    claim = cron_worker._ProfileTickClaim(tick_lock)
+    claim.add_future()
+    claim.close_submissions()
+    released, completed = threading.Event(), threading.Event()
+    callback_errors, worker_ids = [], []
+
+    def run():
+        worker_ids.append(threading.get_ident())
+        assert released.wait(timeout=3)
+        return result
+
+    def complete(future):
+        try:
+            cron_worker._complete_claimed_cron_job(
+                future, cron_jobs=cron_jobs, cron_scheduler=scheduler,
+                profile_dir=profile, jobs_file=profile / "cron/jobs.json",
+                job={"id": "job1", "name": "Daily"}, adapters={}, loop=None,
+                patch_lock=threading.Lock(), in_flight=in_flight,
+                key=(profile.name, "job1"), in_flight_lock=threading.Lock(),
+                profile_claim=claim,
+            )
+        except BaseException as exc:
+            callback_errors.append(exc)
+            raise
+        finally:
+            completed.set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run)
+        future.add_done_callback(complete)
+        released.set()
+        assert completed.wait(timeout=3)
+        assert callback_errors == []
+        assert executor.submit(threading.get_ident).result(timeout=3) == worker_ids[0]
+
+    assert in_flight == set() and tick_lock.released
+    assert os.environ["HERMES_HOME"] == "/router/home"
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == marker_before
+    assert cron_jobs.jobs[0]["last_end_reason"] == end_reason
+    assert "last_delivery_message_id" not in cron_jobs.jobs[0]
+    assert any(call[0] == "deliver" for call in scheduler.calls) is should_deliver
+    if error.startswith("API_KEY="):
+        delivered = next(call[3] for call in scheduler.calls if call[0] == "deliver")
+        assert error.split("=", 1)[1] not in delivered
+    if end_reason == "deferred":
+        delivered = next(call[3] for call in scheduler.calls if call[0] == "deliver")
+        assert "/feishu_auth" in delivered
+        assert "refresh_rejected" not in delivered and "deferred:" not in delivered
+    assert scheduler.calls[-1] == ("mark", "owner", "job1", False, error, None)
+
+
+_REAUTH_ERROR = "deferred: feishu UAT needs reauth (refresh_rejected)"
+
+
+def _write_deferred_marker(
+    profile: Path, job_id: str, marker_path: str, marker_ts: int, reason: str = "refresh_rejected",
+) -> None:
+    # Shape written by cron/reauth.py for every deferred dispatch.
+    output = profile / "cron" / "output"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f"{job_id}.deferred.json").write_text(json.dumps({
+        "deferred": True, "reason": reason, "marker_path": marker_path,
+        "marker_ts": marker_ts, "job_id": job_id, "owner_open_id": "ou_owner",
+    }), encoding="utf-8")
+
+
+def _finalize_deferred(profile: Path, scheduler, cron_jobs, job_id: str = "job1") -> bool:
+    return cron_worker._finalize_claimed_cron_job(
+        cron_jobs, scheduler, profile, profile / "cron" / "jobs.json",
+        {"id": job_id, "name": "Daily report"},
+        {"success": False, "output": "diag", "final_response": "", "error": _REAUTH_ERROR},
+        adapters={}, loop=None, patch_lock=threading.Lock(),
+    )
+
+
+def test_deferred_reauth_notice_once_per_marker_reason_then_daily(tmp_path, monkeypatch):
+    """UAT-deferred cron is the only reauth reminder left: tell the owner, but never spam."""
+    profile = _profile(tmp_path / "profiles", "owner")
+    marker_path = str(tmp_path / "shared" / "feishu_uat" / "ou_owner.needs_reauth")
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily report"}, {"id": "job2", "name": "Weekly"}])
+    scheduler = FinalizeScheduler()
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr(cron_worker.time, "time", lambda: clock[0])
+    monkeypatch.setenv("HERMES_HOME", "/router/home")
+
+    def delivered():
+        return [call[3] for call in scheduler.calls if call[0] == "deliver"]
+
+    _write_deferred_marker(profile, "job1", marker_path, 111)
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(delivered()) == 1
+    notice = delivered()[0]
+    assert "/feishu_auth" in notice and "Daily report" in notice
+    for leaked in ("refresh_rejected", "deferred:", marker_path, "ou_owner", "needs_reauth"):
+        assert leaked not in notice
+    assert cron_jobs.jobs[0]["last_end_reason"] == "deferred"
+    assert "last_delivery_message_id" not in cron_jobs.jobs[0]
+
+    # Same marker: later runs, and other jobs of the same profile, stay quiet.
+    clock[0] += 3600
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    _write_deferred_marker(profile, "job2", marker_path, 111)
+    assert _finalize_deferred(profile, scheduler, cron_jobs, "job2") is True
+    assert len(delivered()) == 1
+    assert [job["last_end_reason"] for job in cron_jobs.jobs] == ["deferred", "deferred"]
+
+    # A renewal tick rewrote the marker (new ts, same reason) between two
+    # deferred runs: still the same cause, still quiet.
+    clock[0] += 600
+    _write_deferred_marker(profile, "job1", marker_path, 171)
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    clock[0] += 600
+    _write_deferred_marker(profile, "job1", marker_path, 231)
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(delivered()) == 1
+
+    # A different reason on the marker is news.
+    _write_deferred_marker(profile, "job1", marker_path, 291, reason="empty_refresh_token")
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(delivered()) == 2
+    _write_deferred_marker(profile, "job1", marker_path, 351, reason="empty_refresh_token")
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(delivered()) == 2
+
+    # The same cause persisting for a day earns one reminder, not one per run.
+    clock[0] += 24 * 3600
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(delivered()) == 3
+    assert os.environ["HERMES_HOME"] == "/router/home"
+
+
+def test_reauth_notice_state_uses_unique_tmp_then_atomic_replace(tmp_path, monkeypatch):
+    cron_jobs = SimpleNamespace(CRON_DIR=str(tmp_path))
+    replaced = []
+    real_replace = cron_worker.os.replace
+
+    def spy_replace(src, dst):
+        replaced.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(cron_worker.os, "replace", spy_replace)
+    cron_worker._record_reauth_notice(cron_jobs, "k1", 1.0)
+    cron_worker._record_reauth_notice(cron_jobs, "k2", 2.0)
+
+    assert len(replaced) == 2 and replaced[0] != replaced[1]
+    assert all(f".{os.getpid()}." in name and name.endswith(".tmp") for name in replaced)
+    assert json.loads((tmp_path / "reauth_notice.json").read_text()) == {"key": "k2", "sent_at": 2.0}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["reauth_notice.json"]
+
+
+def test_deferred_reauth_notice_failure_keeps_worker_and_retries_next_run(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "owner")
+    _write_deferred_marker(profile, "job1", "/shared/feishu_uat/ou_owner.needs_reauth", 111)
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily report"}])
+    scheduler = FinalizeScheduler()
+    attempts = []
+
+    def failing_delivery(job, content, *, adapters=None, loop=None):
+        attempts.append(content)
+        raise RuntimeError("feishu 99991663 app_secret=SENTINEL_APP_SECRET")
+
+    scheduler._deliver_result = failing_delivery
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert cron_jobs.jobs[0]["last_end_reason"] == "deferred"
+    mark = scheduler.calls[-1]
+    assert mark[:5] == ("mark", "owner", "job1", False, _REAUTH_ERROR)
+    assert "SENTINEL_APP_SECRET" not in attempts[0]
+    # Not recorded as sent, so the next deferred run tries again.
+    assert _finalize_deferred(profile, scheduler, cron_jobs) is True
+    assert len(attempts) == 2
 
 
 def test_finalize_records_delivery_error_terminal_and_alert_for_unconfirmed_send(

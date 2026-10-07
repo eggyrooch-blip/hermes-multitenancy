@@ -22,6 +22,17 @@ STATE_FILE="${STATE_FILE:-$HOME/.hermes/deployed-release}"
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/backups/pre-release}"
 LOCK="${LOCK:-$HOME/.hermes/.release.lock}"
 KEEP_RELEASES="${KEEP_RELEASES:-3}"
+# 发布前回滚包保留几份。一份 ~170MB，133 份 = 22G（2026-09-21 实测），
+# 而 hermes-backup.sh 自己的 prune() 够不着这一层（见 prune_prerelease_backups）。
+# 不设 = 一份都不裁：「不删备份」是红线，上限只能由 sunke 显式打开（2026-09-24）。
+KEEP_PRERELEASE_BACKUPS="${KEEP_PRERELEASE_BACKUPS:-}"
+# 版本目录裁剪除了「当前 + 上一版」还要认两类依赖（2026-09-24 core 0.21.4 切换）：
+#   钉住清单 $RELEASES/.keep-pins —— 每行一个目录名，# 注释；发布器只读不写，缺文件 = 空
+#   活配置引用 —— 固定位置的配置里写死的 $RELEASES/<目录>（router/profile config.yaml
+#   的 MCP 命令、gateway drop-in）。只读这几个已知路径，不做全盘扫描（机械盘 IOPS）。
+KEEP_PINS="${KEEP_PINS:-$RELEASES/.keep-pins}"
+RELEASE_REF_HERMES_HOME="${RELEASE_REF_HERMES_HOME:-$HOME/.hermes}"
+RELEASE_REF_SYSTEMD_DIR="${RELEASE_REF_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
 PROBES="${PROBES:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-release-probes.sh}"
 BACKUP_SH="${BACKUP_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-backup.sh}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl --user}"
@@ -46,6 +57,14 @@ RELAY_PKG_DIR="${RELAY_PKG_DIR:-/opt/hermes-agent-relay/venv/lib/python3.11/site
 RELAY_RESTART="${RELAY_RESTART:-sudo -n systemctl restart hermes-agent-relay.service}"
 RELAY_IS_ACTIVE="${RELAY_IS_ACTIVE:-systemctl is-active --quiet hermes-agent-relay.service}"
 RELAY_PROBE_URL="${RELAY_PROBE_URL:-http://127.0.0.1:8770/v1/messages/__release_probe__}"
+# relay 自己 venv 里的解释器：拷完文件、重启之前先用它 import 一次。2026-09-17
+# release-20260917-02：agent_relay_store.py 新增 `from .shared_db import …`，
+# shared_db.py 不在同步清单里，重启后新进程 ModuleNotFoundError 崩溃循环 16 次，
+# 探针等满 90s 才判失败 —— 那 90 秒 relay 已经死了。预检在老进程还活着时把它拦下。
+RELAY_PY="${RELAY_PY:-/opt/hermes-agent-relay/venv/bin/python}"
+# 扫依赖用的解释器（只做 ast 静态分析，不 import 任何东西），跟 relay 的 venv 无关。
+RELAY_SCAN_PY="${RELAY_SCAN_PY:-python3}"
+RELAY_IMPORT_TARGET="${RELAY_IMPORT_TARGET:-hermes_agent_relay_runtime.agent_relay}"
 # 打一次已注册的路由，把 HTTP 状态码打到 stdout。--noproxy 是硬性的：
 # 本机的 http_proxy 已经把这类探针坑成 000 好几次了。
 _relay_curl_probe() {
@@ -72,6 +91,22 @@ RELAY_PROBE_TIMEOUT="${RELAY_PROBE_TIMEOUT:-90}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ── 与 core 配对切换的两个开关（默认 1 = 行为不变）─────────────────────
+# core 与 MT 在同一次停服里一起换时（2026-09-24 core 0.21.4），自动回滚会把旧 MT
+# 装进【新 core 的 venv】再起服务 —— 旧 MT 在新 core 上已知会坏，而旧版探针只查端口
+# 之类，可能判 ROLLED_BACK 假绿。所以配对切换时：
+#   AUTO_ROLLBACK=0  任何一处失败都不翻回 MT/WebUI、不重装旧 editable，只停服务、
+#                    记 outcome=NEEDS_HUMAN_CORE_PAIRED、非零退出，由人整体回退
+#                    core + MT + WebUI + 数据库（停服而不是保持运行：不让半套新版本
+#                    或「旧 MT + 新 core」对外服务）。
+#   DEP_HEAL=0       uv pip check 不过直接判失败，不带依赖重装（那会让 MT 重新解析、
+#                    改写 core 的依赖环境）。
+# 只认 0/1：拼错成 false/no 不能被静默当成「开着」。
+AUTO_ROLLBACK="${AUTO_ROLLBACK:-1}"
+DEP_HEAL="${DEP_HEAL:-1}"
+case "$AUTO_ROLLBACK" in 0|1) ;; *) die "AUTO_ROLLBACK 只能是 0 或 1（现在是 '$AUTO_ROLLBACK'）" ;; esac
+case "$DEP_HEAL" in 0|1) ;; *) die "DEP_HEAL 只能是 0 或 1（现在是 '$DEP_HEAL'）" ;; esac
 
 mkdir -p "$RELEASES" "$BACKUP_ROOT" "$(dirname "$STATE_FILE")"
 # Linux(生产)用 flock：进程被 kill 时内核自动释放，不会留死锁。
@@ -263,6 +298,128 @@ SKIP_PROFILES=1 BACKUP_ROOT="$SNAP" "$BACKUP_SH" >"$SNAP/backup.log" 2>&1 \
   done; } > "$SNAP/ROLLBACK.txt"
 log "  回滚锚点已记录"
 
+# ── 裁剪历史回滚包 ───────────────────────────────────────────────────
+# hermes-backup.sh 自己的 prune() 是相对 BACKUP_ROOT 的，而这条路径把
+# BACKUP_ROOT 顶成了 $SNAP（每个 tag 一个目录）—— 于是它只在单个 tag 内裁剪，
+# 从不删旧 tag，133 份、22G 只增不减。保留规则只能落在这一层。
+#
+# 保护名单跟版本目录裁剪同源：按【绝对路径精确比对】，当前 tag 与回滚锚点
+# （= 此刻真正在跑的那个 tag，ROLLBACK.txt 里 tag= 的那一行）永不删。
+# 只动 $BACKUP_ROOT 的【直接子目录】里名字形如 release-* 的；别的一律留着 ——
+# 误删一次就是把出事时唯一的退路删掉，宁可留垃圾。
+#
+# 受保护的那两份【先占名额】，剩下的名额才按 mtime 从新到旧分给普通目录。
+# 第一版是"数够 keep_n 就开始删、遇到受保护的额外放过"，于是回滚锚点一旦是
+# 最老的那份，结果就是 keep_n+1 份 —— 上限形同虚设，盘照样慢慢涨。
+prune_prerelease_backups() {
+  local root="$1" keep_tag="$2" prev_tag="$3"
+  local keep_n="${KEEP_PRERELEASE_BACKUPS:-}"
+  [ -d "$root" ] || return 0
+  if [ -z "$keep_n" ]; then
+    log "  未设 KEEP_PRERELEASE_BACKUPS，不裁回滚包（不删备份；要裁须显式设正整数）"
+    return 0
+  fi
+  case "$keep_n" in
+    ''|*[!0-9]*) log "  KEEP_PRERELEASE_BACKUPS=$keep_n 不是正整数，跳过裁剪"; return 0 ;;
+  esac
+  [ "$keep_n" -ge 1 ] || { log "  KEEP_PRERELEASE_BACKUPS=$keep_n < 1，跳过裁剪"; return 0; }
+  local root_abs
+  root_abs=$(cd "$root" 2>/dev/null && pwd -P) || return 0
+  local listing
+  # -t = 按 mtime 从新到旧；尾部斜杠让它只列目录。
+  listing=$(ls -1dt "$root_abs"/*/ 2>/dev/null || true)
+  [ -n "$listing" ] || return 0
+  # 先把真实存在的受保护目录点清楚（去重；不存在的不占名额）
+  local prot_a="" prot_b=""
+  case "$keep_tag" in
+    release-*) [ -d "$root_abs/$keep_tag" ] && prot_a="$keep_tag" ;;
+  esac
+  case "$prev_tag" in
+    release-*) [ -d "$root_abs/$prev_tag" ] && [ "$prev_tag" != "$prot_a" ] \
+                 && prot_b="$prev_tag" ;;
+  esac
+  local n_prot=0
+  [ -n "$prot_a" ] && n_prot=$((n_prot + 1))
+  [ -n "$prot_b" ] && n_prot=$((n_prot + 1))
+  local ordinary_slots=$((keep_n - n_prot))
+  if [ "$ordinary_slots" -lt 0 ]; then
+    # 名额比受保护的还少：保护优先，上限让路，但必须说出来，
+    # 否则"为什么还剩 2 份"下次又要有人去翻代码。
+    log "  KEEP_PRERELEASE_BACKUPS=$keep_n 小于受保护的 $n_prot 份（当前 tag + 回滚锚点）—— 只留受保护的这 $n_prot 份"
+    ordinary_slots=0
+  fi
+  local kept=0 removed=0 ordinary_kept=0 d name abs
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    d="${d%/}"
+    name=$(basename "$d")
+    case "$name" in
+      release-*) ;;
+      *) log "  保留 $name（不是 release-* 目录，不裁）"; continue ;;
+    esac
+    # 受保护的两份：名额已经预留好了，永远不删
+    if [ -n "$prot_a" ] && [ "$name" = "$prot_a" ]; then
+      kept=$((kept + 1)); continue
+    fi
+    if [ -n "$prot_b" ] && [ "$name" = "$prot_b" ]; then
+      kept=$((kept + 1)); continue
+    fi
+    if [ "$ordinary_kept" -lt "$ordinary_slots" ]; then
+      ordinary_kept=$((ordinary_kept + 1)); kept=$((kept + 1)); continue
+    fi
+    abs=$(cd "$d" 2>/dev/null && pwd -P) || { log "  跳过 $name（进不去）"; continue; }
+    # 防御：只删直接子目录。软链指到别处时这里会对不上，直接拒。
+    if [ "$abs" != "$root_abs/$name" ]; then
+      log "  拒删 $name —— 解析出的 $abs 不是 $root_abs 的直接子目录"
+      continue
+    fi
+    # 备份目录里可能有 0444 的只读文件，rm -rf 会 permission denied（backup 侧同款坑）
+    chmod -R u+w "$abs" 2>/dev/null || true
+    if rm -rf "$abs"; then
+      removed=$((removed + 1)); log "  裁剪回滚包 $name"
+    else
+      log "  裁剪 $name 失败（保留）"
+    fi
+  done <<< "$listing"
+  log "pre-release 备份保留 ${kept} 份，删除 ${removed} 份"
+}
+prune_prerelease_backups "$BACKUP_ROOT" "$TAG" "$CURRENT"
+
+# 钉住清单：每行一个 $RELEASES 下的目录名，# 起为注释，空白忽略。缺文件 = 空清单。
+release_keep_pins() {
+  [ -f "$KEEP_PINS" ] && [ -r "$KEEP_PINS" ] || return 0
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$KEEP_PINS" 2>/dev/null \
+    | grep -E '^[A-Za-z0-9._-]+$' || true
+}
+
+# 活配置引用：只读固定位置，抽出写死的 $RELEASES/<目录>，输出「目录名<TAB>文件」。
+# 文件缺失、读不了都跳过，不报错、不中止发布。
+release_config_refs() {
+  local hh="$RELEASE_REF_HERMES_HOME" sd="$RELEASE_REF_SYSTEMD_DIR"
+  local files=() f p rel re="" esc
+  for f in "$hh/config.yaml" "$hh"/profiles/*/config.yaml \
+           "$sd"/*.service.d/*.conf "$sd"/*.service; do
+    [ -f "$f" ] && [ -r "$f" ] && files+=("$f")
+  done
+  [ "${#files[@]}" -gt 0 ] || return 0
+  # 同一个目录在配置里可能写成绝对路径、解析后的真实路径、systemd 的 %h 或 ~
+  local prefixes=("$RELEASES")
+  p=$(cd "$RELEASES" 2>/dev/null && pwd -P) && [ "$p" != "$RELEASES" ] && prefixes+=("$p")
+  case "$RELEASES" in
+    "$HOME"/*) rel="${RELEASES#"$HOME"/}"; prefixes+=("%h/$rel" "~/$rel") ;;
+  esac
+  for p in "${prefixes[@]}"; do
+    esc=$(printf '%s' "$p" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+    re="${re:+$re|}$esc"
+  done
+  # 逐文件 grep：文件名直接来自循环变量，不从 grep 输出里解析（路径可能带冒号）
+  for f in "${files[@]}"; do
+    grep -oE "($re)/[A-Za-z0-9._-]+" -- "$f" 2>/dev/null \
+      | while IFS= read -r line; do printf '%s\t%s\n' "${line##*/}" "$f"; done
+  done
+  return 0
+}
+
 # 每个终局都要留下结论。只 exit 1 的话，运维手上只有一份"陈旧的锚点"，
 # 根本看不出这次到底是成功了、回滚了、还是回滚也没成。
 outcome() { printf '%s\n' "outcome=$1" "at=$(date -Is)" >> "$SNAP/ROLLBACK.txt"; }
@@ -273,6 +430,317 @@ build_worktree() {  # $1=canonical 仓  $2=目标目录  $3=sha
   [ -d "$dest" ] && { log "  $dest 已存在，复用"; return 0; }
   git -C "$repo" fetch -q --all --tags 2>/dev/null || true
   git -C "$repo" worktree add -q --detach "$dest" "$sha" || return 1
+}
+
+# ── webui 产物：CI 构建好，生产只解压 ────────────────────────────────
+# 2026-09-21 事故：生产机上 `npm ci + build` 跑了 9.5 分钟，把机械盘的 IO 拖死，
+# 1259 个人在那段时间里干什么都卡。这次构建没有任何理由发生在这台机器上 ——
+# 它是纯函数：同一个 sha 产出同一份 dist。CI（hermes-web-ui 侧）已经把
+# webui-<sha40>.tar.gz 推进 GitLab 的 generic 包仓库，这里只负责取回、校验、解开。
+# 用 gzip 不用 zstd：生产 hermes-1 上没有 zstd 二进制，只有 GNU tar 1.34 + gzip。
+#
+# 三条边界，都是故意的：
+#  1) 失败一律【退回原地构建】而不是 die。包仓库抖一下就发不出版本，比慢更糟。
+#  2) 校验不过 = 当没拿到。删掉下载文件再退回去构建 —— 半个产物比没有产物更危险。
+#  3) token 只从 $HOME/.hermes/release.env 读，且那个文件必须 600 + 本人属主。
+#     文件权限松了就拒用产物（即使 unit 的 EnvironmentFile 已经把 token 灌进环境），
+#     否则「放宽权限」就成了让同机其他用户借走这个 token 的办法。
+WEBUI_PKG_BASE="${WEBUI_PKG_BASE:-https://gitlab.example.com/api/v4/projects/2829/packages/generic/webui-release}"
+RELEASE_ENV="${RELEASE_ENV:-$HOME/.hermes/release.env}"
+
+# 算一个文件的 sha256，只吐 64 位小写 hex。生产是 GNU coreutils 的 sha256sum；
+# 本地跑测试的 mac 上可能只有 BSD 的 shasum。两个都认。
+_sha256_of() {  # $1=文件
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else return 2; fi
+}
+
+# 边车清单严格解析：必须【正好一行】`<64位hex>  <期望的包名>`，文件名还得对得上。
+# 绝不把边车喂给 `sha256sum -c` —— 那样校验的是边车自己写的那个路径，边车里写
+# `/dev/null` 就能让一个从没校验过的包一路通过（codex review P1）。
+_expected_digest() {  # $1=边车文件  $2=期望的包文件名 → 打印 hex
+  local lines digest name rest
+  lines=$(grep -c '[^[:space:]]' "$1" 2>/dev/null) || return 1
+  [ "$lines" = "1" ] || return 1
+  read -r digest name rest < <(grep '[^[:space:]]' "$1")
+  [ -z "$rest" ] || return 1
+  [ "$name" = "$2" ] || return 1
+  digest=$(printf '%s' "$digest" | tr 'A-F' 'a-f')
+  [ "${#digest}" = "64" ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s' "$digest"
+}
+
+# 链接目标是否仍落在包内。纯词法解析，不碰盘。
+# 不能一刀切拒绝 `..`：npm 的 node_modules/.bin/xxx -> ../pkg/bin/xxx 全是这种，
+# 一刀切等于永远用不上产物。要算的是「从链接所在目录出发，规范化之后有没有跑出根」。
+_link_stays_inside() {  # $1=链接在包里的路径  $2=链接目标
+  local base="$1" target="$2" combined part resolved="" IFS=/
+  case "$target" in /*) return 1 ;; esac          # 绝对路径一律拒
+  case "$base" in */*) base="${base%/*}" ;; *) base="" ;; esac
+  combined="${base:+$base/}$target"
+  for part in $combined; do
+    case "$part" in
+      ""|.) continue ;;
+      ..)
+        [ -n "$resolved" ] || return 1            # 已经在根上还要往上 = 跑出去了
+        case "$resolved" in */*) resolved="${resolved%/*}" ;; *) resolved="" ;; esac ;;
+      *) resolved="${resolved:+$resolved/}$part" ;;
+    esac
+  done
+  return 0
+}
+
+# 成员白名单 + 链接目标校验，全部在解包【之前】做。
+# 解包到空目录也挡不住经典的软链穿越（先放 x -> /etc，再放 x/y），所以这道必须前置。
+# 两份清单并排读：-tzf 给干净路径，-tvzf 只用来取类型和链接目标 ——
+# 只解析 -tvzf 的话，带空格的路径会把字段切错。任何解析不出来的情况一律判不合法。
+_validate_archive_members() {  # $1=tar 文件  $2=暂存目录 → 0=全部合法
+  local tarf="$1" plain="$2/.members" verbose="$2/.members-v"
+  local e v typ target norm bad=0
+  tar -tzf "$tarf" > "$plain" 2>/dev/null || return 1
+  tar -tvzf "$tarf" > "$verbose" 2>/dev/null || return 1
+  [ -s "$plain" ] || return 1
+  # 6/7 号 fd：9 号被发布锁占着（exec 9>"$LOCK"），不能碰。
+  exec 6<"$plain" 7<"$verbose"
+  while IFS= read -r e <&6; do
+    IFS= read -r v <&7 || { bad=1; break; }
+    norm="${e#./}"
+    [ -z "$norm" ] && continue                    # 归档根自己
+    case "$norm" in
+      /*) bad=1; break ;;
+      ..|../*|*/../*|*/..) bad=1; break ;;
+    esac
+    case "$norm" in
+      dist|dist/*|node_modules|node_modules/*|package.json|package-lock.json|ARTIFACT.json) ;;
+      *) bad=1; break ;;
+    esac
+    typ="${v:0:1}"
+    case "$typ" in
+      l) target="${v#* -> }";     _link_stays_inside "$norm" "$target" || { bad=1; break; } ;;
+      # 硬链接的目标是相对【归档根】的路径，所以从根上算
+      h) target="${v#* link to }"; _link_stays_inside "ROOT" "$target" || { bad=1; break; } ;;
+    esac
+  done
+  exec 6<&- 7<&-
+  return $bad
+}
+
+# 失败统一出口：说一句、清掉暂存和下载文件。调用方自己 return 1。
+_artifact_abort() {  # $1=日志  $2=暂存目录（可空）  $3..=要删的文件
+  local msg="$1" stage="$2"
+  shift 2
+  log "  $msg"
+  [ -n "$stage" ] && rm -rf "$stage"
+  [ "$#" -gt 0 ] && rm -f "$@"
+  return 1
+}
+
+# 包仓库下载：一个文件，最多两跳。
+#
+# 两条硬约束逼出了这个形状，缺一条都会把 deploy token 送出去：
+#  1) token 不进 argv。`curl -H "DEPLOY-TOKEN: $t"` 会让同机任何用户一条 ps 就读到它
+#     （下载窗口最长 300s）。改成从 stdin 喂 curl 的 config，argv 里只剩一个 `-`。
+#     本脚本任何位置都没有 set -x —— 有的话这份 config 会被原样打进日志。
+#  2) 不用 -L。GitLab 可能把下载 302 到对象存储，而 curl 跟随重定向时会把
+#     --config 里的 header 原样带去那个域名 = 把 token 交给 S3。所以自己走两步：
+#     第一跳带 token 问 GitLab；拿到 3xx 就【不带任何 auth】去取预签名 URL
+#     —— 那个 URL 自己就是凭据，既不该再叠 token，也不该进日志（只记 host）。
+_fetch_pkg_file() {  # $1=url  $2=落地文件  $3=失败说明文件 → 0=拿到了
+  local url="$1" out="$2" err="$3" meta code redirect rhost rc=0
+  : > "$err"
+  # 第一跳故意不带 --fail：要的是 http_code 本身，好把 3xx 和 4xx 分开处理。
+  meta=$(curl --config - --silent --show-error --retry 2 --max-time 300 \
+           -o "$out" -w '%{http_code} %{redirect_url}' "$url" \
+           < <(printf 'header = "DEPLOY-TOKEN: %s"\n' "${HERMES_RELEASE_PKG_TOKEN:-}") \
+           2>>"$err") || rc=$?
+  if [ "$rc" != 0 ]; then
+    printf 'curl %s' "$rc" >> "$err"
+    rm -f "$out"
+    return 1
+  fi
+  code="${meta%% *}"
+  redirect="${meta#* }"
+  case "$code" in
+    2??) return 0 ;;
+    301|302|303|307|308)
+      # 3xx 的响应体是一段重定向说明，不是产物 —— 先删掉再谈第二跳。
+      rm -f "$out"
+      if [ -z "$redirect" ]; then
+        printf 'HTTP %s 但没有 Location' "$code" >> "$err"
+        return 1
+      fi
+      rhost="${redirect#*://}"; rhost="${rhost%%/*}"
+      : > "$err"
+      # 第二跳：没有 --config、没有任何 header。curl 的报错可能带上预签名 URL，
+      # 所以这一跳的 stderr 整个丢掉，只留退出码和目标 host。
+      curl --fail --silent --show-error --retry 2 --max-time 300 -o "$out" "$redirect" 2>/dev/null || rc=$?
+      if [ "$rc" != 0 ]; then
+        printf 'HTTP %s → %s 取失败（curl %s）' "$code" "$rhost" "$rc" >> "$err"
+        rm -f "$out"
+        return 1
+      fi
+      return 0 ;;
+    *)
+      printf 'HTTP %s' "$code" >> "$err"
+      rm -f "$out"
+      return 1 ;;
+  esac
+}
+
+fetch_webui_artifact() {  # $1=webui sha40  $2=目标目录
+  local sha="$1" dest="$2" short="${1:0:8}"
+  local dir="$RELEASES/.artifacts"
+  local tarball="webui-$sha.tar.gz" sums="webui-$sha.sha256"
+  local marker="$dest/.artifact-installing"
+  local stage="" want got emode eowner rc=0
+
+  # 上一次装到一半（进程被杀在两次 mv 中间）留下的树，一个字节都不能复用：
+  # dist/server/index.js 可能已经就位而 node_modules 还缺一半，下面那道
+  # 「dist 在就不构建」的门会被它骗过去，然后带着半套依赖上线（codex review P1）。
+  if [ -f "$marker" ]; then
+    log "  上次产物安装没走完（$marker 还在）—— 清掉 dist/node_modules 重新取"
+    rm -rf "$dest/dist" "$dest/node_modules"
+    rm -f "$marker"
+  fi
+
+  # 校验器先于下载检查：校验不了就别先花掉几百兆下行和一轮盘 IO。
+  # 解包器不用查：gzip 是 tar 自带的，生产和 CI 容器上都在。
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    log "  ARTIFACT SKIPPED: 本机没有 sha256 校验工具 —— 退回原地构建（慢）"
+    return 1
+  fi
+
+  if [ -f "$RELEASE_ENV" ]; then
+    emode=$(stat -c '%a' "$RELEASE_ENV" 2>/dev/null || stat -f '%Lp' "$RELEASE_ENV" 2>/dev/null)
+    eowner=$(stat -c '%U' "$RELEASE_ENV" 2>/dev/null || stat -f '%Su' "$RELEASE_ENV" 2>/dev/null)
+    if [ "$emode" != "600" ]; then
+      log "  ARTIFACT SKIPPED: $RELEASE_ENV 权限是 $emode，必须是 600 —— 退回原地构建（慢）"
+      return 1
+    fi
+    if [ "$eowner" != "$(id -un)" ]; then
+      log "  ARTIFACT SKIPPED: $RELEASE_ENV 属主是 $eowner，必须是 $(id -un) —— 退回原地构建（慢）"
+      return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$RELEASE_ENV" || true
+  fi
+  if [ -z "${HERMES_RELEASE_PKG_TOKEN:-}" ]; then
+    log "  ARTIFACT SKIPPED: no HERMES_RELEASE_PKG_TOKEN —— 退回原地构建（慢）"
+    return 1
+  fi
+
+  mkdir -p "$dir" || { log "  ARTIFACT SKIPPED: 建不出下载目录 $dir —— 退回原地构建（慢）"; return 1; }
+  rm -f "$dir/$tarball" "$dir/$sums" "$dir/curl.err"
+  local base="${WEBUI_PKG_BASE%/}/$sha" f
+  for f in "$tarball" "$sums"; do
+    if ! _fetch_pkg_file "$base/$f" "$dir/$f" "$dir/curl.err"; then
+      log "  ARTIFACT MISSING: $short 取不到 $f（$(tr -d '\n' < "$dir/curl.err" 2>/dev/null)）—— 退回原地构建（慢）"
+      rm -f "$dir/$tarball" "$dir/$sums" "$dir/curl.err"
+      return 1
+    fi
+  done
+  rm -f "$dir/curl.err"
+
+  # 校验：边车自己说了算的东西一个都不信，只信「边车声明的 hex」对上
+  # 「我们自己对这个受控路径算出来的 hex」。
+  want=$(_expected_digest "$dir/$sums" "$tarball") || {
+    _artifact_abort "ARTIFACT CHECKSUM MISMATCH: $short 边车清单不合法（要正好一行 <hex>  $tarball）—— 退回原地构建（慢）" \
+      "" "$dir/$tarball" "$dir/$sums"
+    return 1
+  }
+  got=$(_sha256_of "$dir/$tarball") || {
+    _artifact_abort "ARTIFACT CHECKSUM MISMATCH: $short 算不出 sha256 —— 退回原地构建（慢）" \
+      "" "$dir/$tarball" "$dir/$sums"
+    return 1
+  }
+  if [ "$want" != "$got" ]; then
+    _artifact_abort "ARTIFACT CHECKSUM MISMATCH: $short —— 已删除下载文件，退回原地构建（慢）" \
+      "" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+
+  # 解包进一次性暂存目录，绝不直接落到 checkout 上：被拒的包不许在源码树里
+  # 留下任何东西，否则退回去跑的 npm ci 读的就是攻击者的 package-lock（codex review P1）。
+  stage=$(mktemp -d "$dir/stage.XXXXXX") || {
+    _artifact_abort "ARTIFACT SKIPPED: $short 建不出暂存目录 —— 退回原地构建（慢）" "" "$dir/$tarball" "$dir/$sums"
+    return 1
+  }
+
+  if ! _validate_archive_members "$dir/$tarball" "$stage"; then
+    _artifact_abort "ARTIFACT REJECTED: $short 包里有越界成员（白名单外的路径、.. 或跑出包的链接）—— 退回原地构建（慢）" \
+      "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+
+  rc=0
+  tar -xzf "$dir/$tarball" -C "$stage" 2>"$dir/tar.err" || rc=$?
+  if [ "$rc" != 0 ]; then
+    _artifact_abort "ARTIFACT SKIPPED: $short 解包失败（tar $rc: $(tail -1 "$dir/tar.err" 2>/dev/null)）—— 退回原地构建（慢）" \
+      "$stage" "$dir/$tarball" "$dir/$sums" "$dir/tar.err"
+    return 1
+  fi
+  rm -f "$dir/tar.err"
+
+  # 解完再照着落盘的实际软链复查一遍（清单校验漏解析了也能兜住）。
+  local l lt
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    lt=$(readlink "$l" 2>/dev/null) || lt=""
+    if ! _link_stays_inside "${l#"$stage"/}" "$lt"; then
+      _artifact_abort "ARTIFACT REJECTED: $short 解包后有跑出包的软链 —— 退回原地构建（慢）" \
+        "$stage" "$dir/$tarball" "$dir/$sums"
+      return 1
+    fi
+  done < <(find "$stage" -type l 2>/dev/null)
+
+  if [ ! -f "$stage/dist/server/index.js" ] || [ ! -e "$stage/node_modules/node-pty" ]; then
+    _artifact_abort "ARTIFACT REJECTED: $short 包里缺 dist/server/index.js 或 node_modules/node-pty —— 退回原地构建（慢）" \
+      "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+
+  # 把产物钉死在【这个 sha 的依赖清单】上：package-lock 必须和 checkout 里的逐字节一致。
+  # 少了这条，一个为别的 sha 打的（或被人换过依赖的）包也能装进来。
+  if [ ! -f "$dest/package-lock.json" ] || ! cmp -s "$stage/package-lock.json" "$dest/package-lock.json"; then
+    _artifact_abort "ARTIFACT REJECTED: $short package-lock.json 与 checkout 不一致 —— 退回原地构建（慢）" \
+      "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+  # ARTIFACT.json 得自报同一个 sha。字段名 sha / webui_sha 都认（CI 打包侧的写法），
+  # 但值必须等于本次要发的 sha。
+  if ! grep -Eq "\"(webui_)?sha\"[[:space:]]*:[[:space:]]*\"$sha\"" "$stage/ARTIFACT.json" 2>/dev/null; then
+    _artifact_abort "ARTIFACT REJECTED: $short ARTIFACT.json 里的 sha 对不上 —— 退回原地构建（慢）" \
+      "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+
+  # 安装：两次 rename 之间被杀就会留下半棵树，所以先立标记再动手。
+  # 标记还在 = 下次进来无条件清掉重取，绝不让半套依赖被当成装好了。
+  : > "$marker" || {
+    _artifact_abort "ARTIFACT SKIPPED: $short 写不出安装标记 —— 退回原地构建（慢）" "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  }
+  rm -rf "$dest/dist" "$dest/node_modules"
+  if ! mv "$stage/dist" "$dest/dist" || ! mv "$stage/node_modules" "$dest/node_modules"; then
+    rm -rf "$dest/dist" "$dest/node_modules"
+    rm -f "$marker"
+    _artifact_abort "ARTIFACT SKIPPED: $short 安装失败（mv）—— 退回原地构建（慢）" "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+  if [ ! -f "$dest/dist/server/index.js" ] || [ ! -e "$dest/node_modules/node-pty" ]; then
+    rm -rf "$dest/dist" "$dest/node_modules"
+    rm -f "$marker"
+    _artifact_abort "ARTIFACT SKIPPED: $short 装完自检没过 —— 退回原地构建（慢）" "$stage" "$dir/$tarball" "$dir/$sums"
+    return 1
+  fi
+  rm -f "$marker"
+  rm -rf "$stage"
+  # 留着没用：下次同 sha 重跑时 dist 已经在目标目录里，根本不会再走到这里。
+  rm -f "$dir/$tarball" "$dir/$sums"
+  log "  webui 产物 $short 下载校验通过，跳过 npm ci/build"
+  return 0
 }
 
 # 对象必须真的存在于各自的仓里 —— 不然 worktree add 会报一个难懂的错，
@@ -290,7 +758,7 @@ WEBUI_DIR="$RELEASES/webui-${WEBUI_SHA:0:8}"
 log "构建 multitenancy → $MT_DIR"
 build_worktree "$RELEASES/.repo-mt" "$MT_DIR" "$MT_SHA" || die "multitenancy 检出失败"
 
-log "构建 webui → $WEBUI_DIR（含 npm ci + build，要几分钟）"
+log "构建 webui → $WEBUI_DIR"
 if build_worktree "$RELEASES/.repo-webui" "$WEBUI_DIR" "$WEBUI_SHA"; then
   # .env 不在 git 里，指向跨版本稳定的那一份。
   # 先确认它真的在、且权限没被放宽 —— 缺了它 webui 起不来，
@@ -300,7 +768,14 @@ if build_worktree "$RELEASES/.repo-webui" "$WEBUI_DIR" "$WEBUI_SHA"; then
   mode=$(stat -c '%a' "$STABLE_ENV" 2>/dev/null || stat -f '%Lp' "$STABLE_ENV" 2>/dev/null)
   [ "$mode" = "600" ] || die "$STABLE_ENV 权限是 $mode，必须是 600"
   ln -sfn "$STABLE_ENV" "$WEBUI_DIR/.env"
+  # 先试 CI 产物。它成不成，都由下面那道「dist 还缺不缺」的门做最终决定 ——
+  # 产物路径没有任何自己的否决权，拿不到就是慢一点，发布照走。
+  # 目录已经存在（build_worktree 复用）且 dist 已就位时连下载都不发起。
+  if [ ! -f "$WEBUI_DIR/dist/server/index.js" ] || [ -f "$WEBUI_DIR/.artifact-installing" ]; then
+    fetch_webui_artifact "$WEBUI_SHA" "$WEBUI_DIR" || true
+  fi
   if [ ! -f "$WEBUI_DIR/dist/server/index.js" ]; then
+    log "  原地构建 webui（含 npm ci + build，要几分钟）"
     ( cd "$WEBUI_DIR" && npm ci --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1 ) \
       || die "webui 构建失败 —— 没切换任何东西，当前版本继续跑"
   fi
@@ -380,6 +855,13 @@ reinstall_editable() {  # $1=目标 mt 版本目录（绝对路径）
   # 缺了 19 天，生图全挂而发布次次报绿。装完做一次依赖体检，缺了自愈一次，
   # 仍缺就让本次发布红——发布当场红，好过用户来报。
   if ! ( cd /tmp && "$UV_BIN" pip check -p "$VENV_PY" >/dev/null 2>&1 ); then
+    if [ "$DEP_HEAL" = "0" ]; then
+      # 配对切换：venv 是人预先按 core frozen lock 装好并 pip check 过的，这里不过
+      # 说明环境跟预检时不一样了。带依赖重装会改写 core 环境，只报不修。
+      log "  ✗ 依赖体检未过，DEP_HEAL=0 —— 不带依赖重装，判本次失败："
+      ( cd /tmp && "$UV_BIN" pip check -p "$VENV_PY" 2>&1 ) | sed 's/^/      /'
+      return 1
+    fi
     log "  依赖体检未过 —— 带依赖重装一次自愈"
     ( cd /tmp && "$UV_BIN" pip install -p "$VENV_PY" -q -e "$target" ) \
       || { log "  ✗ 依赖自愈重装失败（目标 $target）"; return 1; }
@@ -387,31 +869,177 @@ reinstall_editable() {  # $1=目标 mt 版本目录（绝对路径）
       || { log "  ✗ 依赖体检仍未过 —— 放弃本次发布"; return 1; }
     log "  依赖自愈完成（uv pip check 通过）"
   fi
-  "$VENV_PY" - "$target" <<'PY' || { log "  ✗ editable 读回核对失败（import 未指向 $target）"; return 1; }
+  _editable_points_to "$target" || { log "  ✗ editable 读回核对失败（import 未指向 $target）"; return 1; }
+  log "  editable -> $target（读回核对通过）"
+}
+
+# venv 里 hermes_multitenancy 真实 import 自哪个目录，是否在 $1 之下。
+_editable_points_to() {  # $1=mt 版本目录（绝对路径）
+  "$VENV_PY" - "$1" <<'PY'
 import importlib, sys
 m = importlib.import_module("hermes_multitenancy")
 t = sys.argv[1].rstrip("/")
 sys.exit(0 if str(getattr(m, "__file__", "") or "").startswith(t + "/") else 1)
 PY
-  log "  editable -> $target（读回核对通过）"
+}
+
+# ── core 配对：旧 MT 只能配它当初跑的那个 core ─────────────────────────
+# core 身份 = venv 里实际 import 到的 hermes-agent 发行版本 + hermes_cli 所在目录的
+# 真实路径（core 软链翻过去，这个路径就跟着变）。不从目录名猜版本。
+# 取不到打印空串。stdin 接 /dev/null：这里不是 heredoc，别让解释器去读终端。
+core_identity() {
+  "$VENV_PY" -c '
+import importlib.metadata as md, os, hermes_cli
+root = os.path.realpath(os.path.dirname(os.path.dirname(hermes_cli.__file__)))
+print(md.version("hermes-agent"), root)
+' </dev/null 2>/dev/null | tail -n 1 || true
+}
+
+# 停服前记一次基线（服务仍在跑、venv 还没被本次发布动过）：
+#   CORE_AT_START       此刻的 core 身份
+#   PREV_MT_IN_VENV=1   venv 此刻 import 的正是上一版 MT = 上一版 MT 就是跑在这个 core 上的
+# 同一次停服先翻 core 再跑发布器时，venv 已经是新 core（A4 里预装了新 MT），
+# PREV_MT_IN_VENV=0 —— 这正是「回滚会把旧 MT 装进新 core」的判据。
+record_core_baseline() {
+  CORE_AT_START=$(core_identity)
+  if _editable_points_to "$PREV_MT_ABS" </dev/null >/dev/null 2>&1; then PREV_MT_IN_VENV=1; else PREV_MT_IN_VENV=0; fi
+  { echo "core_at_start=${CORE_AT_START:-<unknown>}"; echo "prev_mt_in_venv=$PREV_MT_IN_VENV"
+    echo "auto_rollback=$AUTO_ROLLBACK"; echo "dep_heal=$DEP_HEAL"; } >> "$SNAP/ROLLBACK.txt"
+  log "  core 基线：${CORE_AT_START:-<取不到>}；venv 里的 MT 是否上一版：$PREV_MT_IN_VENV"
+}
+
+# 返回 0 = 可以回滚到上一版 MT（与当前 core 配对）；1 = 不配对或无法证明，原因写进 PAIR_REASON。
+rollback_is_paired() {
+  local now
+  PAIR_REASON=""
+  if [ "$PREV_MT_IN_VENV" != "1" ]; then
+    PAIR_REASON="发布前 venv（$VENV_PY）import 的 hermes_multitenancy 不是上一版 $PREV_MT_ABS —— core/venv 已不是上一版 MT 跑过的那一套"
+    return 1
+  fi
+  # 发布前就取不到 core 身份 = venv 里连 hermes_cli 都 import 不了。生产上 gateway
+  # 就跑在这个 venv 里，正常时不可能取不到；取不到说明 core/venv 已经坏了或被换过，
+  # 「core 没变」这半条判据就证明不了。无法证明配对，按不配对处理。
+  if [ -z "$CORE_AT_START" ]; then
+    PAIR_REASON="发布前取不到 core 身份（$VENV_PY 里 import hermes_cli / 读 hermes-agent 版本失败）—— 无法证明 core 没变"
+    return 1
+  fi
+  now=$(core_identity)
+  if [ "$now" != "$CORE_AT_START" ]; then
+    PAIR_REASON="core 在发布过程中变了：发布前 ${CORE_AT_START}，现在 ${now:-<取不到>}"
+    return 1
+  fi
+  return 0
+}
+
+# 不回滚、停服务、交给人。只在 AUTO_ROLLBACK=0，或默认模式下回滚会不配对时走这里。
+# exit 1 = 已停服交人；exit 2 = 连停服都没停下来（still_active 里的 unit 还在对外服务，
+# unknown_state 里的 unit 读不出状态、可能还在跑）。
+hold_for_human() {  # $1=在哪一步失败  $2=为什么不自动回滚
+  local u units still="" unknown="" state rc stop_rc=0
+  log "$1 —— 不自动回滚：$2"
+  units=$(_units)
+  $SYSTEMCTL stop $units 2>/dev/null || stop_rc=$?
+  # 「停过了」不算数：逐个读回。stop 超时/失败时半套新版本还在对外服务，
+  # 日志要是照样写「服务已停」，按它去整体回退的人会被误导。
+  # 只有 exit 3 且读到 inactive/failed 才算已停；exit 0 = 仍在跑；其余（D-Bus 断开、
+  # 权限拒绝、unit 查不到……）一律「状态未知」，与仍在跑一样按停服失败处理。
+  for u in $units; do
+    rc=0; state=$($SYSTEMCTL is-active "$u" 2>/dev/null) || rc=$?
+    if [ "$rc" -eq 0 ]; then still="$still $u"
+    elif [ "$rc" -eq 3 ] && { [ "$state" = inactive ] || [ "$state" = failed ]; }; then :
+    else unknown="$unknown $u"
+    fi
+  done
+  still="${still# }"; unknown="${unknown# }"
+  outcome NEEDS_HUMAN_CORE_PAIRED
+  { echo "failed_step=$1"; echo "hold_reason=$2"
+    echo "stop_rc=$stop_rc"; echo "still_active=${still:-<none>}"
+    echo "unknown_state=${unknown:-<none>}"
+    echo "live_mt=$(readlink "$CODE/hermes-multitenancy" 2>/dev/null)"
+    echo "live_webui=$(readlink "$CODE/hermes-web-ui" 2>/dev/null)"
+    echo "core_now=$(core_identity)"; } >> "$SNAP/ROLLBACK.txt"
+  if [ -n "$still" ] || [ -n "$unknown" ]; then
+    log "NEEDS_HUMAN_CORE_PAIRED — 停服失败（stop 退出码 $stop_rc），仍在运行：${still:-<none>}；状态未知（仍可能在跑）：${unknown:-<none>}"
+    log "   先手工停掉这些 unit 并读回 is-active，再整体回退 core 软链 + MT + WebUI + 数据库快照（锚点：$SNAP/ROLLBACK.txt）"
+    exit 2
+  fi
+  log "NEEDS_HUMAN_CORE_PAIRED — 服务已停（逐个读回 is-active 确认），软链与 editable 保持失败现场，未翻回 ${CURRENT:-上一版}；"
+  log "   在同一次停服里整体回退 core 软链 + MT + WebUI + 数据库快照（锚点：$SNAP/ROLLBACK.txt）"
+  exit 1
+}
+
+# 每个失败点在动手回滚之前调用：不许回滚就直接停服交人（不返回）。
+guard_rollback() {  # $1=在哪一步失败
+  if [ "$AUTO_ROLLBACK" = "0" ]; then
+    hold_for_human "$1" "AUTO_ROLLBACK=0（与 core 配对切换）"
+  fi
+  if ! rollback_is_paired; then
+    hold_for_human "$1" "回滚目标与当前 core 不配对：$PAIR_REASON"
+  fi
 }
 
 # ── relay 同步：拷文件 + 重启 + 读回核对 ─────────────────────────────
 # 文件清单用通配枚举，不写死。写死的清单在下次新增 relay 模块时会静默漏拷 ——
 # 那正是本次要根治的失败类型（漏发一个模块比漏发全部更难发现）。
+# 通配只覆盖文件名模式，覆盖不了这些文件 import 的其它包内模块（2026-09-17 漏拷
+# shared_db.py 就是这样发生的）。所以从通配种子出发，用 ast 沿所有层级的相对 import
+# （含函数体内的延迟 import）递归收敛到不动点。扫描器不可用时退回 glob + shared_db.py：
+# 退回是显式记日志的，不是静默降级。
 _relay_files() {  # $1=源目录（$MT_DIR/hermes_multitenancy）
-  local src="$1" f out=""
+  local src="$1" f seeds="" out
   for f in "$src"/agent_relay*.py "$src"/credentials.py; do
-    [ -f "$f" ] && out="$out $(basename "$f")"
+    [ -f "$f" ] && seeds="$seeds $(basename "$f")"
   done
-  printf '%s' "${out# }"
+  seeds="${seeds# }"
+  [ -n "$seeds" ] || { printf ''; return 0; }
+  out=$("$RELAY_SCAN_PY" - "$src" $seeds <<'PYEOF' 2>/dev/null
+import ast, os, sys
+src, seeds = sys.argv[1], sys.argv[2:]
+done, queue = [], list(seeds)
+while queue:
+    name = queue.pop(0)
+    if name in done:
+        continue
+    done.append(name)
+    try:
+        tree = ast.parse(open(os.path.join(src, name), encoding="utf-8").read())
+    except (OSError, SyntaxError):
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            dep = node.module.split(".")[0] + ".py"
+            if os.path.isfile(os.path.join(src, dep)) and dep not in done and dep not in queue:
+                queue.append(dep)
+print(" ".join(done))
+PYEOF
+) || out=""
+  if [ -z "$out" ]; then
+    log "  ! relay 依赖扫描不可用（$RELAY_SCAN_PY）—— 退回 glob 清单 + shared_db.py"
+    out="$seeds"
+    [ -f "$src/shared_db.py" ] && out="$out shared_db.py"
+  fi
+  printf '%s' "$out"
+}
+
+# 拷完、重启前：在 relay 自己的解释器里 import 一次。失败 = 清单还是漏了什么，
+# 或新代码本身 import 就炸 —— 两种都不该拿到运行中的进程上去试。
+_relay_import_preflight() {
+  # 解释器找不到 = 没法证明新文件能 import，不是「不用证明」。放行会把本次要拦的
+  # 启动崩溃原样放回去（codex r1 #p1）。
+  [ -x "$RELAY_PY" ] || { log "  ✗ relay 解释器不存在或不可执行（$RELAY_PY），import 预检无法进行"; return 1; }
+  local err
+  if err=$(timeout 30 "$RELAY_PY" -c "import $RELAY_IMPORT_TARGET" 2>&1); then
+    return 0
+  fi
+  log "  ✗ relay import 预检失败（$RELAY_IMPORT_TARGET）：$(printf '%s' "$err" | tail -n 1)"
+  return 1
 }
 
 # 返回 0 = relay 已确认跟上；1 = 失败（调用方负责记 outcome 并非零退出）。
 sync_relay() {  # $1=目标 mt 版本目录（绝对路径）  $2=备份目录
   # 分开写：同一条 `local` 里的后一个赋值看不见前一个（整行先展开再赋值），
   # `src="$mt/…"` 写在同一行会在 set -u 下直接炸 unbound variable。
-  local mt="$1" bak="$2" files f restarted=0
+  local mt="$1" bak="$2" files f restarted=0 created=""
   local src="$mt/hermes_multitenancy"
   [ -d "$RELAY_PKG_DIR" ] || { log "  relay 包目录不存在（$RELAY_PKG_DIR）—— 跳过 relay 同步"; return 0; }
   files=$(_relay_files "$src")
@@ -419,15 +1047,27 @@ sync_relay() {  # $1=目标 mt 版本目录（绝对路径）  $2=备份目录
 
   mkdir -p "$bak" || return 1
   for f in $files; do
-    [ -f "$RELAY_PKG_DIR/$f" ] && { cp -p "$RELAY_PKG_DIR/$f" "$bak/$f" || return 1; }
+    if [ -f "$RELAY_PKG_DIR/$f" ]; then
+      cp -p "$RELAY_PKG_DIR/$f" "$bak/$f" || return 1
+    else
+      # 本次首次带进来的文件：还原时必须删掉，不然失败版本的新模块残留在包里，
+      # 下次发布可能靳靠它把 import 蒙混过去，跑成混合版本（codex r1 #p1）。
+      created="$created $f"
+    fi
   done
 
+  # $1=files_only：只动文件、绝不碰进程。预检失败时用 —— 老进程还在跑，任何一次
+  # restart 都是把坏版本或半还原状态推给它（codex r1 #p1）。
   _relay_restore() {
-    local f
+    local f mode="${1:-}"
     for f in $files; do
       [ -f "$bak/$f" ] && cp -p "$bak/$f" "$RELAY_PKG_DIR/$f"
     done
+    for f in $created; do
+      rm -f "$RELAY_PKG_DIR/$f"
+    done
     rm -rf "$RELAY_PKG_DIR/__pycache__"
+    [ "$mode" = "files_only" ] && return 0
     # sudo 被拒时老进程根本没停过：还原了文件 + 老进程还在跑 = 已经自洽，
     # 不该再多踢一脚。只有它真的 down、或本次已经重启成功过，才需要再起一次。
     if [ "$restarted" = "1" ] || ! $RELAY_IS_ACTIVE 2>/dev/null; then
@@ -439,6 +1079,12 @@ sync_relay() {  # $1=目标 mt 版本目录（绝对路径）  $2=备份目录
     cp -p "$src/$f" "$RELAY_PKG_DIR/$f" || { _relay_restore; return 1; }
   done
   rm -rf "$RELAY_PKG_DIR/__pycache__"
+
+  # 老进程此刻还在跑：预检失败只还原文件，不碰进程。
+  if ! _relay_import_preflight; then
+    _relay_restore files_only
+    return 1
+  fi
 
   # `sudo -n` 是刻意的：缺 sudoers drop-in 时当场红，绝不能挂在密码提示上把
   # 每天 18:00 的定时器吊死。
@@ -494,9 +1140,13 @@ install_dropins() {  # $1=目标 mt 版本目录（绝对路径）
   HERMES_MEEGLE_PREPARED=1 HERMES_PYTHON="$VENV_PY" "$installer"
 }
 
+record_core_baseline
 log "停服务 → 翻软链 → 重装 editable → 起服务"
 $SYSTEMCTL stop $(_units) 2>/dev/null || true
 if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"; then
+  # 默认模式下这里的回滚本身无害（venv 还没动过，翻回去就是发布前那一套），但不配对
+  # 时照样停服交人：不配对说明发布前的状态就已经证明不了，宁可停也不带着它重启。
+  guard_rollback "软链切换失败"
   log "软链切换失败 —— 翻回原样并放弃本次发布"
   flip "$PREV_MT" "$PREV_WEBUI" || true
   $SYSTEMCTL start $(_units) 2>/dev/null || true
@@ -504,6 +1154,7 @@ if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DI
   die "切换失败，当前版本继续跑"
 fi
 if ! reinstall_editable "$MT_DIR"; then
+  guard_rollback "editable 重装/读回失败"
   log "editable 未指向新版本 —— 翻回原样并放弃本次发布"
   flip "$PREV_MT" "$PREV_WEBUI" || true
   reinstall_editable "$PREV_MT_ABS" || true
@@ -512,6 +1163,7 @@ if ! reinstall_editable "$MT_DIR"; then
   die "editable 重装/读回失败，当前版本继续跑"
 fi
 if ! install_dropins "$MT_DIR"; then
+  guard_rollback "gateway drop-in 安装失败"
   log "gateway drop-in 安装失败 —— 翻回原样并放弃本次发布"
   flip "$PREV_MT" "$PREV_WEBUI" || true
   reinstall_editable "$PREV_MT_ABS" || true
@@ -552,19 +1204,31 @@ elif "$NEW_PROBES"; then
   KEEP_B=$(cd "$CODE" && cd "$(readlink hermes-web-ui)" && pwd)
   KEEP_C=$(cd "$RELEASES" && cd "$(basename "$PREV_MT")" 2>/dev/null && pwd || true)
   KEEP_D=$(cd "$RELEASES" && cd "$(basename "$PREV_WEBUI")" 2>/dev/null && pwd || true)
+  KEEP_PINNED=$(release_keep_pins)
+  KEEP_REFS=$(release_config_refs)
   for prefix in mt webui; do
     repo="$RELEASES/.repo-$prefix"
-    mapfile -t olds < <(ls -1dt "$RELEASES/$prefix"-* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)))
-    for d in "${olds[@]:-}"; do
+    # while-read 而不是 mapfile：bash 3.2 没有 mapfile，报错后列表为空 = 静默从不裁剪
+    while IFS= read -r d <&3; do
       [ -n "$d" ] && [ -d "$d" ] || continue
       abs=$(cd "$d" && pwd)
+      name=$(basename "$abs")
       # 当前在用的、以及上一版（回滚目标）都不许删
       case "$abs" in
-        "$KEEP_A"|"$KEEP_B"|"$KEEP_C"|"$KEEP_D") continue ;;
+        "$KEEP_A"|"$KEEP_B") log "  保留 $name（current）"; continue ;;
+        "$KEEP_C"|"$KEEP_D") log "  保留 $name（prev）"; continue ;;
       esac
+      # 钉住清单与活配置引用：都在 $RELEASES 直接子目录这一层按目录名整名比对
+      if printf '%s\n' "$KEEP_PINNED" | grep -qxF -- "$name"; then
+        log "  保留 $name（pinned）"; continue
+      fi
+      ref_file=$(printf '%s\n' "$KEEP_REFS" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')
+      if [ -n "$ref_file" ]; then
+        log "  保留 $name（referenced-by $ref_file）"; continue
+      fi
       git -C "$repo" worktree remove --force "$abs" 2>/dev/null || rm -rf "$abs"
-      log "  裁剪旧版本 $(basename "$abs")"
-    done
+      log "  裁剪旧版本 $name"
+    done 3< <(ls -1dt "$RELEASES/$prefix"-* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)))
   done
   # relay 放在【探针通过之后】，不是翻软链之后：mt/webui 一旦回滚，抢先升级的
   # relay 就成了反向漂移 —— 生产跑着比主线更新的 relay，而没有任何东西记得。
@@ -580,6 +1244,8 @@ elif "$NEW_PROBES"; then
 fi
 
 # ── 探针没过：自动翻回上一版 ─────────────────────────────────────────
+# 启动失败、探针消失、探针未过三种都落到这里。
+guard_rollback "新版本启动或探针失败"
 log "探针失败 —— 自动回滚到上一版"
 $SYSTEMCTL stop $(_units) 2>/dev/null || true
 # 回滚本身也可能失败（第二个 rename 挂了 = 两个路径指向不同版本）。

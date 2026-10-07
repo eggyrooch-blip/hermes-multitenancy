@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -660,17 +661,46 @@ def repair_group_profile_feishu_platforms(
         "skipped_non_group": 0,
         "skipped_missing": 0,
         "skipped_invalid": 0,
+        "skipped_unsafe_path": 0,
         "errors": 0,
     }
     if not profiles.exists():
         return stats
+    profiles_resolved = profiles.resolve()
 
-    for profile_home in sorted(path for path in profiles.iterdir() if path.is_dir()):
+    for profile_home in sorted(profiles.iterdir()):
+        # Never follow a symlinked profile (or config) out of the profiles
+        # root: this rewrite runs as the router at startup.
+        if profile_home.is_symlink():
+            if is_group_profile_name(profile_home.name):
+                stats["scanned"] += 1
+                stats["skipped_unsafe_path"] += 1
+                _m.logger.warning(
+                    "multitenancy: refusing to repair symlinked group profile=%s",
+                    profile_home.name,
+                )
+            continue
+        if not profile_home.is_dir():
+            continue
         stats["scanned"] += 1
         if not is_group_profile_name(profile_home.name):
             stats["skipped_non_group"] += 1
             continue
         config_path = profile_home / "config.yaml"
+        try:
+            unsafe = (
+                profile_home.resolve().parent != profiles_resolved
+                or config_path.is_symlink()
+            )
+        except OSError:
+            unsafe = True
+        if unsafe:
+            stats["skipped_unsafe_path"] += 1
+            _m.logger.warning(
+                "multitenancy: refusing to repair group profile outside profiles root profile=%s",
+                profile_home.name,
+            )
+            continue
         if not config_path.is_file():
             stats["skipped_missing"] += 1
             continue
@@ -690,9 +720,16 @@ def repair_group_profile_feishu_platforms(
             if dry_run:
                 stats["planned_updated"] += 1
                 continue
+            original_mode = stat.S_IMODE(config_path.stat().st_mode)
             tmp = config_path.with_name(f".{config_path.name}.tmp.{os.getpid()}")
-            tmp.write_text(_m._dump_profile_config(loaded), encoding="utf-8")
-            os.replace(tmp, config_path)
+            try:
+                tmp.write_text(_m._dump_profile_config(loaded), encoding="utf-8")
+                # A fresh file gets the umask mode; keep the original (0600 stays 0600).
+                os.chmod(tmp, original_mode)
+                os.replace(tmp, config_path)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
             stats["updated"] += 1
         except Exception:
             _m.logger.exception(

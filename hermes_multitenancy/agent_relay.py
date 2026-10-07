@@ -14,6 +14,12 @@ from typing import Any
 
 from aiohttp.web import AppKey
 
+from .agent_relay_admin import (
+    ADMIN_LOG_LIMIT_DEFAULT,
+    ADMIN_MAX_WINDOW_MS as _ADMIN_MAX_WINDOW_MS,
+    admin_denied as _plane_denied,
+    admin_error,
+)
 from .agent_relay_store import RelayConflict, RelayStore, _now_ms, _request_hash, _sha
 from .agent_relay_feishu import (
     FeishuApiError,
@@ -25,8 +31,11 @@ from .agent_relay_feishu import (
 logger = logging.getLogger(__name__)
 MAX_CONTENT_BYTES = 30 * 1024
 ADMIN_TOKEN_ENV = "HERMES_AGENT_RELAY_ADMIN_TOKEN"
-ADMIN_MAX_WINDOW_MS = 7 * 86_400_000
-ADMIN_LOG_LIMIT = 5000
+# Window/page ceilings and the auth decision now live on the plane
+# (``agent_relay_admin``) so every admin resource shares one shape; these names
+# stay for the existing call sites and tests that assert them.
+ADMIN_MAX_WINDOW_MS = _ADMIN_MAX_WINDOW_MS
+ADMIN_LOG_LIMIT = ADMIN_LOG_LIMIT_DEFAULT
 _AUDIT_PREFIX = "relay_audit "
 _LOG_FIELD_RE = re.compile(r"\b(event|status|actor|card|msg)=(\S+)")
 RELAY_STORE_KEY = AppKey("relay_store", object)
@@ -239,20 +248,19 @@ def create_agent_relay_app(
         return store.authenticate(token) if token else None
 
     def admin_denied(request: Any):
-        """Fail closed: no header → 401, wrong or unset admin token → 403."""
-        header = str(request.headers.get("Authorization", "") or "")
-        if not header.startswith("Bearer "):
-            return _error("unauthorized", "admin token required", 401)
-        expected = os.environ.get(ADMIN_TOKEN_ENV, "").strip()
-        # compare_digest raises TypeError on non-ASCII str — compare UTF-8 bytes.
-        offered = header[7:].strip().encode("utf-8", "surrogatepass")
-        if not expected or not hmac.compare_digest(offered, expected.encode("utf-8")):
-            return _error("forbidden", "admin access is not configured for this token", 403)
-        return None
+        """Fail closed, now via the shared plane: no header → 401, a token that is
+        not scoped to this resource → 403, no configured token → 403.
 
-    def admin_window(request: Any):
+        ``logs`` and ``stats`` remain the scope of ``HERMES_AGENT_RELAY_ADMIN_TOKEN``
+        alone, so nothing changes for the consumer these endpoints were built for —
+        and the telemetry consumer's token, which is scoped elsewhere, gets a 403
+        here rather than a second dataset it was never meant to read.
+        """
+        return _plane_denied(request, "logs")
+
+    def admin_window(request: Any, *, resource: str = "logs"):
         """Auth then range; returns (window, error) with exactly one of them set."""
-        denied = admin_denied(request)
+        denied = _plane_denied(request, resource)
         if denied is not None:
             return None, denied
         try:
@@ -283,7 +291,7 @@ def create_agent_relay_app(
         )
 
     async def admin_stats(request):
-        window, denied = admin_window(request)
+        window, denied = admin_window(request, resource="stats")
         if denied is not None:
             return denied
         return web.json_response(store.usage_stats(*window))
@@ -854,6 +862,11 @@ def create_agent_relay_app(
     app.router.add_post("/v1/tokens/{token_id}/revoke", revoke_token)
     app.router.add_get("/v1/admin/logs", admin_logs)
     app.router.add_get("/v1/admin/stats", admin_stats)
+    # Second resource on the same plane, in its own module (god-file split rule):
+    # the kep-telemetry exporter's local diagnostic log, for the platform side.
+    from . import agent_relay_admin_diag as _admin_diag
+
+    _admin_diag.register_telemetry_diagnostics_routes(app)
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)
     return app

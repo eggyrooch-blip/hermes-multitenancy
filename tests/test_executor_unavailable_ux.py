@@ -279,7 +279,7 @@ def test_unknown_code_falls_back_to_generic_message():
 # 3. render_unavailable() — the whole leak surface, adversarial reasons
 # --------------------------------------------------------------------------- #
 _ADVERSARIAL_REASONS = [
-    "executor map unreadable: /Users/hermes/.config/hermes/executors.yaml",
+    "executor map unreadable: /Users/sunke/.config/hermes/executors.yaml",
     "run workspace could not be prepared: fatal: unable to access "
     "'https://gitlab.example.com/sunke/hermes-web-ui.git/': "
     "The requested URL returned error: 403",
@@ -287,7 +287,7 @@ _ADVERSARIAL_REASONS = [
     "ValueError: bad row at sqlite3.py line 42",
     "codex proxy upstream Authorization: Bearer hcx_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
     "CODEX_HOME could not be materialized: PermissionError(13, 'codex-home/config.toml')",
-    "no run-scoped Codex provider proxy credential for host proxy.internal.example.com",
+    "no run-scoped Codex provider proxy credential for host proxy.internal.keep.com",
 ]
 
 

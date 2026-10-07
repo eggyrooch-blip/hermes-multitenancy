@@ -29,7 +29,12 @@ AUTH_FIXED_EXPERT_SLASH_COMMANDS = frozenset({"auth", "feishu-auth"})
 ALLOWED_FIXED_EXPERT_SLASH_COMMANDS = (
     SAFE_FIXED_EXPERT_SLASH_COMMANDS | AUTH_FIXED_EXPERT_SLASH_COMMANDS
 )
-READONLY_DISABLED_TOOLSETS = frozenset({"delegation", "execute_code", "terminal"})
+# 只读专家不许触发内嵌授权：这个表里仍然留着 lark-cli，凭据才是它唯一的闸门。
+# 能让 owner 现场授权 = 能把只读专家升级成带新鲜凭据的写手，绕过只读本身的意义
+# （2026-09-09，request-authorization 进 WebUI 默认集时发现）。
+READONLY_DISABLED_TOOLSETS = frozenset(
+    {"delegation", "execute_code", "terminal", "request-authorization"}
+)
 
 
 @dataclass(frozen=True)

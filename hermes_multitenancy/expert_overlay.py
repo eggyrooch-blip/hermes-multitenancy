@@ -551,6 +551,32 @@ def _effective_audience_allows(
     )
 
 
+MAX_SAMPLE_PROMPTS = 5
+
+
+def _clean_sample_prompts(value: Any) -> list[str]:
+    """Normalize ``experts[].sample_prompts`` into display-ready strings.
+
+    SHAPE-only cleaning — the expert.yaml compiler already enforces per-item
+    length, so nothing is truncated here. Absent/None/non-list → ``[]`` (old
+    manifests predate the field); each item is stringified + stripped, empties
+    dropped, ORDER PRESERVED, capped at ``MAX_SAMPLE_PROMPTS`` (expert.yaml
+    documents 1-5). Extras are dropped silently: a UI field must never make an
+    otherwise-valid manifest unlistable.
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        out.append(text)
+        if len(out) >= MAX_SAMPLE_PROMPTS:
+            break
+    return out
+
+
 def list_experts(
     profile_home: Path, *, department_ids: Optional[list[str]] = None
 ) -> list[dict[str, Any]]:
@@ -615,6 +641,8 @@ def list_experts(
                         # plugin pipeline → drives the WebUI "来自 AiHub" badge.
                         "source": "aihub",
                         "skills": [str(s) for s in ex.get("skills") or []],
+                        # 「试试这样问我」prompts compiled from expert.yaml ui.sample_prompts
+                        "sample_prompts": _clean_sample_prompts(ex.get("sample_prompts")),
                     }
                 if isinstance(release_version, str) and release_version.strip():
                     row["release_version"] = release_version.strip()

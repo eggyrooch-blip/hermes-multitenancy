@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import fcntl
+import os
+import stat
 import logging
 import sqlite3
 import threading
@@ -30,6 +33,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from uuid import uuid4
 
+from .shared_db import connect_shared
 from .credential_renewal_common import (
     CredentialIdentityLockTimeout,
     credential_identity_lock,
@@ -388,6 +392,14 @@ def _serialized(method):
     return _locked
 
 
+def _identity_serialized(method):
+    @functools.wraps(method)
+    def _locked(self, *args, **kwargs):
+        with self.identity_mutation_guard():
+            return method(self, *args, **kwargs)
+    return _locked
+
+
 class RoutingTable:
     """SQLite-backed routing table.
 
@@ -406,18 +418,40 @@ class RoutingTable:
         # check_same_thread=False so the same connection survives across the
         # asyncio task switches that the plugin does. Every connection touch
         # goes through @_serialized so the threads sharing it never interleave.
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # lark-bridge fans one Feishu WS out to multiple gateway processes, so
+        # several RoutingTable connections write this DB concurrently
+        # (touch_active_group fires on every group message). connect_shared
+        # sets the wait, WAL and synchronous=NORMAL that every store on this
+        # file now shares — see shared_db.py for the measurements.
+        self._conn = connect_shared(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript("PRAGMA journal_mode=WAL;")
-        # lark-bridge fans one Feishu WS out to multiple gateway processes,
-        # so several RoutingTable connections can write this DB concurrently
-        # (touch_active_group fires on every group message). Default
-        # busy_timeout is 0 → an instant SQLITE_BUSY under contention. Block
-        # up to 5s for the writer lock instead of erroring out.
-        self._conn.executescript("PRAGMA busy_timeout=5000;")
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
+
+    @contextlib.contextmanager
+    def identity_mutation_guard(self) -> Iterator[None]:
+        # ponytail: one lock per routing DB; partition only if identity changes
+        # contend. Session/heartbeat writes never take this lock or a DB transaction.
+        with self._lock:
+            if self.db_path == ":memory:" or getattr(self, "_identity_guard_depth", 0):
+                yield
+                return
+            path = str(Path(self.db_path).resolve()) + ".identity.lock"
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                    raise RouteIdentityConflictError("routing identity lock is unsafe")
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._identity_guard_depth = 1
+                try:
+                    yield
+                finally:
+                    self._identity_guard_depth = 0
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     @_serialized
     def _active_user_identity(self, user_id: str) -> tuple[str, str] | None:
@@ -464,7 +498,7 @@ class RoutingTable:
                     raise
             yield
 
-    @_serialized
+    @_identity_serialized
     def _migrate(self) -> None:
         """Bring an older DB up to the current schema. Safe to call repeatedly."""
         cur = self._conn.execute("PRAGMA table_info(multitenancy_routing)")
@@ -708,6 +742,27 @@ class RoutingTable:
         return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
 
     @_serialized
+    def resolve_billing_root(self, employee_id: str, profile_name: str) -> Optional[RoutingRow]:
+        """A billing subject and profile must identify exactly one active root."""
+        rows = self._conn.execute(
+            "SELECT * FROM multitenancy_routing WHERE active = 1 "
+            "AND (user_id = ? OR profile_name = ?)",
+            (employee_id, profile_name),
+        ).fetchmany(2)
+        if len(rows) != 1:
+            return None
+        row = _row_to_dataclass(rows[0])
+        if (row.user_id != employee_id or row.profile_name != profile_name
+                or row.kind != "user" or row.provenance != "sync" or not row.open_id):
+            return None
+        roots = self._conn.execute(
+            "SELECT user_id FROM multitenancy_routing WHERE active = 1 "
+            "AND kind = 'user' AND provenance = 'sync' AND open_id = ?",
+            (row.open_id,),
+        ).fetchmany(2)
+        return row if len(roots) == 1 else None
+
+    @_serialized
     def resolve_owner_root(self, open_id: str) -> Optional[RoutingRow]:
         """Return the deterministic sync-root user row for a login open_id.
 
@@ -854,7 +909,7 @@ class RoutingTable:
 
     # -- write path (feishu-sync) ----------------------------------------
 
-    @_serialized
+    @_identity_serialized
     def upsert(
         self,
         *,
@@ -921,7 +976,7 @@ class RoutingTable:
             f"route identity kept changing for user_id={user_id}"
         )
 
-    @_serialized
+    @_identity_serialized
     def upsert_group(
         self,
         *,
@@ -1018,7 +1073,7 @@ class RoutingTable:
         self._conn.commit()
         return synthetic_user_id
 
-    @_serialized
+    @_identity_serialized
     def upsert_owned_agent(
         self,
         *,
@@ -1729,7 +1784,7 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
-    @_serialized
+    @_identity_serialized
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
         for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):

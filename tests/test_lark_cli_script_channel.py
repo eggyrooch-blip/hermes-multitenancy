@@ -113,7 +113,11 @@ def test_schema_routes_ordinary_packaged_script_commands_to_script_mode() -> Non
     assert "any interpreter or direct execution" in schema
     assert "in any subdirectory" in schema
     assert "resolve that path relative to its SKILL.md" in schema
-    assert "do not use terminal/execute_code" in schema
+    # Only AiDock-distributed skills are bound to mode=script; other installed
+    # skills run per SKILL.md via terminal (sunke 2026-10-06).
+    assert "MANDATORY for AiDock-distributed Skills/Plugins" in schema
+    assert "Other installed Skills run per their SKILL.md via terminal/execute_code" in schema
+    assert "do not use terminal/execute_code" not in schema
 
 
 def test_s1_plugin_managed_symlinked_skill_is_granted(script_env) -> None:
@@ -151,6 +155,9 @@ def test_profile_tree_script_is_refused(script_env) -> None:
     )
     result = _run_script_tool(inside)
     assert "AiDock" in result.get("error", "")
+    # The refusal steers the model back to terminal for non-AiDock skills.
+    assert "not an AiDock-distributed script" in result.get("error", "")
+    assert "via terminal instead" in result.get("error", "")
     assert "exit_code" not in result
 
 
@@ -235,6 +242,47 @@ def test_s5b_executable_no_suffix_runs_directly(script_env) -> None:
     assert "REAL:auth status" in result.get("stdout_redacted", "")
 
 
+@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs"])
+def test_node_script_uses_system_interpreter_not_ambient_path(script_env, monkeypatch, suffix) -> None:
+    from hermes_multitenancy.lark_cli_tool import _trusted_script_node
+
+    if _trusted_script_node() is None:
+        pytest.skip("trusted system Node.js not installed")
+    decoy = _write(
+        script_env["profile_home"] / "tmp" / "decoy" / "node",
+        "#!/bin/sh\necho PLANTED_NODE_RAN\n",
+        mode=0o755,
+    )
+    monkeypatch.setenv("PATH", str(decoy.parent))
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/tenant/planted.js")
+    script = _write(
+        script_env["managed_sources"] / "demo" / ("probe" + suffix),
+        "console.log('NODE_OK:' + process.argv[2]);\n",
+    )
+    result = _run_script_tool(script, "42")
+    assert result.get("exit_code") == 0, result
+    assert result.get("stdout_redacted", "").strip() == "NODE_OK:42"
+
+
+def test_node_missing_fails_closed_without_shell_fallback(script_env, monkeypatch) -> None:
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_tool._SCRIPT_NODE_CANDIDATES", ())
+    script = _write(script_env["shared_skills"] / "probe.js", "echo SHELL_MUST_NOT_RUN\n")
+    result = _run_script_tool(script)
+    assert "Node.js" in result.get("error", ""), result
+    assert result.get("error_code") == "FEISHU_DEPENDENCY_UNAVAILABLE", result
+    assert "exit_code" not in result
+
+
+def test_node_system_candidate_cannot_resolve_into_tenant_tree(script_env, monkeypatch) -> None:
+    from hermes_multitenancy.lark_cli_tool import _trusted_script_node
+
+    decoy = _write(script_env["workspace"] / "node", "#!/bin/sh\nexit 0\n", mode=0o755)
+    link = script_env["profile_home"] / "tmp" / "node"
+    link.symlink_to(decoy)
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_tool._SCRIPT_NODE_CANDIDATES", (str(link),))
+    assert _trusted_script_node() is None
+
+
 def test_s1c_strict_env_present_also_granted(script_env, monkeypatch) -> None:
     # Both env shapes pass: gateway-shaped (strict var present) and
     # worker-shaped (absent, the fixture default that pins the incident).
@@ -271,17 +319,39 @@ def test_p0_2_planted_python3_is_ignored(script_env, monkeypatch) -> None:
     assert "REAL:auth status" in result.get("stdout_redacted", "")
 
 
-def test_s2_bare_shim_exec_still_denied(script_env) -> None:
+def test_s2_bare_shim_exec_self_serves_under_the_run_token(script_env) -> None:
+    # 2026-09-11: a bare terminal call inside the strict runtime is no longer
+    # refused — the run token proves the runtime, credentials stay broker-side,
+    # and the identity rule (not the path) is what the shim enforces. See
+    # tests/test_lark_cli_guard.py for the full lane matrix.
     completed = subprocess.run(
-        [str(script_env["shim_dir"] / "lark-cli"), "auth", "status"],
+        # non-diagnostic on purpose: `auth status` is answered locally by the
+        # shim now, and this case is about the forwarding lane.
+        [str(script_env["shim_dir"] / "lark-cli"), "docs", "+fetch", "--doc", "X"],
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "REAL:docs +fetch --doc X" in completed.stdout
+    assert any(
+        event["event_type"] == "lark_cli.direct_exec.self_served"
+        for event in _audit_events(script_env["audit_path"])
+    )
+
+
+def test_s2b_bare_shim_exec_as_bot_is_denied(script_env) -> None:
+    completed = subprocess.run(
+        [str(script_env["shim_dir"] / "lark-cli"), "im", "+messages-send", "--as", "bot"],
         capture_output=True,
         text=True,
         env={**os.environ},
         check=False,
     )
     assert completed.returncode == 126
-    assert "Direct execution denied" in completed.stderr
-    assert 'mode="script"' in completed.stderr
+    assert "Direct execution denied for bot identity" in completed.stderr
+    assert "REAL:" not in completed.stdout
 
 
 def test_s6_without_run_token_channel_fails_closed(script_env, monkeypatch) -> None:
@@ -292,18 +362,20 @@ def test_s6_without_run_token_channel_fails_closed(script_env, monkeypatch) -> N
     assert "exit_code" not in result
 
 
-def test_s6b_script_without_grant_hits_shim_126(script_env) -> None:
-    # Mutation-equivalent: same script + shim, but no AUTHORIZED → in-script
-    # lark-cli call is denied. Proves S1 passes because of the injected grant.
+def test_s6b_script_outside_the_strict_runtime_hits_shim_126(script_env) -> None:
+    # Mutation-equivalent: same script + shim, but no run token → the shim has
+    # no proof of the strict runtime and the in-script lark-cli call is denied.
+    # (Dropping only AUTHORIZED no longer denies: that lane now self-serves.)
     script = _write(script_env["managed_sources"] / "demo" / "scripts" / "probe.py", PROBE_BODY)
     env = {**os.environ}
     env.pop("HERMES_LARK_CLI_AUTHORIZED", None)
+    env.pop("HERMES_LARK_CLI_RUN_TOKEN", None)
     env["PATH"] = os.pathsep.join([str(script_env["shim_dir"]), env.get("PATH", "")])
     completed = subprocess.run(
         [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
     )
     assert completed.returncode == 7
-    assert "Direct execution denied" in completed.stderr
+    assert "Direct execution denied. Use the registered lark_cli tool." in completed.stderr
 
 
 def test_relative_path_resolves_against_profile_skills_root(script_env) -> None:

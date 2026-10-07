@@ -26,6 +26,7 @@ both enforced in :func:`check_account_drift`:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.error
@@ -384,6 +385,7 @@ class SweepResult:
     failed: int = 0
     deferred_budget: int = 0
     failures: list[tuple[str, str]] | None = None
+    failure_details: list[dict[str, str]] | None = None
 
     def summary(self) -> str:
         return (
@@ -396,6 +398,40 @@ class SweepResult:
                 self.deferred_budget,
             )
         )
+
+
+def _sweep_failure_reason(exc: Exception) -> str:
+    """Only constants leave this boundary; account/probe errors contain secrets."""
+    message = exc.args[0] if exc.args and isinstance(exc.args[0], str) else ""
+    exact = {
+        "billing credential is for a different employee": "subject_mismatch",
+        "billing payer profile drift detected": "profile_drift",
+        "billing payer email drift detected": "email_drift",
+        "billing payer profile is ambiguous": "profile_ambiguous",
+        "employee billing identity could not be resolved": "route_unresolved",
+        "billing routing dependency unavailable": "route_unavailable",
+        "routing identity lock is unsafe": "route_lock_unsafe",
+        "employee billing org identity unavailable": "org_unavailable",
+        "employee billing org identity ambiguous": "org_ambiguous",
+        "employee billing org email missing": "org_email_missing",
+        "billing credential identity drift detected": "credential_identity_drift",
+        "billing credential tuple drift detected": "credential_tuple_drift",
+        "billing credential account identity is unverified": "account_unverified",
+        "billing credential contract version is unsupported": "contract_unsupported",
+        "billing credential is for a different email": "email_mismatch",
+        "billing credential lifetime is implausible": "lifetime_invalid",
+        "billing credential vault entry is invalid": "vault_invalid",
+        "billing credential vault is unavailable": "vault_unavailable",
+        "gateway could not verify the credential's account identity": "account_unverified",
+        "employee_key_unreachable": "gateway_unreachable",
+        "employee_key_response_subject_mismatch": "subject_mismatch",
+        "employee_key_response_lifetime_implausible": "lifetime_invalid",
+    }
+    if message.startswith("billing credential account changed: stored="):
+        return "account_drift"
+    if message.startswith("billing credential failed activation probe: "):
+        return "activation_probe_failed"
+    return exact.get(message, "unknown")
 
 
 def sweep_cohort(
@@ -420,10 +456,14 @@ def sweep_cohort(
     does not hammer Feishu and LiteLLM in one burst — the remainder is picked
     up by the next pass.
     """
-    result = SweepResult(failures=[])
+    result = SweepResult(failures=[], failure_details=[])
     attempted = 0
     for member in cohort:
         result.checked += 1
+        member_ref = hashlib.sha256(
+            str(getattr(member, "employee_user_id", member)).encode()
+        ).hexdigest()[:12]
+        stage = "needs"
         try:
             if not needs(member):
                 result.skipped_current += 1
@@ -436,16 +476,22 @@ def sweep_cohort(
                 result.deferred_budget += 1
                 continue
             attempted += 1
+            stage = "issue"
             issued = issue(member)
+            stage = "store"
             store(member, issued)
             result.issued += 1
             if on_event:
-                on_event("issued", str(member), "")
+                on_event("issued", member_ref, "")
         except Exception as exc:  # one bad member must not stop the sweep
             result.failed += 1
-            result.failures.append((str(member), type(exc).__name__))
+            result.failures.append((member_ref, type(exc).__name__))
+            result.failure_details.append({
+                "member": member_ref, "stage": stage,
+                "reason": _sweep_failure_reason(exc),
+            })
             if on_event:
-                on_event("failed", str(member), type(exc).__name__)
+                on_event("failed", member_ref, type(exc).__name__)
     return result
 
 
@@ -519,9 +565,6 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
     payer_ids_raw = os.environ.get("HERMES_LITELLM_BILLING_PAYER_IDS", "")
     cohort_from_routing = _cohort_is_routing(payer_ids_raw)
     cohort_ids = [] if cohort_from_routing else _cohort_ids(payer_ids_raw)
-    domain = str(
-        os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "example.com")
-    ).strip()
     db_path = str(os.environ.get("HERMES_MULTITENANCY_DB", "")).strip()
     if not db_path:
         raise EmployeeKeyError("employee_key_refresh_db_unset")
@@ -569,8 +612,6 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
             email, _department = _employee_org_fields(employee_id)
         except Exception:
             email = ""
-        if not email:
-            email = f"{employee_id}@{domain}"
         payers.append(_ResolvedPayer(employee_id, profile, email, ""))
 
     if cohort_from_routing and not payers:
@@ -597,10 +638,15 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
         raise EmployeeKeyError("employee_key_refresh_credential_key_unset")
 
     preparer = _default_preparer()
-    credentials = preparer._credentials
 
     def _store_binding(payer: _ResolvedPayer, issued: IssuedKey) -> None:
-        store_binding(preparer, payer, issued)
+        with preparer.refresh_identity(payer):
+            store_binding(preparer, payer, issued)
+
+    def _needs(payer: _ResolvedPayer) -> bool:
+        with preparer.refresh_identity(payer) as needed:
+            return needed
+
     client = EmployeeKeyClient(
         os.environ.get("HERMES_EMPLOYEE_KEY_BASE_URL", "")
         or os.environ.get("HERMES_AI_GATEWAY_BROKER_URL", ""),
@@ -610,15 +656,16 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
     def _issue(payer: _ResolvedPayer) -> IssuedKey:
         import uuid
 
-        return client.issue(
-            employee_id=payer.employee_user_id,
-            enterprise_email=payer.email,
-            idempotency_key=f"refresh-{payer.employee_user_id}-{uuid.uuid4().hex[:12]}",
-        )
+        with preparer.refresh_identity(payer):
+            return client.issue(
+                employee_id=payer.employee_user_id,
+                enterprise_email=payer.email,
+                idempotency_key=f"refresh-{payer.employee_user_id}-{uuid.uuid4().hex[:12]}",
+            )
 
     if dry_run:
         due = [p.employee_user_id for p in payers
-               if credentials.employee_key_needed(p)]
+               if _needs(p)]
         return {
             "dry_run": True,
             "cohort": len(cohort_ids),
@@ -629,7 +676,7 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
 
     result = sweep_cohort(
         payers,
-        needs=credentials.employee_key_needed,
+        needs=_needs,
         issue=_issue,
         store=_store_binding,
         max_issues=max_issues,
@@ -644,6 +691,7 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
                       "deferred_budget")
         },
         "failures": result.failures or [],
+        "failure_details": result.failure_details or [],
     }
 
 

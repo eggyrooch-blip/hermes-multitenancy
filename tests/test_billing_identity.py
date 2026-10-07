@@ -1201,3 +1201,119 @@ def test_prepare_always_asks_with_minting_disabled(tmp_path, monkeypatch):
     assert credentials.mint_flags == [False] * len(credentials.mint_flags), (
         "prepare() asked with minting ENABLED — that is request-path issuance"
     )
+
+
+def test_write_lock_loss_on_binding_persist_does_not_drop_the_run(tmp_path, monkeypatch, caplog):
+    """2026-09-17 production incident.
+
+    `BillingIdentityStore.put` raised `database is locked` on the request path,
+    the exception reached commands.py's catch-all, and the employee got
+    "请求状态暂时无法保存，请稍后重试。" instead of an answer — 10 turns across 6
+    people. The persist is a cache write; the run must survive losing it.
+    """
+    import logging
+    import sqlite3
+
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor")
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+
+    def locked_put(_identity):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "put", locked_put)
+    preparer = BillingIdentityPreparer(
+        routing=_Routing(), store=store, credentials=_FakeCredentials()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.billing_identity"):
+        prepared = preparer.prepare(_request())
+
+    # The run still carries a complete, enforced billing identity.
+    assert prepared.metadata["litellm_billing_enforced"] is True
+    assert prepared.metadata["litellm_billing_employee_user_id"] == "actor"
+    # …and the lost write is visible to whoever reads the logs.
+    assert any("billing binding persist failed" in r.message for r in caplog.records)
+
+
+def test_binding_persist_reraises_non_lock_sqlite_errors(tmp_path, monkeypatch):
+    """Only the lock loss degrades. A schema/value defect must still surface."""
+    import sqlite3
+
+    import pytest
+
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor")
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+
+    def broken_put(_identity):
+        raise sqlite3.IntegrityError("NOT NULL constraint failed")
+
+    monkeypatch.setattr(store, "put", broken_put)
+    preparer = BillingIdentityPreparer(
+        routing=_Routing(), store=store, credentials=_FakeCredentials()
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        preparer.prepare(_request())
+
+
+def test_binding_store_waits_for_the_write_lock_as_long_as_the_other_hot_writers(tmp_path):
+    """5s was the shortest timeout on the shared db and it is what fired."""
+    from hermes_multitenancy.billing_identity import BillingIdentityStore
+
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+    assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    assert store._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_real_write_lock_loss_leaves_no_open_transaction_on_the_store_connection(tmp_path):
+    """codex r1 #p1 — the mocked tests above never touch the transaction path.
+
+    A real second writer holds the WAL write lock; the store's INSERT dies on
+    it. The store keeps its connection for the process lifetime, so an
+    implicit transaction left open here would pin a stale read snapshot and
+    turn every later write into SQLITE_BUSY_SNAPSHOT — invisible, because
+    `prepare` now swallows OperationalError.
+    """
+    import sqlite3
+
+    import pytest
+
+    from hermes_multitenancy.billing_identity import BillingIdentity, BillingIdentityStore
+
+    db_path = tmp_path / "multitenancy.db"
+    store = BillingIdentityStore(db_path)
+    store.put(BillingIdentity("actor", "actor", "actor@example.com", "llm-v1"))
+
+    # Fail fast instead of waiting out the production 30s.
+    store._conn.execute("PRAGMA busy_timeout=50")
+    blocker = sqlite3.connect(db_path)
+    blocker.execute("PRAGMA busy_timeout=50")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store.put(BillingIdentity("actor", "actor", "actor@example.com", "llm-v2"))
+        assert store._conn.in_transaction is False
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    # The store recovers completely: it sees writes the blocker's window hid,
+    # and its own next write lands.
+    sqlite3.connect(db_path).execute(
+        "UPDATE multitenancy_billing_identities SET litellm_user_id = 'llm-elsewhere'"
+    ).connection.commit()
+    assert store.get("actor").litellm_user_id == "llm-elsewhere"
+    store.put(BillingIdentity("actor", "actor", "actor@example.com", "llm-v3"))
+    assert store.get("actor").litellm_user_id == "llm-v3"

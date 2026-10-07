@@ -132,7 +132,8 @@ def test_remote_probe_retries_only_explicit_protocol_version_rejection():
         "https://mcp.example/mcp", resolver=public_dns, request=request
     ))
     assert result["verdict"] == "pass"
-    assert versions[:2] == ["2025-11-25", "2025-06-18"]
+    from hermes_multitenancy.connector_remote_probe import _latest_protocol_version
+    assert versions[:2] == [_latest_protocol_version(), "2025-06-18"]
 
 
 def test_remote_probe_recognizes_structured_api_key_challenge():

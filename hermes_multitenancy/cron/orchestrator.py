@@ -13,12 +13,14 @@ import concurrent.futures
 import contextlib
 from concurrent.futures import TimeoutError as FuturesTimeout
 import functools
+import hashlib
 import json
 import math
 import signal
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sqlite3
 import sys
@@ -267,6 +269,67 @@ def _record_cron_terminal(
     return False
 
 
+_REAUTH_NOTICE_STATE_FILE = "reauth_notice.json"
+_REAUTH_NOTICE_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def _reauth_notice_text(job: dict) -> str:
+    # Local copy only: never the raw error, marker path or any credential text.
+    name = " ".join(str(job.get("name") or job.get("id") or "定时任务").split())[:80]
+    return (
+        f"⚠️ 定时任务「{name}」本次没有执行：你的飞书授权已失效。"
+        "请在飞书私聊 Hermes 发送 /feishu_auth 重新授权，授权后任务会按计划继续运行。"
+    )
+
+
+def _reauth_notice_key(cron_jobs: Any, job: dict, error: str) -> str:
+    """Identity of the auth marker that deferred this run (path + reason), hashed.
+
+    The marker ts is deliberately excluded: renewal ticks may rewrite the marker
+    while the cause is unchanged, and that must not reopen the rate limit.
+    """
+    marker = ""
+    try:
+        payload = json.loads(
+            (Path(cron_jobs.OUTPUT_DIR) / f"{job.get('id') or 'unnamed'}.deferred.json")
+            .read_text(encoding="utf-8")
+        )
+        marker = f"{payload.get('marker_path') or ''}\x1f{payload.get('reason') or ''}"
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return hashlib.sha256((marker or error).encode("utf-8")).hexdigest()[:32]
+
+
+def _reauth_notice_due(cron_jobs: Any, key: str, now: float) -> bool:
+    """One notice per profile per marker; repeat at most once a day while it persists."""
+    try:
+        state = json.loads(
+            (Path(cron_jobs.CRON_DIR) / _REAUTH_NOTICE_STATE_FILE).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True
+    if not isinstance(state, dict) or state.get("key") != key:
+        return True
+    try:
+        return now - float(state.get("sent_at") or 0) >= _REAUTH_NOTICE_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        return True
+
+
+def _record_reauth_notice(cron_jobs: Any, key: str, now: float) -> None:
+    tmp = None
+    try:
+        path = Path(cron_jobs.CRON_DIR) / _REAUTH_NOTICE_STATE_FILE
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+        tmp.write_text(json.dumps({"key": key, "sent_at": now}), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, TypeError, AttributeError):
+        logger.warning("[multitenancy] failed to record cron reauth notice state", exc_info=True)
+        with contextlib.suppress(OSError):
+            if tmp is not None:
+                tmp.unlink()
+
+
 def _finalize_claimed_cron_job_current_context(
     cron_jobs: Any,
     cron_scheduler: Any,
@@ -281,12 +344,6 @@ def _finalize_claimed_cron_job_current_context(
     try:
         save_job_output = _cw._cron_scheduler_function(cron_jobs, cron_scheduler, "save_job_output")
         deliver_result = getattr(cron_scheduler, "_deliver_result")
-        summarize_failure = getattr(
-            cron_scheduler,
-            "_summarize_cron_failure_for_delivery",
-            lambda _job, error: f"⚠️ Cron '{_job.get('name') or _job.get('id')}' failed: {error}",
-        )
-
         success = bool(_cw._result_field(result, "success", False))
         output = str(_cw._result_field(result, "output", "") or "")
         final_response = str(_cw._result_field(result, "final_response", "") or "")
@@ -297,7 +354,27 @@ def _finalize_claimed_cron_job_current_context(
         if verbose:
             logger.info("[multitenancy] cron output saved to: %s", output_file)
 
-        deliver_content = final_response if success else summarize_failure(job, error)
+        deferred = not success and bool(
+            error and error.startswith("deferred: feishu UAT needs reauth (")
+        )
+        # Core's failure classifier lazily registers profile plugins. This runs
+        # in a tenant home inside the router process; keep failure copy local.
+        from agent.redact import redact_sensitive_text
+        failure_detail = " ".join(redact_sensitive_text(
+            error or "unknown error", force=True, redact_url_credentials=True,
+        ).split())[:180]
+        # Deferred runs are the only reauth reminder left (proactive DMs are
+        # off), so tell the owner once per auth marker instead of going silent.
+        reauth_notice_key = None
+        if deferred:
+            reauth_notice_key = _cw._reauth_notice_key(cron_jobs, job, error or "")
+            if not _cw._reauth_notice_due(cron_jobs, reauth_notice_key, time.time()):
+                reauth_notice_key = None
+        deliver_content = (
+            final_response if success else
+            (_cw._reauth_notice_text(job) if reauth_notice_key else "") if deferred else
+            f"⚠️ Cron '{job.get('name') or job.get('id')}' failed: {failure_detail}"
+        )
         should_deliver = bool(str(deliver_content or "").strip())
         silent_marker = str(getattr(cron_scheduler, "SILENT_MARKER", "[SILENT]")).upper()
         if should_deliver and success and silent_marker in str(deliver_content).strip().upper():
@@ -345,8 +422,12 @@ def _finalize_claimed_cron_job_current_context(
         receipt_expected = bool(job.pop("_hermes_feishu_receipt_expected", False))
         if success and should_deliver and receipt_expected and not receipt_message_id and not delivery_error:
             delivery_error = "feishu delivery completed without provider receipt"
+        if reauth_notice_key and should_deliver and not delivery_error:
+            _cw._record_reauth_notice(cron_jobs, reauth_notice_key, time.time())
         end_reason = (
-            "delivery_error"
+            "deferred"
+            if deferred
+            else "delivery_error"
             if delivery_error
             else "completed"
             if success
@@ -366,8 +447,9 @@ def _finalize_claimed_cron_job_current_context(
         )
         if delivery_error:
             logger.warning(
-                "[multitenancy] cron_delivery_alert job=%s end_reason=delivery_error",
+                "[multitenancy] cron_delivery_alert job=%s end_reason=%s",
                 job["id"],
+                end_reason,
             )
         logger.info(
             "[multitenancy] cron terminal job=%s end_reason=%s receipt=%s",

@@ -23,7 +23,49 @@ from typing import Any, Iterator, Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import executor_map
-from ._core import _expert_id_for_event
+from ._core import _event_metadata, _expert_id_for_event
+from .mcp_servers import register_profile_mcp_servers as _register_profile_mcp_servers
+
+
+def _reasoning_config_for_event(event: Any) -> Optional[dict]:
+    """Resolve ``metadata.reasoning_effort`` into AIAgent's ``reasoning_config``.
+
+    The WebUI reasoning-effort picker rides ``metadata`` (zero RunRequest schema
+    change) all the way to ``event.raw_event["metadata"]``. Core owns the
+    vocabulary: ``hermes_constants.parse_reasoning_effort`` accepts the seven
+    level words (minimal/low/medium/high/xhigh/max/ultra) plus
+    none/false/disabled for "reasoning off", and returns exactly the dict shape
+    ``AIAgent(reasoning_config=...)`` wants.
+
+    Returns ``None`` whenever the key is absent, empty or unrecognized, so the
+    caller leaves ``reasoning_config`` unset and the profile/core default keeps
+    applying. Never raises: a malformed picker value must not kill a run.
+    """
+    try:
+        raw = _event_metadata(event).get("reasoning_effort")
+    except Exception:
+        logger.debug("[multitenancy] reasoning_effort metadata unreadable", exc_info=True)
+        return None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(raw)
+    except Exception:
+        logger.warning(
+            "[multitenancy] reasoning_effort=%r could not be parsed; using profile default",
+            raw,
+            exc_info=True,
+        )
+        return None
+    if parsed is None:
+        logger.warning(
+            "[multitenancy] ignoring unrecognized reasoning_effort=%r; using profile default",
+            raw,
+        )
+        return None
+    return parsed
 
 
 def _install_billing_delegation_guard(enabled: bool):
@@ -81,6 +123,36 @@ def _trusted_feishu_child_sender(event: Any, current_sender_open_id: Any) -> str
     return actor
 
 
+def _profile_declared_mcp_servers(profile_home: Path) -> Any:
+    """This profile's OWN ``config.yaml`` ``mcp_servers`` block, or ``None``.
+
+    The authoritative source boundary for ``agent_real/mcp_servers.py``. Read
+    again from disk rather than taken from the ``config`` dict this function's
+    caller already holds, because TWO merges sit between that dict and "what this
+    profile declared", and both widen the scope:
+
+    * core's ``_load_mcp_config()`` ends with ``_portable_mcp_servers``, which
+      folds every plugin-provided (portable) MCP server into its result, and
+      ``hermes_cli.tools_config.enabled_mcp_server_names()`` then folds those
+      names into the default toolset;
+    * ``_load_profile_config`` deep-merges the SHARED home's ``config.yaml`` into
+      the profile's, so a name the org declared centrally would re-admit a
+      plugin-supplied server config under that name.
+
+    ``None`` on anything unreadable or non-mapping: the registrar treats an
+    unknown scope as empty, and MCP is an enhancement to a turn, never a
+    precondition for it.
+    """
+    try:
+        raw = _pkg._load_yaml(profile_home / "config.yaml")
+    except Exception:
+        logger.warning(
+            "[multitenancy] reading profile mcp_servers declarations failed", exc_info=True
+        )
+        return None
+    return raw.get("mcp_servers") if isinstance(raw, dict) else None
+
+
 def _run_with_aiagent(
     event: Any,
     profile_home: Path,
@@ -129,9 +201,7 @@ def _run_with_aiagent(
         primary,
         strip_custom_context_suffix=True,
     )
-    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
-        config, provider, env_overrides
-    )
+    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider, env_overrides)
     base_url = _resolve_base_url(provider, True, config, env_overrides)
     from ..billing_identity import (
         billing_endpoint_allowed,
@@ -396,9 +466,8 @@ def _run_with_aiagent(
                 "user_id": str(getattr(source, "user_id", "") or "") if source else "",
                 "user_name": str(getattr(source, "user_name", "") or "") if source else "",
                 "session_key": str(gateway_session_key),
-                # Every routed turn runs inside a one-shot AIAgent subprocess.
-                # Detached delegate_task workers die with that subprocess, so
-                # all platforms must join delegated work before returning.
+                # MT owns a finite run and has no authenticated detached-result consumer.
+                # Upstream falls back to joined parallel children in this scope.
                 "async_delivery": False,
             }
             try:
@@ -477,6 +546,28 @@ def _run_with_aiagent(
             **kwargs: Any,
         ) -> None:
             _log_aiagent_tool_progress(event_type, tool_name, preview, args, **kwargs)
+            if event_type in {"subagent.start", "subagent.tool", "subagent.progress", "subagent.complete"}:
+                # Identity comes from the upstream relay; never merge children by name.
+                # Tool arguments/results and child reasoning are not UI progress data.
+                child_id = kwargs.get("subagent_id")
+                if not isinstance(child_id, str) or not child_id or len(child_id) > 200:
+                    return
+                fields = (
+                    "subagent_id", "parent_id", "depth", "model", "toolsets",
+                    "task_index", "task_count", "goal", "child_session_id",
+                    "delegation_id", "tool_count", "status", "duration_seconds",
+                )
+                payload = {}
+                for key in fields:
+                    value = kwargs.get(key)
+                    if isinstance(value, str):
+                        payload[key] = value[:1000 if key == "goal" else 200]
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                        payload[key] = value
+                    elif key == "toolsets" and isinstance(value, (list, tuple)):
+                        payload[key] = [str(item)[:100] for item in value[:32]]
+                _emit(event_type, session_id=str(session_id), name=str(tool_name or "")[:100], **payload)
+                return
             if event_type == "tool.started":
                 # First tool-start is the earliest deterministic signal that
                 # Hermes core has inserted the session row into state.db with
@@ -621,10 +712,6 @@ def _run_with_aiagent(
             if text:
                 _emit("thinking", text=text)
 
-        def _tool_gen_event_callback(tool_name: str) -> None:
-            if tool_name:
-                _emit("tool_started", name=str(tool_name), preview="generating arguments")
-
         if platform_key == "webui":
             clarify_callback = _configure_webui_clarify_bridge(event_sink, str(gateway_session_key))
         elif platform_key == "feishu":
@@ -659,7 +746,6 @@ def _run_with_aiagent(
             "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
             "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
             "clarify_callback": clarify_callback,
-            "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
         }
         if project_context is not None and project_context.project_id:
             agent_kwargs["skip_memory"] = True
@@ -690,6 +776,20 @@ def _run_with_aiagent(
             agent_kwargs["disabled_toolsets"] = disabled_toolsets
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
+        # WebUI reasoning-effort picker, broker mode's last hop. Bridge mode
+        # already lands this on the live agent (bridge_pool swaps
+        # session.agent.reasoning_config per run); broker builds a fresh AIAgent
+        # per run right here, so passing the constructor kwarg is the whole fix
+        # — no save/restore, nothing to leak into the next run or the warm
+        # worker's next tenant. Unset when absent/unparseable: the profile
+        # config default must keep winning.
+        reasoning_config = _reasoning_config_for_event(event)
+        if reasoning_config is not None:
+            agent_kwargs["reasoning_config"] = reasoning_config
+            # Only fires when the picker actually sent a level, so it stays a
+            # one-line-per-run breadcrumb instead of noise — and it is the only
+            # place ops can read back that the hop landed.
+            logger.info("[multitenancy] reasoning_config=%s (from metadata)", reasoning_config)
 
         # Expert-mode overlay (ephemeral, this run only). Rides the
         # UPSTREAM ``ephemeral_system_prompt`` constructor kwarg: core re-appends
@@ -704,7 +804,7 @@ def _run_with_aiagent(
         # expert's domain role, skills and write-safety reminder. The previously
         # wired ``identity_override`` kwarg required FORKING core and would RAISE
         # on upstream (see SPEC dead ends); it is gone.
-        _role_override = _pkg._role_override_block_for_event(event, profile_home)
+        _role_override = _pkg._compose_system_text(event, profile_home, "")
         # Todo progress rules ride the SAME kwarg, CONCATENATED after the expert
         # block — never assigned separately, so expert overlay and todo rules can
         # never overwrite each other (review red-line R1). A core that lacks the
@@ -771,6 +871,7 @@ def _run_with_aiagent(
             agent_kwargs["ephemeral_system_prompt"] = "\n\n".join(_ephemeral_parts)
 
         approval_cleanup = lambda: None
+        authorization_cleanup = lambda: None
         runtime_env_cleanup = lambda: None
         expert_skill_scope_cleanup = lambda: None
         vod_image_override_cleanup = lambda: None
@@ -782,6 +883,36 @@ def _run_with_aiagent(
                 event_sink,
                 str(gateway_session_key),
             )
+            # Inline authorization is WebUI-only on purpose: it needs a browser
+            # the owner is already logged into AND a broker seam that can verify
+            # the credential live. Every other channel keeps the existing
+            # out-of-band credential hub flow; without a bridge the tool fails
+            # closed rather than raising a card nobody can answer.
+            if platform_key == "webui":
+                (
+                    _authorization_callback,
+                    _authorization_bridge_cleanup,
+                ) = _configure_webui_authorization_bridge(event_sink, str(gateway_session_key))
+                if _authorization_callback is not None:
+                    from ..request_authorization_tool import (
+                        register_authorization_bridge,
+                        unregister_authorization_bridge,
+                    )
+
+                    register_authorization_bridge(
+                        str(gateway_session_key), _authorization_callback
+                    )
+
+                    def authorization_cleanup(
+                        _session_key: str = str(gateway_session_key),
+                        _bridge_cleanup=_authorization_bridge_cleanup,
+                        _unregister=unregister_authorization_bridge,
+                    ) -> None:
+                        try:
+                            _unregister(_session_key)
+                        finally:
+                            _bridge_cleanup()
+
             requested_workspace = raw_event.get("workspace") if isinstance(raw_event, dict) else None
             workspace = requested_workspace
             if project_context is not None and project_context.project_id:
@@ -856,6 +987,17 @@ def _run_with_aiagent(
                 enforce_credentials=billing_enforced and not codex_mapped,
             )
             _register_aiagent_process_image_gen_providers()
+            # Fourth host: connect this profile's own ``mcp_servers`` before the
+            # agent is built. Core never does this in ``AIAgent.__init__`` — every
+            # other host (CLI / gateway / cron / TUI) runs discovery itself, and
+            # multitenancy shells out to a bare interpreter that runs none of them,
+            # so a configured MCP server reached the tool FILTER but was never
+            # connected and contributed no tools. See agent_real/mcp_servers.py.
+            _register_profile_mcp_servers(
+                enabled_toolsets,
+                platform_key=platform_key,
+                declared_mcp_servers=_profile_declared_mcp_servers(profile_home),
+            )
             try:
                 agent = AIAgent(**agent_kwargs)
             except TypeError as exc:
@@ -941,6 +1083,7 @@ def _run_with_aiagent(
             # parent process re-runs it post-done with full write access.
             _retag_source_now("finally-pre-close")
             approval_cleanup()
+            authorization_cleanup()
             aux_runtime_cleanup()
             delegation_guard_cleanup()
             vod_image_override_cleanup()

@@ -2207,7 +2207,7 @@ def test_codex_app_server_bridge_reaches_our_tool_complete_callback():
     bridge(
         {
             "method": "item/started",
-            "params": {"item": {"id": "call_1", "item_type": "commandExecution"}},
+            "params": {"item": {"id": "call_1", "type": "commandExecution"}},
         }
     )
     bridge(
@@ -2216,10 +2216,10 @@ def test_codex_app_server_bridge_reaches_our_tool_complete_callback():
             "params": {
                 "item": {
                     "id": "call_1",
-                    "item_type": "commandExecution",
+                    "type": "commandExecution",
                     "command": "python render_ub_xml.py",
-                    "aggregated_output": f"generated {sentinel}",
-                    "exit_code": 0,
+                    "aggregatedOutput": f"generated {sentinel}",
+                    "exitCode": 0,
                 }
             },
         }

@@ -15,7 +15,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -141,6 +141,8 @@ class DepartmentUser:
     open_id: str
     user_id: Optional[str] = None
     union_id: Optional[str] = None
+    enterprise_email: str = ""
+    email: str = ""
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,8 @@ class Employee:
     is_leader: bool = False
     union_id: Optional[str] = None
     subordinates: tuple[str, ...] = field(default_factory=tuple)
+    enterprise_email: str = ""
+    email: str = ""
 
 
 @dataclass(frozen=True)
@@ -335,8 +339,7 @@ class FeishuContactClient:
 
     def iter_department_user_records(self, dept_id: str) -> list[dict[str, Any]]:
         """Same find_by_department pull as fetch_department_users, but returns the
-        RAW user objects (which carry email / enterprise_email that DepartmentUser
-        drops). Additive — existing callers are untouched. Used by
+        RAW user objects (including fields beyond DepartmentUser). Additive — existing callers are untouched. Used by
         ``fetch_contact_directory`` to build an open_id -> {email, dept} map without
         a second auth path (reuses this client's tenant token)."""
         records: list[dict[str, Any]] = []
@@ -442,6 +445,18 @@ def build_org_snapshot(
                 continue
             agent_id = user.user_id or f"oid-{user.open_id[-8:]}"
             if agent_id in employees:
+                existing = employees[agent_id]
+                if existing.open_id != user.open_id or any(
+                    getattr(existing, field) and getattr(user, field)
+                    and getattr(existing, field).casefold() != getattr(user, field).casefold()
+                    for field in ("enterprise_email", "email")
+                ):
+                    raise FeishuOrgSyncError("department user identity conflict")
+                employees[agent_id] = replace(
+                    existing,
+                    enterprise_email=existing.enterprise_email or user.enterprise_email,
+                    email=existing.email or user.email,
+                )
                 continue
             employees[agent_id] = Employee(
                 open_id=user.open_id,
@@ -454,6 +469,8 @@ def build_org_snapshot(
                 leader_user_id=dept.leader_user_id,
                 is_leader=False,
                 union_id=user.union_id,
+                enterprise_email=user.enterprise_email,
+                email=user.email,
             )
 
     leader_ids = {dept.leader_user_id for dept in departments if dept.leader_user_id}
@@ -1718,6 +1735,8 @@ def _department_user_from_api(raw: dict[str, Any]) -> DepartmentUser:
         open_id=str(raw.get("open_id") or ""),
         user_id=raw.get("user_id") or None,
         union_id=raw.get("union_id") or None,
+        enterprise_email=raw.get("enterprise_email", "").strip() if isinstance(raw.get("enterprise_email"), str) else "",
+        email=raw.get("email", "").strip() if isinstance(raw.get("email"), str) else "",
     )
 
 

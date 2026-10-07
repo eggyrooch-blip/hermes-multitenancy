@@ -132,9 +132,7 @@ async def _stream_loop(
             )
         except ValueError:
             continue
-        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
-            config, provider, env_overrides
-        )
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider, env_overrides)
         if not api_key:
             continue
         base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)
@@ -974,6 +972,10 @@ async def _stream_aiagent_subprocess(
                     event, {k: v for k, v in data.items() if k != "event"}
                 )
             elif event_name in {
+                "subagent.start",
+                "subagent.tool",
+                "subagent.progress",
+                "subagent.complete",
                 "tool_started",
                 "tool_completed",
                 "approval_required",
@@ -985,6 +987,12 @@ async def _stream_aiagent_subprocess(
                 "auth_resolved",
                 "clarify_required",
                 "clarify_resolved",
+                # RequestAuthorization rides the same child→parent control
+                # channel as clarify/approval. Omitting the pair here drops the
+                # event silently: the tool blocks in-call for the full 10-minute
+                # window while the browser never sees a card (2026-09-08 live).
+                "authorization_required",
+                "authorization_resolved",
                 "harness_thread_bound",
             }:
                 payload_data = _redact_ingest_runtime_value(
@@ -1201,9 +1209,11 @@ async def _stream_aiagent_subprocess(
             # carries the turn's frozen identity (sender open_id, allowed bot
             # chats), so outliving the run it was minted for would widen that
             # authorization window. Slot release still happens after the scope
-            # exits, so a profile never has two live scopes at once — and the
-            # profile lock is still held here, so the worker being discarded is
-            # necessarily this run's own (no timeout/steal path to acquire it).
+            # exits, so warm runs of one profile never overlap (a one-shot
+            # fallback after a slot-wait timeout may run alongside, but it owns
+            # only per-run resources) — and the profile lock is still held
+            # here, so the worker being discarded is necessarily this run's own
+            # (no timeout/steal path to acquire it).
             #
             # The discard sits in its own try/finally: if it raises (a cancelled
             # teardown, a dead loop), the scope must still exit, or the broker

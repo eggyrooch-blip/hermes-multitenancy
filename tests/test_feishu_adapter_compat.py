@@ -10,6 +10,20 @@ from typing import Any
 from hermes_multitenancy import cron_worker
 from hermes_multitenancy import feishu_adapter_compat
 from hermes_multitenancy.feishu_inbound_richtext import install_feishu_inbound_richtext_patch
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_real_feishu_plugin(monkeypatch) -> None:
+    """Keep the real core feishu plugin out of these layout tests.
+
+    With core 0.21.4 installed, an earlier test on the same xdist worker may have
+    materialized the plugin loader's synthetic module (and ``load_feishu_module``
+    would materialize it on demand), so it would win over every fake layout
+    below. Each test that needs a synthetic module installs its own.
+    """
+    monkeypatch.delitem(sys.modules, feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAME, raising=False)
+    monkeypatch.setattr(feishu_adapter_compat, "_materialize_deferred_feishu_platform", lambda: None)
 
 
 @dataclass
@@ -18,6 +32,7 @@ class FakeNormalizedMessage:
     text_content: str = ""
     image_keys: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    media_refs: list[Any] = field(default_factory=list)
 
 
 class FakeFeishuAdapter:

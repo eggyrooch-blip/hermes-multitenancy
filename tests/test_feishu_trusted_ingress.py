@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -158,6 +160,51 @@ def test_ticket_type_is_bound_to_issuing_adapter_not_reloaded_module(routes, mon
 
     assert admission is not None
     assert admission.profile_name == "profile_a"
+
+
+def test_envelope_validation_keeps_issuing_adapter_after_module_replaced(routes, monkeypatch):
+    """Review P1 (adapter-provenance-lost): validation after admission must use
+    the issuing adapter's ticket class, not a re-materialized module's."""
+    from hermes_multitenancy.feishu_ingress_compat import (
+        _TrustedFeishuEnvelope,
+        _envelope_allowed,
+    )
+
+    def issuer_template(self):
+        return TrustedFeishuIngressTicket
+
+    issuer = FunctionType(
+        issuer_template.__code__,
+        {"TrustedFeishuIngressTicket": FakeTicket},
+        name=issuer_template.__name__,
+    )
+    adapter = type(
+        "BoundAdapter",
+        (),
+        {"_app_id": "cli_trusted", "_issue_trusted_ingress_ticket": issuer},
+    )()
+    ticket = FakeTicket("ou_a", "evt_envelope_after_reload")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=adapter)
+    assert admission is not None
+
+    monkeypatch.setattr(
+        ingress,
+        "load_feishu_module",
+        lambda: NS(TrustedFeishuIngressTicket=type("ReplacementTicket", (), {})),
+    )
+    envelope = _TrustedFeishuEnvelope(object(), ticket, admission)
+
+    assert _envelope_allowed(adapter, envelope)
+    event = NS(
+        source=NS(platform="feishu", user_id=ticket.actor_id, chat_id=ticket.chat_id,
+                  chat_type=admission.chat_type),
+        message_id=ticket.message_id,
+        trusted_feishu_ingress_ticket=ticket,
+        trusted_feishu_ingress_admission=admission,
+    )
+    # Without the adapter the replaced module's class is used and denies.
+    assert not ingress.validate_admitted_feishu_event(event)
+    assert ingress.validate_admitted_feishu_event(event, adapter=adapter)
 
 
 def test_human_denial_logs_only_reason_and_fingerprints(routes, caplog):
@@ -495,6 +542,8 @@ def test_real_agent_ticket_crosses_mt_runtime_boundary(
     # the suite-wide Feishu registry isolation fixture clears that state.
     discover_plugins(force=True)
     feishu = load_live_feishu_module()
+    monkeypatch.setattr(ingress, "load_live_feishu_module", lambda: feishu)
+    ingress.install_trusted_feishu_ingress_admission()
     assert hasattr(feishu.FeishuAdapter, "_trusted_ingress_admitter")
     monkeypatch.setattr(ingress, "load_feishu_module", lambda: feishu)
     captured = {}
@@ -1046,3 +1095,654 @@ def test_bot_throttle_map_is_ttl_and_size_bounded(routes, tmp_path):
     with ingress._seen_lock:
         assert "oc_stale" not in ingress._bot_last_admit
         assert len(ingress._bot_last_admit) <= ingress._BOT_ADMIT_MAX
+
+
+@pytest.fixture
+def stock_ingress(routes, monkeypatch):
+    """Exercise MT wrappers on the real stock class, without SDK/network calls."""
+    from hermes_cli import __version__
+
+    if tuple(int(part) for part in __version__.split(".")[:3]) < (0, 21, 3):
+        pytest.skip("stock 0.21.3 ingress adapter tests do not apply to this older core")
+    from plugins.platforms.feishu import adapter as stock
+    from hermes_multitenancy.feishu_ingress_compat import install_stock_feishu_ingress
+
+    class Adapter(stock.FeishuAdapter):
+        pass
+
+    seen = []
+    monkeypatch.setattr(Adapter, "_on_message_event", lambda self, data: seen.append(data))
+    monkeypatch.setattr(Adapter, "_on_card_action_trigger", lambda self, data: seen.append(data))
+    module = NS(FeishuAdapter=Adapter)
+    install_stock_feishu_ingress(module)
+    Adapter._trusted_ingress_admitter = staticmethod(ingress.admit_trusted_feishu_ingress)
+    monkeypatch.setattr(ingress, "load_feishu_module", lambda: module)
+    adapter = object.__new__(Adapter)
+    adapter._app_id = "cli_trusted"
+    adapter.platform = stock.Platform.FEISHU
+    return adapter, seen, module
+
+
+def _stock_callback(actor="ou_a", *, card=False, form=False, event_id="evt_stock"):
+    return NS(header=NS(event_id=event_id), event=NS(
+        sender=NS(sender_id=NS(open_id=actor), sender_type="user"),
+        message=None if card else NS(chat_id="oc_dm", message_id="om_stock"),
+        operator=NS(open_id=actor),
+        context=NS(open_chat_id="oc_dm", open_message_id="om_stock"),
+        action=NS(tag="button", form_value={} if form else None),
+    ))
+
+
+@pytest.mark.parametrize("card,form", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("transport", ["websocket", "webhook"])
+def test_stock_callbacks_are_admitted_before_inline_handlers(stock_ingress, card, form, transport):
+    from hermes_multitenancy.feishu_ingress_compat import _transport
+
+    adapter, seen, _module = stock_ingress
+    token = _transport.set(transport)
+    try:
+        callback = adapter._on_card_action_trigger if card else adapter._on_message_event
+        callback(_stock_callback(card=card, form=form))
+        assert len(seen) == 1
+        envelope = seen[0]
+        assert envelope.trusted_feishu_ingress_ticket.transport == transport
+        assert envelope.trusted_feishu_ingress_ticket.event_kind == (
+            "form" if form else "button" if card else "message"
+        )
+        assert envelope.trusted_feishu_ingress_admission.profile_name == "profile_a"
+        callback(_stock_callback(card=card, form=form))  # replay
+        callback(_stock_callback(actor="ou_unknown", card=card, form=form, event_id="bad"))
+        assert len(seen) == 1
+    finally:
+        _transport.reset(token)
+
+
+def test_stock_comment_and_meeting_callbacks_deny_before_side_effects(stock_ingress):
+    adapter, seen, _module = stock_ingress
+    adapter._on_drive_comment_event(_stock_callback())
+    adapter._on_meeting_invited_event(_stock_callback())
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_stock_guard_rechecks_actor_route_and_rejects_unstamped_events(stock_ingress, routes):
+    adapter, seen, _module = stock_ingress
+    adapter._on_message_event(_stock_callback())
+    envelope = seen.pop()
+    handled = []
+
+    async def handle(event):
+        handled.append(event)
+
+    adapter.handle_message = handle
+    adapter._get_chat_lock = lambda _chat: asyncio.Lock()
+    def event(actor="ou_a", raw=envelope):
+        return NS(source=NS(platform="feishu", user_id=actor, chat_id="oc_dm", chat_type="p2p"),
+                  message_id="om_stock", raw_message=raw)
+
+    await adapter._dispatch_inbound_event(event())
+    await adapter._dispatch_inbound_event(event(actor="ou_b"))
+    mixed_actor = event()
+    mixed_actor.source.user_id_alt = "on_b"
+    await adapter._dispatch_inbound_event(mixed_actor)
+    await adapter._dispatch_inbound_event(event(raw=_stock_callback()))
+    assert len(handled) == 1
+    routes.upsert(user_id="u_a", profile_name="profile_b", open_id="ou_a", union_id="on_a")
+    await adapter._dispatch_inbound_event(event())
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["cli_trusted", "cli_other"])
+async def test_stock_reaction_uses_api_verified_chat_and_own_message(stock_ingress, owner):
+    from hermes_multitenancy.feishu_ingress_compat import _PendingReaction
+
+    adapter, seen, _module = stock_ingress
+    adapter._client = NS(im=NS(v1=NS(message=NS(get=object()))))
+    adapter._build_get_message_request = lambda ident: ident
+    adapter._response_succeeded = lambda response: True
+    async def run_blocking(_method, message_id):
+        assert message_id == "om_reaction"
+        return NS(data=NS(items=[NS(sender=NS(id=owner), chat_id="oc_dm", chat_type="p2p")]))
+    adapter._run_blocking = run_blocking
+    async def profile(_ident):
+        return {"user_id": "u_a", "user_id_alt": "on_a", "user_name": "A"}
+    async def chat(_chat):
+        return {"name": "DM", "chat_type": "p2p"}
+    async def handle(event):
+        seen.append(event)
+    adapter._resolve_sender_profile = profile
+    adapter.get_chat_info = chat
+    adapter._resolve_channel_prompt = lambda _chat: None
+    adapter._get_chat_lock = lambda _chat: asyncio.Lock()
+    adapter.handle_message = handle
+    data = NS(header=NS(event_id="reaction_1"), event=NS(
+        user_id=NS(open_id="ou_a", user_id="u_a", union_id="on_a"), operator_type="user", message_id="om_reaction",
+        chat_id="oc_untrusted", reaction_type=NS(emoji_type="OK"),
+    ))
+    await adapter._handle_reaction_event(
+        "im.message.reaction.created_v1",
+        _PendingReaction(data, "im.message.reaction.created_v1", "websocket"),
+    )
+    assert len(seen) == (1 if owner == "cli_trusted" else 0)
+    if seen:
+        assert seen[0].trusted_feishu_ingress_ticket.chat_id == "oc_dm"
+        assert seen[0].trusted_feishu_ingress_admission.profile_name == "profile_a"
+
+
+def test_stock_unknown_adapter_fails_closed():
+    from hermes_multitenancy.feishu_ingress_compat import install_stock_feishu_ingress
+
+    with pytest.raises(RuntimeError, match="startup denied"):
+        install_stock_feishu_ingress(NS(FeishuAdapter=type("UnknownAdapter", (), {})))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_stock_webhook_authenticates_before_issuing_ticket(stock_ingress, valid):
+    import hashlib
+    import json
+
+    adapter, seen, _module = stock_ingress
+    adapter._verification_token = "test-verification"
+    adapter._encrypt_key = "test-signature-key"
+    adapter._webhook_path = "/feishu"
+    adapter._check_webhook_rate_limit = lambda _key: True
+    adapter._record_webhook_anomaly = lambda *_args: None
+    adapter._clear_webhook_anomaly = lambda _remote: None
+    payload = {
+        "header": {"event_id": "webhook_1", "event_type": "im.message.receive_v1",
+                   "token": "test-verification"},
+        "event": {"sender": {"sender_id": {"open_id": "ou_a"}, "sender_type": "user"},
+                  "message": {"chat_id": "oc_dm", "message_id": "om_webhook"}},
+    }
+    body = json.dumps(payload).encode()
+    class Content:
+        async def readexactly(self, size):
+            raise asyncio.IncompleteReadError(body, size)
+    timestamp, nonce = str(int(time.time())), "nonce"
+    signature = hashlib.sha256((timestamp + nonce + adapter._encrypt_key).encode() + body).hexdigest()
+    response = await adapter._handle_webhook_request(NS(
+        remote="127.0.0.1", content=Content(), content_length=len(body),
+        headers={"Content-Type": "application/json", "x-lark-request-timestamp": timestamp,
+                 "x-lark-request-nonce": nonce, "x-lark-signature": signature if valid else "invalid"},
+    ))
+    assert response.status == (200 if valid else 401)
+    assert len(seen) == (1 if valid else 0)
+    if seen:
+        assert seen[0].trusted_feishu_ingress_ticket.transport == "webhook"
+
+
+def test_stock_sdk_registers_admitted_callbacks(stock_ingress, monkeypatch):
+    from plugins.platforms.feishu import adapter as stock
+
+    adapter, seen, _module = stock_ingress
+    callbacks = {}
+    class Builder:
+        def __getattr__(self, name):
+            def register(*args):
+                callbacks[args[0] if name == "register_p2_customized_event" else name] = args[-1]
+                return self
+            return register
+        def build(self):
+            return self
+    monkeypatch.setattr(stock, "EventDispatcherHandler", NS(builder=lambda *_args: Builder()))
+    adapter._encrypt_key = ""
+    adapter._verification_token = ""
+    adapter._build_event_handler()
+    callbacks["register_p2_im_message_receive_v1"](_stock_callback())
+    callbacks["register_p2_card_action_trigger"](_stock_callback(card=True, event_id="card_1"))
+    callbacks["drive.notice.comment_add_v1"](_stock_callback(event_id="comment_1"))
+    callbacks["vc.bot.meeting_invited_v1"](_stock_callback(event_id="meeting_1"))
+    assert len(seen) == 2
+    assert all(item.trusted_feishu_ingress_ticket.transport == "websocket" for item in seen)
+
+
+@pytest.mark.asyncio
+async def test_stock_three_tier_message_identity_is_preserved(stock_ingress):
+    from plugins.platforms.feishu.adapter import MessageType
+
+    adapter, seen, _module = stock_ingress
+    data = _stock_callback()
+    data.event.sender.sender_id = NS(open_id="ou_a", user_id="u_a", union_id="on_a")
+    adapter._on_message_event(data)
+    envelope = seen.pop()
+    async def content(_message):
+        return "hello", MessageType.TEXT, [], [], [], []
+    async def chat(_chat):
+        return {"name": "DM", "chat_type": "p2p"}
+    async def name(*_args, **_kwargs):
+        return "A"
+    async def handle(event):
+        seen.append(event)
+    adapter._extract_message_content = content
+    adapter.get_chat_info = chat
+    adapter._resolve_sender_name_from_api = name
+    adapter._resolve_channel_prompt = lambda *_args: None
+    adapter._get_chat_lock = lambda _chat: asyncio.Lock()
+    adapter.handle_message = handle
+    await adapter._process_inbound_message(
+        data=envelope, message=data.event.message, sender_id=data.event.sender.sender_id,
+        chat_type="p2p", message_id="om_stock",
+    )
+    assert len(seen) == 1
+    assert seen[0].source.user_id == "u_a"
+    assert seen[0].source.user_id_alt == "on_a"
+    assert seen[0].sender_open_id == "ou_a"
+    assert ingress.validate_admitted_feishu_event(seen[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["approval", "update"])
+@pytest.mark.parametrize("attack", ["other_actor", "unknown_actor", "message", "chat", "route", "late_route", "unadmitted", "valid"])
+async def test_stock_prompt_binds_original_actor_and_rechecks_on_loop(routes, monkeypatch, kind, attack):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.feishu import adapter as stock
+    from hermes_multitenancy.feishu_ingress_compat import (
+        _TrustedFeishuEnvelope, install_stock_feishu_ingress,
+    )
+    import tools.approval
+
+    class Adapter(stock.FeishuAdapter):
+        pass
+
+    module = NS(FeishuAdapter=Adapter)
+    install_stock_feishu_ingress(module)
+    Adapter._trusted_ingress_admitter = staticmethod(ingress.admit_trusted_feishu_ingress)
+    monkeypatch.setattr(ingress, "load_feishu_module", lambda: module)
+    adapter = Adapter(PlatformConfig(enabled=True, extra={"app_id": "cli_trusted"}))
+    adapter._app_id = "cli_trusted"
+    adapter._client = object()
+    adapter._loop = asyncio.get_running_loop()
+    adapter._admins = adapter._allowed_group_users = set()
+    tasks, resolved = [], []
+
+    def submit(_loop, coro):
+        tasks.append(asyncio.create_task(coro))
+        return True
+
+    adapter._submit_on_loop = submit
+    monkeypatch.setattr(tools.approval, "resolve_gateway_approval", lambda session, choice: resolved.append(choice) or 1)
+    adapter._write_update_prompt_response = lambda answer: resolved.append(answer)
+
+    async def send(**kwargs):
+        return object()
+
+    adapter._feishu_send_with_retry = send
+    adapter._finalize_send_result = lambda *args: SendResult(success=True, message_id="om_card")
+
+    def prompt():
+        if kind == "approval":
+            return adapter.send_exec_approval("oc_dm", "echo safe", "owner_a")
+        return adapter.send_update_prompt("oc_dm", "safe?", session_key="owner_a")
+
+    # An ambient caller cannot provide its own actor/profile strings and mint a card.
+    assert not (await prompt()).success
+    ticket = adapter._issue_trusted_ingress_ticket("im.message.receive_v1", _stock_callback(), transport="websocket")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=adapter)
+    envelope = _TrustedFeishuEnvelope(_stock_callback(), ticket, admission)
+    event = NS(source=NS(platform="feishu", user_id="ou_a", chat_id="oc_dm", chat_type="p2p"),
+               message_id="om_stock", raw_message=envelope)
+
+    async def handle(_event):
+        # Core copies ContextVars to its worker, then submits the card coroutine
+        # back onto the gateway loop. Exercise both hops with the real sender.
+        result = await asyncio.to_thread(lambda: asyncio.run_coroutine_threadsafe(prompt(), adapter._loop).result(5))
+        assert result.success
+
+    adapter.handle_message = handle
+    await adapter._dispatch_inbound_event(event)
+    states = adapter._approval_state if kind == "approval" else adapter._update_prompt_state
+    ident = next(iter(states))
+    assert states[ident]["actor_id"] == "ou_a"
+    assert states[ident]["profile_name"] == "profile_a"
+    value = ({"hermes_action": "approve_once", "approval_id": ident} if kind == "approval"
+             else {"hermes_update_prompt_action": "y", "update_prompt_id": ident})
+    actor = "ou_b" if attack == "other_actor" else "ou_unknown" if attack == "unknown_actor" else "ou_a"
+    data = _stock_callback(actor, card=True, event_id="card_answer")
+    data.event.action.value = value
+    data.event.context.open_message_id = "om_wrong" if attack == "message" else "om_card"
+    if attack == "chat":
+        data.event.context.open_chat_id = "oc_other"
+    if attack == "route":
+        routes.upsert(user_id="u_a", profile_name="profile_b", open_id="ou_a", union_id="on_a")
+    if attack == "unadmitted":
+        handler = adapter._handle_approval_card_action if kind == "approval" else adapter._handle_update_prompt_card_action
+        handler(event=data.event, action_value=value, loop=adapter._loop)
+    else:
+        adapter._on_card_action_trigger(data)
+    if attack == "late_route":
+        routes.upsert(user_id="u_a", profile_name="profile_b", open_id="ou_a", union_id="on_a")
+    if tasks:
+        await asyncio.gather(*tasks)
+    assert resolved == (["once" if kind == "approval" else "y"] if attack == "valid" else [])
+    assert (ident not in states) == (attack == "valid")
+
+
+# ── Round 5: owner binding outlives the 300s ticket; text answers need the owner ──
+
+def _group_callback(actor, *, chat_id="oc_group", message_id="om_group", event_id="evt_group_msg"):
+    return NS(header=NS(event_id=event_id), event=NS(
+        sender=NS(sender_id=NS(open_id=actor), sender_type="user"),
+        message=NS(chat_id=chat_id, message_id=message_id),
+        operator=NS(open_id=actor),
+        context=NS(open_chat_id=chat_id, open_message_id=message_id),
+        action=NS(tag="button", form_value=None),
+    ))
+
+
+def _real_prompt_adapter(monkeypatch):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.feishu import adapter as stock
+    from hermes_multitenancy.feishu_ingress_compat import install_stock_feishu_ingress
+    import tools.approval
+
+    # install() wraps register_gateway_notify process-wide; restore it after the test.
+    monkeypatch.setattr(tools.approval, "register_gateway_notify", tools.approval.register_gateway_notify)
+
+    class Adapter(stock.FeishuAdapter):
+        pass
+
+    module = NS(FeishuAdapter=Adapter)
+    install_stock_feishu_ingress(module)
+    Adapter._trusted_ingress_admitter = staticmethod(ingress.admit_trusted_feishu_ingress)
+    monkeypatch.setattr(ingress, "load_feishu_module", lambda: module)
+    adapter = Adapter(PlatformConfig(enabled=True, extra={"app_id": "cli_trusted"}))
+    adapter._app_id = "cli_trusted"
+    adapter._client = object()
+    adapter._loop = asyncio.get_running_loop()
+    adapter._admins = adapter._allowed_group_users = set()
+    tasks, sent = [], []
+
+    def submit(_loop, coro):
+        tasks.append(asyncio.create_task(coro))
+        return True
+
+    async def send(**kwargs):
+        sent.append(kwargs)
+        return object()
+
+    adapter._submit_on_loop = submit
+    adapter._feishu_send_with_retry = send
+    adapter._finalize_send_result = lambda *args: SendResult(success=True, message_id="om_card")
+    return adapter, tasks, sent
+
+
+def _admitted_event(adapter, actor, *, chat_id="oc_dm", chat_type="p2p", message_id="om_stock",
+                    event_id="evt_stock", text=""):
+    from hermes_multitenancy.feishu_ingress_compat import _TrustedFeishuEnvelope
+
+    callback = (_stock_callback(actor, event_id=event_id) if chat_id == "oc_dm"
+                else _group_callback(actor, chat_id=chat_id, message_id=message_id, event_id=event_id))
+    ticket = adapter._issue_trusted_ingress_ticket("im.message.receive_v1", callback, transport="websocket")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=adapter)
+    assert admission is not None
+    envelope = _TrustedFeishuEnvelope(callback, ticket, admission)
+    args = text.split(maxsplit=1)[1] if " " in text else ""
+    # Stamped the way the MT guard stamps an admitted event before core sees it.
+    return NS(source=NS(platform="feishu", user_id=actor, chat_id=chat_id, chat_type=chat_type),
+              message_id=ticket.message_id, raw_message=envelope, text=text,
+              get_command_args=lambda: args, trusted_feishu_ingress_ticket=ticket,
+              trusted_feishu_ingress_admission=admission)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clicker", ["ou_a", "ou_b"])
+async def test_long_turn_approval_card_stays_bound_to_original_actor(routes, monkeypatch, clicker):
+    """A turn that needs approval after the 300s ticket expired still gets an owner-bound card."""
+    import tools.approval
+
+    adapter, tasks, _sent = _real_prompt_adapter(monkeypatch)
+    resolved = []
+    monkeypatch.setattr(tools.approval, "resolve_gateway_approval", lambda session, choice: resolved.append(choice) or 1)
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+    event = _admitted_event(adapter, "ou_a")
+
+    async def handle(_event):
+        offset[0] = 400.0  # the agent turn outlived the originating ticket
+        result = await asyncio.to_thread(lambda: asyncio.run_coroutine_threadsafe(
+            adapter.send_exec_approval("oc_dm", "echo safe", "owner_a"), adapter._loop).result(5))
+        assert result.success
+
+    adapter.handle_message = handle
+    await adapter._dispatch_inbound_event(event)
+    ident = next(iter(adapter._approval_state))
+    assert adapter._approval_state[ident]["actor_id"] == "ou_a"
+    data = _stock_callback(clicker, card=True, event_id=f"late_click_{clicker}")
+    data.event.action.value = {"hermes_action": "approve_once", "approval_id": ident}
+    data.event.context.open_message_id = "om_card"
+    adapter._on_card_action_trigger(data)
+    if tasks:
+        await asyncio.gather(*tasks)
+    assert resolved == (["once"] if clicker == "ou_a" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["ambient", "route_changed"])
+async def test_unbound_approval_is_declined_with_notice_never_text(routes, monkeypatch, case):
+    from gateway.relay.egress import declined_send
+    from hermes_multitenancy.feishu_ingress_compat import _APPROVAL_OWNER_UNAVAILABLE_NOTICE
+
+    adapter, _tasks, sent = _real_prompt_adapter(monkeypatch)
+    results = []
+
+    async def prompt():
+        return await adapter.send_exec_approval("oc_dm", "echo safe", "owner_a")
+
+    if case == "ambient":
+        results.append(await prompt())
+    else:
+        async def handle(_event):
+            routes.upsert(user_id="u_a", profile_name="profile_b", open_id="ou_a", union_id="on_a")
+            results.append(await asyncio.to_thread(
+                lambda: asyncio.run_coroutine_threadsafe(prompt(), adapter._loop).result(5)))
+
+        adapter.handle_message = handle
+        await adapter._dispatch_inbound_event(_admitted_event(adapter, "ou_a"))
+    [result] = results
+    assert not result.success
+    # "declined" makes core raise instead of re-sending the prompt as answerable text.
+    assert declined_send(result)
+    assert adapter._approval_state == {}
+    assert [json.loads(call["payload"]).get("text") for call in sent] == [_APPROVAL_OWNER_UNAVAILABLE_NOTICE]
+
+
+_THREAD_SESSION = "agent:main:feishu:group:oc_group:om_topic_root"
+
+
+def _shared_thread_runner():
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+    from hermes_multitenancy.gateway_ownership import _patch_gateway_text_approval_owner
+
+    class Runner(GatewaySlashCommandsMixin):
+        _pending_approvals: dict = {}
+
+        def _session_key_for_source(self, source):
+            return _THREAD_SESSION  # thread_sessions_per_user=False: one session per topic thread
+
+        async def _deliver_approval_confirmation(self, event, confirmation_text, verb):
+            return confirmation_text
+
+    _patch_gateway_text_approval_owner(Runner)
+    return Runner()
+
+
+@pytest.mark.asyncio
+async def test_shared_thread_text_approval_only_by_the_requesting_actor(routes, monkeypatch, tmp_path):
+    import contextvars
+    import threading
+    import tools.approval
+    from tools.approval_gateway_wait import _await_gateway_decision
+    from hermes_multitenancy.gateway_ownership import _TEXT_APPROVAL_NOT_OWNER
+
+    routes.upsert_group(chat_id="oc_group", profile_name="profile_group", owner_open_id="ou_a",
+                        display_label="group")
+    (tmp_path / "profile_group").mkdir()
+    adapter, _tasks, _sent = _real_prompt_adapter(monkeypatch)
+    runner = _shared_thread_runner()
+    notified, decisions = [], []
+    started = threading.Event()
+
+    async def handle(_event):
+        # Core registers the turn's notify callback and the agent thread (a copy of this
+        # admitted context) blocks on the dangerous-command approval.
+        tools.approval.register_gateway_notify(_THREAD_SESSION, lambda data: (notified.append(data), started.set()))
+        notify = tools.approval._gateway_notify_cbs[_THREAD_SESSION]
+        ctx = contextvars.copy_context()
+        threading.Thread(target=ctx.run, args=(lambda: decisions.append(_await_gateway_decision(
+            _THREAD_SESSION, notify, {"command": "rm -rf /tmp/r5", "description": "d", "pattern_key": "k"})),),
+            daemon=True).start()
+
+    adapter.handle_message = handle
+    try:
+        await adapter._dispatch_inbound_event(_admitted_event(
+            adapter, "ou_a", chat_id="oc_group", chat_type="group", message_id="om_owner", event_id="evt_owner"))
+        assert await asyncio.to_thread(started.wait, 5)
+
+        for n, text in enumerate(("/approve", "/approve all", "/deny", "/deny all no")):
+            other = _admitted_event(adapter, "ou_b", chat_id="oc_group", chat_type="group",
+                                    message_id=f"om_b{n}", event_id=f"evt_b{n}", text=text)
+            handler = runner._handle_approve_command if text.startswith("/approve") else runner._handle_deny_command
+            assert await handler(other) == _TEXT_APPROVAL_NOT_OWNER
+        assert tools.approval.has_blocking_approval(_THREAD_SESSION)
+        assert decisions == []
+
+        owner = _admitted_event(adapter, "ou_a", chat_id="oc_group", chat_type="group",
+                                message_id="om_a2", event_id="evt_a2", text="/approve")
+        assert await runner._handle_approve_command(owner) != _TEXT_APPROVAL_NOT_OWNER
+        for _ in range(50):
+            if decisions:
+                break
+            await asyncio.sleep(0.05)
+        assert decisions and decisions[0]["choice"] == "once"
+    finally:
+        tools.approval.unregister_gateway_notify(_THREAD_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_text_approval_without_recorded_owner_is_refused(routes, monkeypatch):
+    """An approval raised outside any admitted Feishu turn has no owner: text cannot answer it."""
+    import threading
+    import tools.approval
+    from tools.approval_gateway_wait import _await_gateway_decision
+    from hermes_multitenancy.gateway_ownership import _TEXT_APPROVAL_NOT_OWNER
+
+    adapter, _tasks, _sent = _real_prompt_adapter(monkeypatch)
+    runner = _shared_thread_runner()
+    started = threading.Event()
+    tools.approval.register_gateway_notify(_THREAD_SESSION, lambda data: started.set())
+    notify = tools.approval._gateway_notify_cbs[_THREAD_SESSION]
+    threading.Thread(target=lambda: _await_gateway_decision(
+        _THREAD_SESSION, notify, {"command": "rm -rf /tmp/r5", "description": "d", "pattern_key": "k"}),
+        daemon=True).start()
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        event = _admitted_event(adapter, "ou_a", text="/approve")
+        assert await runner._handle_approve_command(event) == _TEXT_APPROVAL_NOT_OWNER
+        assert tools.approval.has_blocking_approval(_THREAD_SESSION)
+    finally:
+        tools.approval.unregister_gateway_notify(_THREAD_SESSION)
+
+
+# ---------------------------------------------------------------------------
+# Round 6: a second MT copy (another HERMES_HOME's PluginManager loading the
+# entry point) must not take over ingress.
+# ---------------------------------------------------------------------------
+
+_MT_OWNER_ATTR = "_hermes_multitenancy_registered_module"
+
+
+@contextmanager
+def _second_mt_copy(name="hermes_mt_dup_home_b"):
+    import importlib.util
+
+    import hermes_multitenancy as owner
+
+    package_dir = Path(owner.__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        name, package_dir / "__init__.py", submodule_search_locations=[str(package_dir)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        for loaded in list(sys.modules):
+            if loaded == name or loaded.startswith(name + "."):
+                sys.modules.pop(loaded, None)
+
+
+def test_second_mt_copy_keeps_admitter_and_inbound_still_admitted(
+    stock_ingress, monkeypatch, tmp_path,
+):
+    import hermes_multitenancy
+    from hermes_multitenancy import plugin_entry
+
+    adapter, seen, module = stock_ingress
+    Adapter = type(adapter)
+    # The first (directory-plugin) copy registered and owns the live adapter.
+    monkeypatch.setattr(sys, _MT_OWNER_ATTR, hermes_multitenancy.__name__, raising=False)
+    owner_admitter = Adapter._trusted_ingress_admitter
+    assert owner_admitter is ingress.admit_trusted_feishu_ingress
+
+    hooks = []
+
+    class Ctx:
+        def register_hook(self, name, callback):
+            hooks.append((name, callback))
+
+    with _second_mt_copy() as dup:
+        dup_ingress = importlib.import_module(f"{dup.__name__}.trusted_feishu_ingress")
+        monkeypatch.setattr(dup_ingress, "load_live_feishu_module", lambda: module)
+        monkeypatch.setattr(dup_ingress, "load_feishu_module", lambda: module)
+        # What the copy's _register would do first: install its own ingress.
+        monkeypatch.setattr(dup, "_register", lambda ctx: dup_ingress.install_trusted_feishu_ingress_admission())
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "tenant_b"))
+        dup.register(Ctx())
+
+    assert Adapter._trusted_ingress_admitter is owner_admitter
+    assert getattr(sys, _MT_OWNER_ATTR) == hermes_multitenancy.__name__
+    # The other home's manager still carries MT's hooks — the owner's callables.
+    assert dict(hooks)["pre_gateway_dispatch"] is plugin_entry._dispatch_with_worker_init
+    assert [name for name, _ in hooks] == ["post_tool_call", "transform_tool_result", "pre_gateway_dispatch"]
+
+    adapter._on_message_event(_stock_callback(event_id="evt_after_dup"))
+    assert len(seen) == 1
+    assert seen[0].trusted_feishu_ingress_admission.profile_name == "profile_a"
+
+
+def test_second_copy_admitter_install_refuses_to_replace_owner(stock_ingress, monkeypatch):
+    adapter, _seen, module = stock_ingress
+    Adapter = type(adapter)
+    with _second_mt_copy("hermes_mt_dup_install") as dup:
+        dup_ingress = importlib.import_module(f"{dup.__name__}.trusted_feishu_ingress")
+        monkeypatch.setattr(dup_ingress, "load_live_feishu_module", lambda: module)
+        with pytest.raises(RuntimeError, match="already installed by hermes_multitenancy.trusted_feishu_ingress"):
+            dup_ingress.install_trusted_feishu_ingress_admission()
+    assert Adapter._trusted_ingress_admitter is ingress.admit_trusted_feishu_ingress
+    # Re-installing from the owner copy stays idempotent.
+    ingress.install_trusted_feishu_ingress_admission()
+    assert Adapter._trusted_ingress_admitter is ingress.admit_trusted_feishu_ingress
+
+
+def test_rejected_envelope_is_logged_with_message_id_and_reason(stock_ingress, caplog):
+    adapter, seen, _module = stock_ingress
+    Adapter = type(adapter)
+
+    def foreign_admitter(*, ticket, adapter):
+        admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=adapter)
+        return replace(admission, _seal=object())  # what another copy's admission looks like
+
+    Adapter._trusted_ingress_admitter = staticmethod(foreign_admitter)
+    with caplog.at_level("WARNING"):
+        adapter._on_message_event(_stock_callback(event_id="evt_foreign"))
+    assert seen == []
+    assert (
+        "envelope rejected callback=_on_message_event message_id=om_stock "
+        "reason=admission_not_from_this_copy"
+    ) in caplog.text

@@ -26,7 +26,7 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
 # (agent_id/expert_id) deliberately stays out: see the note above.
 _UPDATE_ALLOWED_FIELDS = {
     "name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
-    "model", "provider",
+    "model", "provider", "context_from",
 }
 _MAX_NAME_LENGTH = 200
 _MAX_PROMPT_LENGTH = 5000
@@ -137,6 +137,26 @@ def cron_profile_scope(profile_home: Path) -> Iterator[Any]:
                 os.environ["HERMES_HOME"] = saved_env_home
 
 
+def _continuity_fields(body: dict[str, Any]) -> dict[str, Any]:
+    result = dict(body)
+    if "continuity" in result:
+        enabled = result.pop("continuity")
+        if not isinstance(enabled, bool):
+            raise CronApiError("continuity must be a boolean", 400)
+        expected = ["self"] if enabled else []
+        if "context_from" in result and result["context_from"] not in (expected, "self" if enabled else None):
+            raise CronApiError("conflicting continuity context", 400)
+        result["context_from"] = expected
+    if "context_from" in result:
+        refs = result["context_from"]
+        if refs == "self":
+            refs = ["self"]
+        if refs not in (None, [], ["self"]):
+            raise CronApiError("only this job's own continuity context is supported", 400)
+        result["context_from"] = refs or []
+    return result
+
+
 def _validate_common_fields(body: dict[str, Any], *, require_create_fields: bool) -> None:
     name = body.get("name")
     schedule = body.get("schedule")
@@ -218,6 +238,7 @@ def create_job(
     user_key = str(user_key or "").strip()
     if not user_key:
         raise CronApiError("user_key is required", 400)
+    body = _continuity_fields(body)
     _validate_common_fields(body, require_create_fields=True)
     # agent_id is server-derived by the broker handler from the access-checked
     # profile's routing row — never taken from the client body.
@@ -234,6 +255,8 @@ def create_job(
         "name": str(body.get("name") or "").strip(),
         "deliver": deliver,
     }
+    if "context_from" in body:
+        kwargs["context_from"] = body["context_from"]
     if body.get("skills"):
         kwargs["skills"] = body.get("skills")
     if body.get("repeat") is not None:
@@ -284,6 +307,7 @@ def create_job(
 
 def update_job(profile_name: str, job_id: str, body: dict[str, Any]) -> dict[str, Any]:
     job_id = validate_job_id(job_id)
+    body = _continuity_fields(body)
     sanitized = {k: v for k, v in body.items() if k in _UPDATE_ALLOWED_FIELDS}
     if not sanitized:
         raise CronApiError("No valid fields to update", 400)

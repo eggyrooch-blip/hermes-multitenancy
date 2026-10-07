@@ -25,6 +25,10 @@ ALLOW_UNREADABLE="${ALLOW_UNREADABLE:-0}"
 # 排除清单默认跟脚本放在一起（部署后是 deploy/hermes-backup-excludes.txt）
 EXCLUDE_FILE="${EXCLUDE_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-backup-excludes.txt}"
 LOCK_FILE="${LOCK_FILE:-$BACKUP_ROOT/.lock}"
+RSYNC_BWLIMIT_KBPS="${RSYNC_BWLIMIT_KBPS:-1024}"
+# ionice 的可执行名。生产（util-linux）有，macOS 没有，所以必须能退化。
+# 留成变量只为一件事：让测试能确定性地跑「机器上没有 ionice」那条分支。
+IONICE_BIN="${IONICE_BIN:-ionice}"
 
 TS="$(date +%Y%m%dT%H%M%S)"
 STATE_ROOT="$BACKUP_ROOT/state"
@@ -32,6 +36,25 @@ PROFILES_ROOT="$BACKUP_ROOT/profiles"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# 共享盘的补备写入曾阻塞 gateway heartbeat；优先级不能代替吞吐上限。
+# ponytail: 仅限制 rsync 传输，目录扫描/校验仍由既有 IO 优先级控制。
+[[ "$RSYNC_BWLIMIT_KBPS" =~ ^[1-9][0-9]*$ ]] \
+  || die "RSYNC_BWLIMIT_KBPS 必须为正整数 KiB/s（0 会关闭限速，拒绝）"
+
+# ── 重 IO 一律降到 idle 类 ──────────────────────────────────────────
+# 2026-09-18 与 2026-09-21 两次发布的「发布前回滚包」各把 gateway 卡死 13 分钟：
+# 两个库共 230MB 的 sqlite .backup + integrity_check 无限速地打在机械盘上，
+# 而这条路径 SKIP_PROFILES=1，RSYNC_BWLIMIT_KBPS 根本轮不到生效。
+# unit 级 IOSchedulingClass=best-effort prio 7 在 wbt 把队列深度压到 1 时没有意义 ——
+# 只有 idle 类（-c3）才会在别人要 IO 时彻底让路。CPU 侧顺手压到最低。
+# nice/ionice 的设置会被子进程继承，所以包住 xargs 就等于包住 sha256sum。
+if command -v "$IONICE_BIN" >/dev/null 2>&1; then
+  run_io() { "$IONICE_BIN" -c3 nice -n19 "$@"; }
+else
+  log "ionice 不可用，退化为 nice"
+  run_io() { nice -n19 "$@"; }
+fi
 
 # ── 单实例：备份自己不能并发跑 ───────────────────────────────────────
 mkdir -p "$BACKUP_ROOT"
@@ -138,16 +161,16 @@ for src in "${DBS[@]}"; do
   # "这个文件不会变"。生产库一直在写，这个断言是假的，sqlite 会因此忽略 WAL，
   # 读出撕裂或过期的镜像 —— 那是比"可能写一个字节"严重得多的正确性问题。
   # 真正的风险（对空文件写头部）已在上面用 `! -s` 挡掉了。
-  sqlite3 -cmd ".timeout 60000" "$src" ".backup '$dst'" \
+  run_io sqlite3 -cmd ".timeout 60000" "$src" ".backup '$dst'" \
     || die "$name .backup 失败"
 
   # 副本落地时会继承 WAL 模式，于是旁边多出 -wal/-shm。实测主文件本身已自足，
   # 但把副本切回 delete 模式能 checkpoint 并删掉旁文件 —— 恢复时“只拷 .db”就绝不会漏数据，
   # 也不会有易变的旁文件混进 SHA256SUMS。
-  sqlite3 "$dst" "pragma journal_mode=delete;" >/dev/null 2>&1 || true
+  run_io sqlite3 "$dst" "pragma journal_mode=delete;" >/dev/null 2>&1 || true
 
   # 校验副本本身。未经校验的备份比没有备份更危险 —— 风险模型正压在它身上。
-  chk="$(sqlite3 "$dst" "pragma integrity_check;" 2>&1 | head -1)"
+  chk="$(run_io sqlite3 "$dst" "pragma integrity_check;" 2>&1 | head -1)"
   [ "$chk" = "ok" ] || die "$name 副本校验失败：$chk"
   # 副本已是 delete 模式，旁文件此刻只是打开时留下的空壳，删掉让备份目录里只剩纯 .db
   rm -f "$dst-wal" "$dst-shm"
@@ -159,12 +182,12 @@ done
 # 配置与凭证属于恢复关键资产；缺失时不能产出“完整”哨兵。
 for f in "$HERMES_HOME_DIR/config.yaml" "$HERMES_HOME_DIR/.env" "$HERMES_HOME_DIR/auth.json"; do
   [ -s "$f" ] || die "关键配置缺失或为空：$(basename "$f")"
-  cp -p "$f" "$STAGING/config/"
+  run_io cp -p "$f" "$STAGING/config/"
 done
 [ -d "$HERMES_HOME_DIR/feishu_uat" ] \
   && [ -n "$(find "$HERMES_HOME_DIR/feishu_uat" -type f -print -quit 2>/dev/null)" ] \
   || die "关键凭证目录 feishu_uat 缺失或为空"
-cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/"
+run_io cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/"
 
 # MANIFEST + 校验和：演练时靠它判断“恢复出来的是不是当初那份”
 {
@@ -189,17 +212,17 @@ cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/"
   # 能且只能要求：还原结果 == 备份时刻记录的行数，差 0。
   for d in "$STAGING"/db/*.db; do
     dbn="$(basename "$d")"
-    echo "table_count ${dbn}=$(sqlite3 "$d" 'select count(*) from sqlite_master where type="table";')"
-    sqlite3 "$d" "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name;" \
+    echo "table_count ${dbn}=$(run_io sqlite3 "$d" 'select count(*) from sqlite_master where type="table";')"
+    run_io sqlite3 "$d" "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name;" \
     | while read -r t; do
         [ -n "$t" ] || continue
-        echo "rows ${dbn}.${t}=$(sqlite3 "$d" "select count(*) from \"$t\";")"
+        echo "rows ${dbn}.${t}=$(run_io sqlite3 "$d" "select count(*) from \"$t\";")"
       done
   done
 } > "$STAGING/MANIFEST.txt"
 # Linux 是 sha256sum，macOS 只有 shasum。生产走前者，本地测试走后者。
 if command -v sha256sum >/dev/null 2>&1; then SUM=(sha256sum); else SUM=(shasum -a 256); fi
-( cd "$STAGING" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 "${SUM[@]}" > SHA256SUMS )
+( cd "$STAGING" && find . -type f ! -name SHA256SUMS -print0 | run_io xargs -0 "${SUM[@]}" > SHA256SUMS )
 
 trap - ERR
 # 时间戳只精确到秒。同一秒内跑两次(手动触发撞上定时器、或发布前备份紧跟日备)时目标已存在，
@@ -289,7 +312,7 @@ PY
 
   STAGING_PROF="$PROFILES_ROOT/.staging-$TS"
   set +e
-  rsync -a --delete ${link_arg[@]+"${link_arg[@]}"} ${excl_arg[@]+"${excl_arg[@]}"} \
+  rsync -a --delete --bwlimit="$RSYNC_BWLIMIT_KBPS" ${link_arg[@]+"${link_arg[@]}"} ${excl_arg[@]+"${excl_arg[@]}"} \
     "$HERMES_HOME_DIR/profiles/" "$STAGING_PROF/" >/dev/null 2>&1
   rc=$?
   set -e
@@ -309,7 +332,7 @@ PY
   [ "$nprof" -gt 0 ] || die "profiles 快照产出 0 个文件 —— 空备份不算成功"
   # 内容清单必须在备份时刻固化。恢复时若快照后来被改坏，不能拿“坏后的源”跟
   # “刚从坏源复制出的副本”互相比较后假绿。
-  ( cd "$PROF_DEST" && find . -type f -print0 | xargs -0 "${SUM[@]}" ) \
+  ( cd "$PROF_DEST" && find . -type f -print0 | run_io xargs -0 "${SUM[@]}" ) \
     > "$STATE_DEST/PROFILE_SHA256SUMS"
   python3 - "$PROF_DEST" > "$STATE_DEST/PROFILE_SYMLINKS.json" <<'PY'
 import json, os, sys
@@ -322,7 +345,7 @@ for base, dirs, files in os.walk(root, followlinks=False):
             links.append([os.path.relpath(path, root), os.readlink(path)])
 json.dump(sorted(links), sys.stdout, ensure_ascii=False, separators=(",", ":"))
 PY
-  ( cd "$STATE_DEST" && "${SUM[@]}" PROFILE_SHA256SUMS PROFILE_SYMLINKS.json >> SHA256SUMS )
+  ( cd "$STATE_DEST" && run_io "${SUM[@]}" PROFILE_SHA256SUMS PROFILE_SYMLINKS.json >> SHA256SUMS )
   log "profiles 快照完成 → ${PROF_DEST}（${nprof} 个文件$([ -n "$prev" ] && echo "，增量，基于 $(basename "${prev%/}")" || echo "，首次全量")）"
 fi
 

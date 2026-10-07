@@ -104,6 +104,7 @@ def collect_connector_statuses(
     )
     statuses = _enrich_rows(rows, profile=profile_name)
     from .. import feishu_uat_auth
+    from ..figma_connector import status as figma_status
     from ..github_mcp_connector import status as github_status
 
     try:
@@ -124,6 +125,29 @@ def collect_connector_statuses(
             acting_identity="user",
             credential_owner=profile_name,
             runtime_policy_owner="run_broker",
+            kind="external",
+        ))
+
+    # Same shape as the GitHub append above: one connector's reader must never be
+    # able to blank the whole panel, so a failure here degrades to one error row.
+    try:
+        shared = Path(shared_home) if shared_home else feishu_uat_auth.resolve_shared_home()
+        statuses.append(figma_status(shared, profile_name, open_id))
+    except Exception as exc:
+        logger.warning("Figma connector status unavailable (%s)", type(exc).__name__)
+        statuses.append(ConnectorStatus(
+            id="figma",
+            title="Figma",
+            provider="figma",
+            installed=False,
+            status="error",
+            detail="Figma Connector 状态暂不可用",
+            action=AuthAction(kind="manual", label="重试"),
+            profile=profile_name,
+            scope="profile",
+            acting_identity="user",
+            credential_owner=profile_name,
+            runtime_policy_owner="connector_driver",
             kind="external",
         ))
 

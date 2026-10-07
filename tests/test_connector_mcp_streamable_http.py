@@ -31,7 +31,9 @@ def test_streamable_http_requires_discoverable_auth_and_uses_bound_principal(tmp
 
     async def list_tools(principal):
         seen.append(("list", principal))
-        return [Tool(name="identity_probe", description="probe", inputSchema={"type": "object"})]
+        return [Tool(name="identity_probe", description="probe", inputSchema={
+            "type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]
+        })]
 
     async def call_tool(principal, name, arguments):
         seen.append(("call", principal, name, arguments))
@@ -56,19 +58,22 @@ def test_streamable_http_requires_discoverable_auth_and_uses_bound_principal(tmp
                 assert token not in challenge
 
                 client.headers["Authorization"] = f"Bearer {token}"
-                async with streamable_http_client(resource, http_client=client) as (read, write, _):
+                async with streamable_http_client(resource, http_client=client) as (read, write, *_):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         tools = await session.list_tools()
                         assert [tool.name for tool in tools.tools] == ["identity_probe"]
                         result = await session.call_tool("identity_probe", {"value": 7})
                         assert result.content[0].text == "owner-ok"
+                        invalid = await session.call_tool("identity_probe", {"value": "wrong"})
+                        assert invalid.model_dump(by_alias=True)["isError"] is True
 
     asyncio.run(run())
-    assert [(row[1].profile_name, row[1].subject_id, row[1].client_id) for row in seen] == [
+    assert sum(row[0] == "call" for row in seen) == 1
+    assert len(seen) >= 2
+    assert {(row[1].profile_name, row[1].subject_id, row[1].client_id) for row in seen} == {
         ("alice", "subject-alice", "cursor-local"),
-        ("alice", "subject-alice", "cursor-local"),
-    ]
+    }
     store.close()
 
 
@@ -328,7 +333,70 @@ def test_legacy_sse_client_uses_the_same_bound_principal(tmp_path: Path):
         server.should_exit = True
         thread.join(timeout=5)
         store.close()
-    assert [(item.profile_name, item.subject_id, item.client_id) for item in seen] == [
+    assert len(seen) >= 2
+    assert {(item.profile_name, item.subject_id, item.client_id) for item in seen} == {
         ("alice", "subject-alice", "legacy-sse-client"),
-        ("alice", "subject-alice", "legacy-sse-client"),
-    ]
+    }
+
+
+def test_github_remote_transport_uses_sdk_http_client_and_wire_fields(tmp_path, monkeypatch):
+    from mcp.types import CallToolResult, TextContent, Tool
+
+    from hermes_multitenancy import github_mcp_connector as github
+    from hermes_multitenancy.compat.mcp_server import httpx
+    from hermes_multitenancy.connector_client_auth import ClientTokenStore
+    from hermes_multitenancy.connector_mcp_http import create_connector_mcp_http_app
+    from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
+
+    issuer = "http://127.0.0.1:8767"
+    resource = f"{issuer}/mcp"
+    store = ClientTokenStore(tmp_path / "multitenancy.db", issuer=issuer, resource=resource)
+    token = store.mint(
+        principal=issue_webui_principal(
+            profile_name="alice", actor_subject="subject-alice", credential_subject="subject-alice"
+        ),
+        client_id="github-transport", scopes=["mcp:tools"],
+    )
+    seen = []
+
+    async def list_tools(principal):
+        assert principal.subject_id == "subject-alice"
+        return [Tool(name="get_me", description="identity", inputSchema={"type": "object"})]
+
+    async def call_tool(principal, name, arguments):
+        seen.append((principal.subject_id, name, arguments))
+        return CallToolResult(
+            content=[TextContent(type="text", text="owner-ok")], structuredContent={"ok": True}
+        )
+
+    app = create_connector_mcp_http_app(
+        token_store=store, issuer=issuer, resource=resource,
+        list_tools=list_tools, call_tool=call_tool,
+    )
+    original_client = httpx.AsyncClient
+    clients = []
+
+    def local_client(**kwargs):
+        client = original_client(transport=httpx.ASGITransport(app=app), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(github, "REMOTE_URL", resource)
+    monkeypatch.setattr(httpx, "AsyncClient", local_client)
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            tools = await github._remote_list_tools(token)
+            assert tools == [{"name": "get_me", "description": "identity", "inputSchema": {"type": "object"}}]
+            result = await github._remote_call_tool(token, "get_me", {})
+            assert result["structuredContent"] == {"ok": True}
+            assert result["isError"] is False
+            assert result["content"][0]["text"] == "owner-ok"
+
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()
+    assert len(clients) == 2
+    assert all(isinstance(client, original_client) and client.is_closed for client in clients)
+    assert seen == [("subject-alice", "get_me", {})]

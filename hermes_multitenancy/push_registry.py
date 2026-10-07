@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+
+from .shared_db import connect_shared
 import threading
 import time
 from dataclasses import dataclass
@@ -156,10 +158,9 @@ class PushRegistryStore:
         self.db_path = str(db_path) if db_path is not None else str(DEFAULT_DB_PATH)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = connect_shared(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
-        self._conn.executescript("PRAGMA journal_mode=WAL;")
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._migrate()

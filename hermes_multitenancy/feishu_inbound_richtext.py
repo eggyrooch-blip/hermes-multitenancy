@@ -109,6 +109,15 @@ def _replace_normalized_message(
     metadata: dict[str, Any] | None = None,
 ) -> Any:
     resolved_text = _normalize_whitespace(text_content)
+    media_refs = list(getattr(result, "media_refs", []) or [])
+    for item in (metadata or {}).get("uplifted_media", []):
+        if item.get("file_key"):
+            module = load_feishu_module()
+            ref = module.FeishuPostMediaRef(
+                file_key=item["file_key"], file_name=item.get("file_name", ""),
+                resource_type="video" if item.get("resource_type") in {"video", "media"} else item.get("resource_type", "file"))
+            if ref not in media_refs:
+                media_refs.append(ref)
     base_image_keys = list(getattr(result, "image_keys", []) or [])
     merged_image_keys = base_image_keys if image_keys is None else _unique_strings([*base_image_keys, *image_keys])
     merged_metadata = dict(getattr(result, "metadata", {}) or {})
@@ -118,6 +127,7 @@ def _replace_normalized_message(
         resolved_text == str(getattr(result, "text_content", "") or "")
         and merged_image_keys == base_image_keys
         and merged_metadata == dict(getattr(result, "metadata", {}) or {})
+        and media_refs == list(getattr(result, "media_refs", []) or [])
     ):
         return result
     return replace(
@@ -125,6 +135,7 @@ def _replace_normalized_message(
         text_content=resolved_text,
         image_keys=merged_image_keys,
         metadata=merged_metadata,
+        media_refs=media_refs,
     )
 
 
@@ -312,7 +323,17 @@ def _render_forward_entry(item: Any) -> tuple[str, list[str], list[dict[str, Any
     image_keys: list[str] = []
     uplifted_media: list[dict[str, Any]] = []
 
-    if nested_type == "image" or _find_first_text(item, keys=("image_key",)):
+    nested = item.get("content") if isinstance(item.get("content"), dict) else {}
+    image_key = str(item.get("image_key") or nested.get("image_key") or "").strip()
+    file_key = str(item.get("file_key") or nested.get("file_key") or "").strip()
+    if file_key and nested_type != "image":
+        file_name = str(item.get("file_name") or nested.get("file_name") or item.get("title") or "").strip()
+        if image_key:
+            image_keys.append(image_key)
+        uplifted_media.append({"resource_type": nested_type or "file", "image_key": image_key,
+            "file_key": file_key, "file_name": file_name, "sender_name": sender})
+        body = f"[文件: {file_name}]" if file_name else "[文件]"
+    elif nested_type == "image" or image_key:
         image_key = _find_first_text(item, keys=("image_key",))
         if image_key:
             image_keys.append(image_key)
@@ -326,10 +347,7 @@ def _render_forward_entry(item: Any) -> tuple[str, list[str], list[dict[str, Any
             }
         )
         body = "[图片]"
-    elif nested_type in {"file", "audio", "media", "video"} or _find_first_text(
-        item,
-        keys=("file_key", "file_name"),
-    ):
+    elif nested_type in {"file", "audio", "media", "video"} or file_key:
         file_key = _find_first_text(item, keys=("file_key",))
         file_name = _find_first_text(item, keys=("file_name", "title", "name"))
         uplifted_media.append(

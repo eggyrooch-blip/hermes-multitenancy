@@ -52,36 +52,6 @@ def test_entry_without_key_returns_none():
     assert ar._resolve_custom_provider_api_key(cfg, "custom:litellm-sre") is None
 
 
-def test_resolves_key_env_from_profile_environment():
-    cfg = _cfg()
-    cfg["custom_providers"][0].pop("api_key")
-    cfg["custom_providers"][0]["key_env"] = "ZAI_API_KEY"
-
-    assert ar._resolve_custom_provider_api_key(
-        cfg, "custom:litellm-sre", {"ZAI_API_KEY": "zai-test-key"}
-    ) == "zai-test-key"
-
-
-def test_custom_key_env_does_not_read_untrusted_ambient_environment(monkeypatch):
-    cfg = _cfg()
-    cfg["custom_providers"][0].pop("api_key")
-    cfg["custom_providers"][0]["key_env"] = "FEISHU_APP_SECRET"
-    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leave-host")
-
-    assert ar._resolve_custom_provider_api_key(
-        cfg, "custom:litellm-sre", {}
-    ) is None
-
-
-def test_named_custom_provider_resolves_its_registered_base_url():
-    cfg = _cfg()
-    cfg["model"].pop("base_url")
-
-    assert ar._resolve_base_url(
-        "custom:litellm-sre", True, cfg, {}
-    ) == "https://litellm.sre.example.com/v1"
-
-
 def test_slug_name_normalized_with_spaces():
     cfg = _cfg()
     cfg["custom_providers"][0]["name"] = "Lite LLM SRE"  # normalizes to "lite-llm-sre"
@@ -101,3 +71,105 @@ def test_slug_picks_correct_entry_among_multiple():
 def test_customai_lookalike_not_matched_without_config():
     # a provider whose name merely starts with "custom" must not false-match
     assert ar._resolve_custom_provider_api_key(_cfg(), "customai") is None
+
+
+# --- key_env resolution (188 outage 2026-09-08) -----------------------------
+# A custom provider may NAME its secret instead of inlining it. Reading only the
+# inline `api_key` made every key_env-shaped profile raise "no API key for
+# primary provider" on every turn; `fallback_providers` are all key_env-shaped,
+# so the fallbacks died with it.
+
+
+def _cfg_key_env():
+    cfg = _cfg()
+    entry = cfg["custom_providers"][0]
+    entry.pop("api_key")
+    entry["key_env"] = "ZAI_API_KEY"
+    return cfg
+
+
+def test_resolves_key_env_from_profile_env_overrides():
+    assert (
+        ar._resolve_custom_provider_api_key(
+            _cfg_key_env(), "custom:litellm-sre", {"ZAI_API_KEY": "sk-from-dotenv"}
+        )
+        == "sk-from-dotenv"
+    )
+
+
+def test_resolves_key_env_from_process_env(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "sk-from-os-environ")
+    assert (
+        ar._resolve_custom_provider_api_key(_cfg_key_env(), "custom:litellm-sre")
+        == "sk-from-os-environ"
+    )
+
+
+def test_env_overrides_win_over_process_env(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "sk-from-os-environ")
+    assert (
+        ar._resolve_custom_provider_api_key(
+            _cfg_key_env(), "custom:litellm-sre", {"ZAI_API_KEY": "sk-from-dotenv"}
+        )
+        == "sk-from-dotenv"
+    )
+
+
+def test_custom_key_env_does_not_read_untrusted_ambient_environment(monkeypatch):
+    # GitHub #15: a non-provider secret in the gateway process env must never be
+    # handed to a profile-configured endpoint.
+    cfg = _cfg_key_env()
+    cfg["custom_providers"][0]["key_env"] = "FEISHU_APP_SECRET"
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leave-host")
+
+    assert ar._resolve_custom_provider_api_key(cfg, "custom:litellm-sre", {}) is None
+
+
+def test_custom_api_key_env_alias_resolves_from_profile_environment():
+    cfg = _cfg_key_env()
+    cfg["custom_providers"][0]["api_key_env"] = cfg["custom_providers"][0].pop("key_env")
+
+    assert (
+        ar._resolve_custom_provider_api_key(
+            cfg, "custom:litellm-sre", {"ZAI_API_KEY": "zai-test-key"}
+        )
+        == "zai-test-key"
+    )
+
+
+def test_blank_key_env_does_not_mask_valid_api_key_env_alias():
+    # Review P1 (blank-alias-mask): whitespace key_env must not hide the alias.
+    cfg = _cfg_key_env()
+    cfg["custom_providers"][0]["key_env"] = "  "
+    cfg["custom_providers"][0]["api_key_env"] = "ZAI_API_KEY"
+
+    assert (
+        ar._resolve_custom_provider_api_key(
+            cfg, "custom:litellm-sre", {"ZAI_API_KEY": "zai-test-key"}
+        )
+        == "zai-test-key"
+    )
+
+
+def test_key_env_pointing_at_an_unset_variable_returns_none(monkeypatch):
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+    assert ar._resolve_custom_provider_api_key(_cfg_key_env(), "custom:litellm-sre") is None
+
+
+def test_inline_api_key_wins_over_key_env(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "sk-from-env")
+    cfg = _cfg()
+    cfg["custom_providers"][0]["key_env"] = "ZAI_API_KEY"
+    assert (
+        ar._resolve_custom_provider_api_key(cfg, "custom:litellm-sre", {"ZAI_API_KEY": "sk-x"})
+        == "sk-test-key"
+    )
+
+
+def test_named_custom_provider_resolves_its_registered_base_url():
+    cfg = _cfg()
+    cfg["model"].pop("base_url")
+
+    assert ar._resolve_base_url(
+        "custom:litellm-sre", True, cfg, {}
+    ) == "https://litellm.sre.example.com/v1"

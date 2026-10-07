@@ -1246,6 +1246,28 @@ def test_ingest_sync_timeout_transfers_secret_ownership_and_dedupes_retry(
     dispatch_finished = asyncio.Event()
     release_dispatch = asyncio.Event()
     captured: dict[str, object] = {}
+    cleanup_done = asyncio.Event()
+    real_cleanup = server_mod._ingest_cleanup_secret_dir
+    real_wait_for = asyncio.wait_for
+    timeout_triggered = False
+
+    def capture_cleanup(secret_dir):
+        real_cleanup(secret_dir)
+        if secret_dir:
+            cleanup_done.set()
+
+    async def timeout_after_dispatch(awaitable, timeout):
+        nonlocal timeout_triggered
+        if (getattr(awaitable, "__name__", "") == "_run_sync_request"
+                and not timeout_triggered):
+            timeout_triggered = True
+            task = asyncio.create_task(awaitable)
+            await real_wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
+            return await real_wait_for(task, timeout=0)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(server_mod, "_ingest_cleanup_secret_dir", capture_cleanup)
+    monkeypatch.setattr(asyncio, "wait_for", timeout_after_dispatch)
 
     async def prepare(request):
         nonlocal prepare_calls
@@ -1331,17 +1353,14 @@ def test_ingest_sync_timeout_transfers_secret_ownership_and_dedupes_retry(
                 client.post(
                     "/api/run-broker/ingest", json=payload, headers=headers
                 ),
-                timeout=0.5,
+                timeout=SYNC_TIMEOUT,
             )
             retry_body = await retry.json()
             retained_after_retry = secret_dir.is_dir()
 
             release_dispatch.set()
             await asyncio.wait_for(dispatch_finished.wait(), timeout=SYNC_TIMEOUT)
-            for _ in range(100):
-                if not secret_dir.exists():
-                    break
-                await asyncio.sleep(0.005)
+            await asyncio.wait_for(cleanup_done.wait(), timeout=SYNC_TIMEOUT)
             cleaned_after_execution = not secret_dir.exists()
 
             third = await client.post(

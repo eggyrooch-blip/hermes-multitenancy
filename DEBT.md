@@ -11,7 +11,7 @@
 ## 2026-07-30 mt-transient-replay-retry-silence · 部署重启伤亡三条残留(SPEC 明确 out of scope,待 sunke 拍板)
 
 背景:2026-07-30 17:04:24 / 17:05:47 两次 gateway 重启(另一会话部署 mt,prod reflog 17:05:41 pull 到 2603f40),
-in-flight run 随进程组一起吃 SIGTERM。qiaojunlong 那轮 `saw_done=False`、elapsed 34.245s 被打断。
+in-flight run 随进程组一起吃 SIGTERM。wangwu 那轮 `saw_done=False`、elapsed 34.245s 被打断。
 本 slug 只修了"错误文案撒谎"(信号死不再拼陈旧 stderr 尾巴),下列三条**没修**:
 
 **D1 — 无 graceful drain / 在途 run 不会自动重发(需产品拍板)**
@@ -114,10 +114,10 @@ CI（`.gitlab-ci.yml`）首次真跑全量测试时暴露的，逐条记账。�
 ### D1 — 脚本里硬编码开发机绝对路径（**CI 抓出来的真缺陷**，优先级最高）
 
 - `scripts/lark_cli_matrix_runner.mjs:18`
-  `import { io } from '/Users/hermes/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
-  另有 4 处 `/Users/hermes/.hermes/...`（第 138、158、388、393 行）
+  `import { io } from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
+  另有 4 处 `/Users/dev/.hermes/...`（第 138、158、388、393 行）
 - `scripts/feishu_file_media_matrix_runner.py:27`
-  `SHARED_HOME = Path("/Users/hermes/.hermes")`，第 387 行 `"/Users/hermes/.hermes/profiles" in text`
+  `SHARED_HOME = Path("/Users/dev/.hermes")`，第 387 行 `"/Users/dev/.hermes/profiles" in text`
 
 后果：这 17 条测试**只在 sunke 那台 Mac 上能过**，生产机和任何新同事的机器都会失败
 （容器里直接 `PermissionError: '/Users'`）。这违反 CLAUDE.md 的「Never hardcode paths」。
@@ -510,3 +510,89 @@ dispatcher 现在对每个**已识别**动作（built-in + 注册的 business；
 - 未做原因：动的是 relay 运行时代码，走 `/opt/hermes-agent-relay` 下独立 venv 的
   4 文件同步链（`agent_relay*.py` + `credentials.py`），blast radius 远大于改一个
   超时值；且"ws 没连上算不算启动成功"是产品语义决定，要 engineer 拍。
+
+## ingest 路径的内联授权缺 session 绑定（另开一单）
+- 来源：slug `trae-inline-authorization`（2026-09-08），RequestAuthorization 落地时发现。
+- 机制：`build_ingest_run_request`（`hermes_multitenancy/webui_broker_server.py`）不设
+  `session_id`，而 broker 冻结的绑定是 (owner_open_id, profile_name, session_id) 三元组。
+  没有 session 就没有东西给 confirm/cancel 路由绑，`_register_pending_authorization`
+  因此 fail-closed：不注册、不发卡片、立刻给子进程写 `failed` 并发
+  `authorization_resolved(state=failed)`。
+- **今天不是缺陷**：该终态被 ingest 的短路分支接住——调用方拿到
+  `status: needs_authorization`（含脱敏 payload），run 被 cancel，pending 注册表清空，
+  子进程 tool call 立即返回。不等待、不泄漏、不会 stall 满 600s 窗口。覆盖用例
+  `tests/test_request_authorization.py::test_interactive_ingest_returns_needs_authorization_instead_of_stalling`。
+- 将来若要让 ingest 真正支持内联授权，前置条件是先给 ingest 请求形状加上 session 绑定。
+- 未做原因：本 slug 的 PRD 只服务 trusted WebUI Run；`session_id` 还喂 carryover /
+  turn context key，扩 ingest 请求契约属于越界。**另开一单。**
+
+## kep-cli 内联授权在共享 agent 上直接拒绝（缺 actor 自有凭证解析）
+- 来源：slug `trae-inline-authorization`（2026-09-08），codex 评审 `_verify_kep_cli:actor-identity-discarded#p1` 的处置。
+- 机制：共享 agent 的 Run 合法地把 **owner 的执行 profile** 和 **grantee 的用户身份**配在一起。
+  kep-cli 的凭证store 是 per-profile 的、没有 actor 维度，所以「这个 profile 已登录」
+  回答不了「**这个人**已授权吗」。原实现直接丢掉 `open_id`，于是 grantee 会被判为已授权
+  （用的是 owner 的凭证），而 `authorize` 还会往 owner 的 profile 里发起登录。
+- 本次处置：`authorization_verify._verify_kep_cli` 增加 actor 绑定——用与飞书设备流同一个路由源
+  （`feishu_uat_auth._profile_name_for_open_id`）要求 `open_id` 路由到的 profile 就是本 Run 的
+  profile，否则 **fail-closed 拒绝**（不核验、不发起登录）。覆盖用例
+  `tests/test_request_authorization.py::test_a_shared_agent_grantee_cannot_ride_the_owners_kep_credential`。
+- **代价**：共享 agent 上 kep-cli 内联授权现在完全不可用（owner 本人在自己 profile 上不受影响）。
+- 将来若要支持：前置条件是 kep-cli 凭证按 (profile, actor) 存取，与 feishu UAT 的
+  `subject_id` 维度对齐；那是 credential hub 的改动，不在本 slug 范围内。**另开一单。**
+
+## 同 uid 下文件权限位挡不住子进程；写入屏障只由沙箱提供
+- 来源：slug `trae-inline-authorization`（2026-09-08），codex 评审 `_read_authorization_response:child-writable-success#p1`。
+- 机制：授权结果是 parent → child 的文件 rendezvous。子进程知道自己的响应文件路径（`pending_ref` 是它自己铸的），
+  所以「一次写入即自助授权」是主攻击面。但 parent 与 child 在本机跑同一个 uid，
+  **目录 mode 位无法把两者分开**（子进程可以 chmod 回来）。
+- 本次处置是三层，只有前两层是强制力：
+  1. **Linux**：`bwrap-default.args` 显式 `--ro-bind-try ${SHARED_HOME}/authorization`（内核级只读；
+     同时修掉 `--tmpfs /tmp` 把旧的 $TMPDIR rendezvous 整个藏起来的问题）。
+  2. **macOS**：`profile-default.sb` 在 `/private/tmp` allow 之后追加 `(deny file-write*)`（Seatbelt 强制，last-match-wins）。
+  3. **服务端对账**：`_clear_pending_authorization` 拿子进程上报的终态与**服务端自己记录的决定**对账，
+     服务端没记过的 success 一律降级为 `failed`。这一层与文件系统无关，所以在**未开沙箱的本机 dev**
+     （`HERMES_USE_SANDBOX` 未开）里是唯一还在生效的防线。
+- **残留**：未开沙箱时，被注入的子进程仍能让**自己的 tool 结果**读到 success（自欺），
+  但卡片、审计事件与 pending 注册表不会跟着走。要彻底消除，需要 rendezvous 换成 parent 单向签名
+  （或换成不经文件系统的 IPC）——**另开一单**，本 slug 不做。
+
+## lark-cli 凭证缺 `scope` 字段会多要一次授权
+- 来源：slug `trae-inline-authorization`（2026-09-08），codex 评审 `verify_service_authorized:requested-scopes-unchecked#p1` 的副作用。
+- 机制：核验现在要求已存凭证的授予集合**覆盖**本次冻结的 scopes，授予集合读自 UAT payload 的 `scope` 字段。
+  本次改动之前铸出、payload 里没有 `scope` 的凭证，覆盖判定拿不到证据 → 判为未授权 → 用户被要求重新授权一次。
+- 方向是安全的（fail-closed），代价是一次性的重新授权。未做回填：`scope` 属于 provider 授予事实，
+  由服务端猜一个值写回去，就等于把「本地断言」当成「provider 事实」，正是这套核验要避免的。
+
+## 授权后 lark_cli 身份短暂解析为 bot（另开一单）
+- 来源：2026-09-08 本机候选栈实测（trae-inline-authorization）。授权卡已翻「已授权」且原 Run 继续后，紧接着的若干次 `lark_cli` 调用解析到 identity=bot，触发 bot-scope 守卫失败，模型多次重试、跑了一次凭据诊断后才拿到 identity=user 与真实结果；同会话第二条任务首调即 user。
+- 判断：不是授权卡/等待/核验流程的缺陷，是新凭据落盘后运行时身份择优（vault / JSON / broker lease）短暂读到旧态。
+- 待办：授权成功后同步刷新运行时凭据缓存或让 lark_cli 首调重读；补一条「授权成功后首调即 user」的回归用例。
+
+## 授权生命周期缺服务端审计日志（另开一单）
+- 来源：同上实测。WebUI 日志零条授权记录；broker stdout 只有心跳，stderr 无 authorization_id / state 轨迹，只有一条泛化的 device-auth scope 警告。
+- 待办：broker 在 register / authorize / resolve(state) / cancel / expire / teardown 各点打一行结构化日志（含 authorization_id、run_id、service、state，不含 token / open_id），作为 PRD 第 7 节「服务端回执」的落点。
+
+## Child-writable success 只堵了沙箱写入，没堵重放（另开一单）
+- 来源：2026-09-08 codex 评审 `trae-inline-authorization`（head 1ebaa6c）`_read_authorization_response:child-writable-success#p1`。entry-1 的只读挂载修复已生效（子进程主动写入的路径已阻断，5 条沙箱/伪造相关测试全绿），但 entry-2 复审指出更深的洞未堵：`_read_authorization_response` 仍信任未签名的 JSON 内容本身，且 `_register_pending_authorization` 没有拒绝复用/重放的 `pending_ref`——响应文件存活到 Run teardown 为止，同一个 ref 理论上可以在同一窗口内被回放出第二次「成功」。
+- 判断：方向是对的（read-only mount 挡住了子进程直接写），但没做到「服务端签名信封」+「拒绝重放 ref」这两条硬约束，仍是 P1 级敞口，不是误报。
+- 待办：给响应事件加上 Run/nonce/service/expiry 绑定的服务端签名信封；`_register_pending_authorization` 对已消费过的 `pending_ref` 直接拒绝新注册；补一条「重放旧 pending_ref 骗不出第二次 success」的回归。
+
+## KEP 共享 agent 可对另一用户 profile 发起登录（另开一单）
+- 来源：同上 2026-09-08 codex 复审 `handle_authorization_authorize:shared-profile-credential-overwrite#p1`。`_verify_kep_cli` 在核验时已用 `_actor_owns_profile` 拒绝跨用户凭据，但 `handle_authorization_authorize` 在**注册/发起登录**这一步没有做同样的 actor-owned-profile 前置检查——共享 agent 场景下，grantee 仍可能把 owner 的 profile 拉进一次新的 kep-auth 登录流程，哪怕最终 confirm 会被 `_verify_kep_cli` 挡下。
+- 判断：结果层（能否核验通过）已 fail-closed，过程层（该不该允许发起这次登录）没有对齐，登录本身对 owner 凭据的覆写风险还在。
+- 待办：`handle_authorization_authorize` 对 KEP 请求提前跑一次 `_actor_owns_profile`，不匹配直接终态拒绝、不进入 `start_kep_cli_login`；补一条「共享 agent 发起 KEP 登录被拒且未触发登录进程」的路由测试。
+
+## 已消费的终态决定可能在确认前被清理（另开一单）
+- 来源：同上 2026-09-08 codex 复审 `_purge_dead_pending_authorizations_locked:terminal-decision-deleted-before-ack#p1`。本轮改动只给 `_kill_authorization_flow` 调用加了 `_locked=True`（避免重入锁），没有实现「保留终态决定直到子进程确认或 Run teardown」——并发场景下，一次成功写入和子进程确认之间如果插入了新的注册，清理仍可能把已消费的成功记录当"dead"清掉，WebUI 侧的映射会看到一个空 authorization_id 的 failed 事件。
+- 判断：未修复，仍是复审给出的原始判断。
+- 待办：清理逻辑排除「已 consumed 且处于终态」的记录，只在其被确认或 Run 结束后才真正删除；补一条两个 Run 交错注册/确认的回归。
+
+## Inline 授权成功后旧的 reauth 信号未清（另开一单）
+- 来源：同上 2026-09-08 codex 复审 `stream_run_agent:stale-reauth-signal-after-inline-success#p1`。`_core.py` 本轮未改动。`stream_run_agent` 在一次授权失败时会置一个 Run 级 reauth/expiry 信号，inline 授权随后成功完成时没有清掉这个信号，导致同一个已完成的 Run 又弹出一次 auth_required/重放卡片。
+- 判断：未修复，属于体验/信号清理缺口，不影响本次授权的安全边界。
+- 待办：服务端核验成功后只清匹配的 Run/service 信号与失效的 operation 引用；补一条「授权失败→inline 成功→后续正常读→不再弹 auth_required」的回归。
+
+## 授权 scope 归一化仍是 O(n²) 列表去重（另开一单）
+- 来源：同上 2026-09-08 codex 复审 `normalize_requested_scopes:unbounded-quadratic-normalization#p1`。`authorization_verify.py:_clean_scope_list` 在 20 条上限检查之前用 `value not in seen`（列表成员判断）去重，超大数组是二次方开销；复审用 4 万条字符串实测跑了 6.6 秒，取消协程也不能中止这段计算。
+- 判断：未修复，当前实现与复审描述完全一致。
+- 待办：归一化前先按原始条目数/单条长度做上限拒绝，去重改用 set；补一条超大数组快速拒绝的回归。

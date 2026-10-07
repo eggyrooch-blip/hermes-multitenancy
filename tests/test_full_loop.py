@@ -46,11 +46,26 @@ async def test_full_loop_calls_adapter_in_order():
         result = on_pre_gateway_dispatch(event=event, gateway=gateway, session_store=None)
         assert result == {"action": "skip", "reason": "multitenancy router took over"}
 
-        # Drain the background task
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-            if len(call_log) >= 2:
+        # Drain the background task. Wait on a wall-clock DEADLINE, not a fixed
+        # number of ticks: 20 x 10ms = 200ms was enough on an idle box but flaked
+        # on the CI runner under IO contention ("expected 2 calls, got 0", main
+        # pipeline 552108, 2026-09-23). The task still finishes in milliseconds
+        # on the normal path; the deadline only bounds the worst case.
+        # Fail FAST too: once every other task on the loop has finished, nothing
+        # can add to call_log any more, so stop waiting and let the assertion
+        # below report what actually happened; a task that raised is re-raised
+        # with its real traceback instead of a bare "got 0".
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        current = asyncio.current_task()
+        while len(call_log) < 2 and loop.time() < deadline:
+            others = asyncio.all_tasks() - {current}
+            if not others or all(t.done() for t in others):
                 break
+            await asyncio.sleep(0.01)
+        for t in asyncio.all_tasks() - {current}:
+            if t.done() and not t.cancelled() and t.exception() is not None:
+                raise t.exception()
 
         assert len(call_log) == 2, f"expected 2 calls, got {len(call_log)}: {call_log}"
 

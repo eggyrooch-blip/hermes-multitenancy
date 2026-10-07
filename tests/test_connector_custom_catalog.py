@@ -970,7 +970,7 @@ def test_catalog_oauth_broker_completes_pkce_into_the_owner_vault(tmp_path: Path
     import asyncio
     from urllib.parse import parse_qs, urlparse
 
-    import httpx
+    from hermes_multitenancy.compat.mcp_server import httpx
 
     from hermes_multitenancy.connector_catalog_oauth import CatalogOAuthBroker
     from hermes_multitenancy.connector_custom_catalog import ConnectorCatalog, CustomConnectorStore
@@ -1106,7 +1106,7 @@ def test_catalog_oauth_broker_expires_abandoned_callback(tmp_path: Path):
     import asyncio
     from urllib.parse import parse_qs, urlparse
 
-    import httpx
+    from hermes_multitenancy.compat.mcp_server import httpx
 
     from hermes_multitenancy.connector_catalog_oauth import CatalogOAuthBroker
     from hermes_multitenancy.connector_custom_catalog import ConnectorCatalog

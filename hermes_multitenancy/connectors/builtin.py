@@ -28,8 +28,9 @@ KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
 GITLAB_PERSONAL = "gitlab-personal"
 GITHUB_MCP = "github-mcp"
+FIGMA = "figma"
 
-CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL, GITHUB_MCP)
+CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL, GITHUB_MCP, FIGMA)
 
 
 BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
@@ -227,6 +228,32 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
             runtime_policy_owner="run_broker",
         ),
         ui=ConnectorUiSpec(group="other-credentials", action="manual"),
+    ),
+    # Figma 与 GITHUB_MCP 的区别在数据面：GitHub 的工具调用由 run-broker 代理（所以它的
+    # runtime_policy_owner 是 run_broker），Figma 是 agent 核心拿员工自己的 OAuth token 直连
+    # mcp.figma.com，broker 只负责授权与状态。auth_flow 用 mcp_oauth：registry 的 driver 对这个
+    # flow 没有 start 实现，启动走 webui_broker_server 的 figma 路由，和 github 同构。
+    FIGMA: ConnectorDefinition(
+        id=FIGMA,
+        title="Figma",
+        provider="figma",
+        kind="external",
+        scope="profile",
+        invocation=InvocationSpec(type="mcp", detail="https://mcp.figma.com/mcp"),
+        auth_flow=AuthFlowSpec(
+            type="mcp_oauth",
+            status_probe="figma_connector.status",
+            start="figma_connector.FigmaOAuthBroker.start",
+            complete="figma_connector.FigmaOAuthBroker.complete",
+        ),
+        policy=ConnectorPolicy(
+            supported_identities=("user",),
+            default_identity="user",
+            audit=True,
+            secrets_owner="profile_home",
+            runtime_policy_owner="connector_driver",
+        ),
+        ui=ConnectorUiSpec(group="other-credentials", action="oauth_url"),
     ),
 }
 

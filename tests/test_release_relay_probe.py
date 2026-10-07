@@ -25,9 +25,8 @@ def _wait(codes: list[str], timeout: int = 3, *, tmp_path: Path | None = None) -
     """Drive relay_probe_wait with a scripted probe sequence.
 
     Returns (rc, waited_seconds, last_code). `sleep` is stubbed to a no-op so the
-    retry path costs no wall clock. The cursor lives in a FILE on purpose: the
-    function calls the probe through `$(...)`, i.e. in a subshell, so a shell
-    variable cursor would silently reset and every call would replay code #1.
+    retry path costs no wall clock. An inherited file descriptor shares its offset across the probe subshells;
+    shell variables would reset, and head/tail/mv spawn three processes per tick.
     """
     base = tmp_path or Path(subprocess.run(["mktemp", "-d"], capture_output=True, text=True).stdout.strip())
     codes_file = base / "codes"
@@ -35,11 +34,10 @@ def _wait(codes: list[str], timeout: int = 3, *, tmp_path: Path | None = None) -
     script = textwrap.dedent(f"""
         set -uo pipefail
         . {LIB}
+        exec 3<"{codes_file}"
         probe() {{
-          local f={codes_file} c
-          c=$(head -1 "$f" 2>/dev/null)
-          [ -n "$c" ] || c=401
-          tail -n +2 "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+          local c
+          IFS= read -r c <&3 || c=401
           printf '%s' "$c"
         }}
         noop_sleep() {{ :; }}

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import functools
 import inspect
 import json
 import logging
@@ -79,6 +80,24 @@ _server_thread_lock = threading.Lock()
 
 _pending_clarifies: dict[str, dict[str, Any]] = {}
 _pending_approvals: dict[str, dict[str, Any]] = {}
+
+
+# Inline `request_authorization` requests, keyed by the SERVER-issued id. The
+# child's own `pending_ref` and the response file path never leave this process:
+# the browser only ever sees the opaque id, and the (owner, profile, session)
+# binding frozen here is the only identity the authorize/confirm/cancel routes
+# will act on — nothing the caller asserts is consulted.
+_pending_authorizations: dict[str, dict[str, Any]] = {}
+_pending_authorizations_lock = threading.Lock()
+
+# One inline authorization window. Kept equal to the child bridge's default
+# HERMES_MULTITENANCY_AUTHORIZATION_TIMEOUT so a request cannot outlive the tool
+# call that is waiting on it.
+_AUTHORIZATION_TTL_SECONDS = 600
+
+_AUTHORIZATION_TERMINAL_STATES: frozenset[str] = frozenset(
+    {"success", "cancelled", "expired", "failed"}
+)
 
 
 _credential_broker_tokens: dict[str, dict[str, str]] = {}
@@ -615,6 +634,14 @@ class _ActorScopedSessionDB:
         if not self._session_id_allowed(session_id):
             return []
         return self._inner.get_messages_as_conversation(session_id)
+
+    def resolve_session_by_title(self, title: str) -> str | None:
+        session_id = self._inner.resolve_session_by_title(title)
+        return session_id if self._session_id_allowed(session_id) else None
+
+    def list_recent_sessions_bounded(self, *, limit: int = 20, **kwargs: Any) -> list[dict[str, Any]]:
+        rows = self._inner.list_recent_sessions_bounded(limit=max(limit * 20, 200), **kwargs)
+        return [row for row in rows if self._session_id_allowed(str(row.get("id") or ""))][:limit]
 
     def search_messages(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         requested_limit = int(kwargs.get("limit") or 20)
@@ -2399,6 +2426,1078 @@ def _write_pending_approval_response(
     return True
 
 
+def _authorization_supported_services() -> frozenset[str]:
+    from ..credential_hub.model import KEP_CLI_ONLINE, KEP_CLI_PRE, LARK_CLI
+
+    return frozenset({LARK_CLI, KEP_CLI_ONLINE, KEP_CLI_PRE})
+
+
+def _authorization_profile_paths(profile_name: str) -> tuple[Path, Path]:
+    """(profile_dir, shared_home) for the live credential probe."""
+    from ..feishu_uat_auth import resolve_shared_home
+
+    shared_home = resolve_shared_home()
+    return shared_home / "profiles" / profile_name, shared_home
+
+
+# The child mints this and nothing else about the rendezvous. Anchored, bounded,
+# and free of every path metacharacter, so the derived filename can only ever be
+# a leaf INSIDE the per-run directory: no ``/``, no ``\\``, no ``..``, no NUL,
+# no absolute path, no length games.
+_PENDING_REF_RE = re.compile(r"^authreq_[A-Za-z0-9_-]{1,64}$")
+
+
+def _authorization_rendezvous_root() -> Path:
+    """Parent-owned root of the authorization rendezvous.
+
+    NOT the shared system temp dir any more. The old root was
+    ``$TMPDIR/hermes-multitenancy-authorization`` — a directory every process on
+    the box could write, which made "the child writes its own success file" a
+    ONE-WRITE self-authorization, and which the Linux sandbox's ``--tmpfs /tmp``
+    hid from the child entirely. Under ``SHARED_HOME`` the directory is a real
+    parent-owned path that the sandbox can mount read-only for the child
+    (``bwrap-default.args`` ro-bind, ``profile-default.sb`` deny file-write*).
+    """
+    raw = os.environ.get("HERMES_MULTITENANCY_AUTHORIZATION_ROOT", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    from ..feishu_uat_auth import resolve_shared_home
+
+    return resolve_shared_home() / "authorization"
+
+
+def _authorization_response_dir(run_id: str) -> Path:
+    """The per-run rendezvous directory, derived from the run id ALONE.
+
+    Both sides compute it independently — the parent here, the child from the
+    path this same function produced when its env was built — so the directory
+    never travels in a child-controlled payload. Hashed because ``run_id`` is a
+    server secret and must not become a filesystem name.
+    """
+    digest = hashlib.sha256(str(run_id or "").encode("utf-8")).hexdigest()[:32]
+    return _authorization_rendezvous_root() / digest
+
+
+def _authorization_response_path(run_id: str, pending_ref: str) -> Optional[Path]:
+    """Server-derived response path, or None when ``pending_ref`` is not a ref.
+
+    The child's ``response_path`` is deliberately ignored: accepting it let the
+    child aim the parent's privileged write at any path it liked.
+    """
+    if not str(run_id or "").strip() or not _PENDING_REF_RE.match(str(pending_ref or "")):
+        return None
+    return _authorization_response_dir(run_id) / f"{pending_ref}.json"
+
+
+# Execution liveness for inline authorization, INDEPENDENT of the auth-signal
+# replay cache. The replay cache is retained past run end on purpose (that is
+# what makes JIT re-auth replay work), so reading it as "the run is still
+# executing" let a confirm land after the user pressed Stop. This registry is
+# set when a run starts streaming and cleared in the same finally-block that
+# tears the run down — nothing else writes it.
+_authorization_live_runs: dict[str, dict[str, str]] = {}
+_authorization_live_runs_lock = threading.Lock()
+
+
+def _mark_authorization_run_live(run_id: str, *, profile_name: str, subject: str) -> None:
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return
+    with _authorization_live_runs_lock:
+        _authorization_live_runs[run_id] = {
+            "profile_name": str(profile_name or ""),
+            "subject": str(subject or ""),
+        }
+
+
+def _mark_authorization_run_finished(run_id: str) -> None:
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return
+    with _authorization_live_runs_lock:
+        _authorization_live_runs.pop(run_id, None)
+
+
+def _sanitize_authorization_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The ONLY authorization payload allowed to reach a browser.
+
+    Allow-list, not a deny-list: the child's payload carries ``response_path``
+    and ``pending_ref``, and the pending record carries the owner's open_id and
+    profile. A ``cleaned.pop(...)`` style sanitizer would leak every field a
+    future edit adds; this one can only ever emit these five.
+    """
+    scopes = payload.get("scopes")
+    return {
+        "authorization_id": str(payload.get("authorization_id") or ""),
+        "service": str(payload.get("service") or ""),
+        "scopes": (
+            [str(scope) for scope in scopes if str(scope).strip()]
+            if isinstance(scopes, list)
+            else []
+        ),
+        "expires_at": payload.get("expires_at"),
+        "state": str(payload.get("state") or ""),
+    }
+
+
+def _write_authorization_response_file(response_path: str, state: str, reason: str) -> bool:
+    """Unblock the waiting child tool call. The single write point.
+
+    Published atomically: the child polls this path every 100ms, so a partial
+    ``write_text`` was readable as malformed JSON and turned a real success into
+    a terminal "response was malformed" failure. Write beside it, then rename.
+    """
+    if not response_path:
+        return False
+    tmp_path: Optional[Path] = None
+    try:
+        path = Path(response_path)
+        # mode applies on CREATION only: an existing rendezvous directory keeps
+        # whatever permissions it was created with, so a read-only one makes
+        # this write fail (and report it) instead of being silently widened.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        tmp_path.write_text(
+            json.dumps({"state": state, "reason": reason}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        logger.warning("[multitenancy] authorization response write failed", exc_info=True)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
+
+
+def _authorization_pending_is_live(pending: dict[str, Any], now: float) -> bool:
+    if pending.get("consumed"):
+        return False
+    if str(pending.get("state") or "") != "pending":
+        return False
+    try:
+        return float(pending.get("expires_at") or 0) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def _authorization_flow_referenced_elsewhere(
+    flow: dict[str, Any], *, exclude_authorization_id: str
+) -> bool:
+    """Does any OTHER live pending record still point at this SAME flow?
+
+    Two different Runs (or a request that reused an already-open Feishu device
+    session via ``find_active_session``) can end up with pending records that
+    describe the identical underlying provider login. Tearing one of them down
+    must never cancel a login the other record is still relying on to
+    complete. Caller holds ``_pending_authorizations_lock``.
+    """
+    for key, other in _pending_authorizations.items():
+        if key == exclude_authorization_id:
+            continue
+        if _same_authorization_flow(other.get("flow"), flow):
+            return True
+    return False
+
+
+def _kill_authorization_flow(pending: dict[str, Any], *, _locked: bool = False) -> None:
+    """Tear down whatever live login this request started (KEP Popen / Feishu device flow).
+
+    Only tears down the PROVIDER session when no OTHER live pending record is
+    still attached to the same flow — releasing one owner must never cut the
+    login out from under another. ``_locked`` tells us whether the caller
+    already holds ``_pending_authorizations_lock`` (most do, from directly
+    inside a registry mutation): this never re-enters that non-reentrant lock,
+    and never skips the shared-flow check either.
+    """
+    task = pending.pop("poll_task", None)
+    if task is not None:
+        # The completion watcher outlives nothing: cancel/expiry/run-end all
+        # land here, and a poller left running would keep asking Feishu for a
+        # device code nobody is waiting on any more.
+        try:
+            task.cancel()
+        except Exception:
+            logger.debug("[multitenancy] authorization poller cancel failed", exc_info=True)
+    flow = pending.get("flow")
+    if not isinstance(flow, dict):
+        return
+    exclude_id = str(pending.get("authorization_id") or "")
+    if _locked:
+        shared = _authorization_flow_referenced_elsewhere(flow, exclude_authorization_id=exclude_id)
+    else:
+        with _pending_authorizations_lock:
+            shared = _authorization_flow_referenced_elsewhere(flow, exclude_authorization_id=exclude_id)
+    if not shared:
+        proc = flow.get("proc")
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                logger.debug("[multitenancy] kep login process kill failed", exc_info=True)
+        if str(flow.get("kind") or "") == "lark" and flow.get("session_id"):
+            try:
+                from .. import feishu_uat_auth
+
+                feishu_uat_auth.cancel_session(
+                    session_id=str(flow.get("session_id") or ""),
+                    profile_name=str(pending.get("profile_name") or ""),
+                    open_id=str(pending.get("owner_open_id") or ""),
+                )
+            except Exception:
+                logger.debug("[multitenancy] feishu auth session cancel failed", exc_info=True)
+    pending["flow"] = None
+
+
+def _authorization_terminal_decision(
+    *, service: str, scopes: list[str], response_path: str, state: str, reason: str
+) -> dict[str, Any]:
+    """Answer the blocked child directly and tell the browser it is over.
+
+    Used only where there is no live pending record to guard (a refused
+    registration, or a fast path whose guarded write did not land). A refused
+    registration that left the tool call polling would hang the whole turn for
+    the full window, so the write is unconditional here — nothing else can be
+    holding this path, because the authorization_id has not been published yet.
+    """
+    _write_authorization_response_file(response_path, state, reason)
+    return {
+        "kind": "authorization_resolved",
+        "payload": _sanitize_authorization_payload(
+            {"service": service, "scopes": scopes, "state": state}
+        ),
+    }
+
+
+def _authorization_failed_decision(
+    *, service: str, scopes: list[str], response_path: str, reason: str
+) -> dict[str, Any]:
+    return _authorization_terminal_decision(
+        service=service, scopes=scopes, response_path=response_path,
+        state="failed", reason=reason,
+    )
+
+
+def _purge_dead_pending_authorizations_locked(now: float) -> None:
+    """Drop records that can never complete. Caller holds the lock.
+
+    Duplicate admission used to consult these: a record whose run had already
+    exited still counted as "one is pending", so the next request in that run
+    was refused by something nobody could ever resolve.
+    """
+    doomed = [
+        key
+        for key, pending in _pending_authorizations.items()
+        if not _authorization_pending_is_live(pending, now)
+        or not _authorization_run_is_live(pending)
+    ]
+    for key in doomed:
+        pending = _pending_authorizations.pop(key, None)
+        if pending is not None:
+            _kill_authorization_flow(pending, _locked=True)
+
+
+def _register_pending_authorization(
+    run_request: RunRequest, payload: dict[str, Any], *, run_id: str = ""
+) -> dict[str, Any]:
+    """Freeze the binding for one inline authorization request.
+
+    Blocking (the live credential probe shells out and does HTTPS), so the
+    stream mapping calls it through ``asyncio.to_thread``. Returns the emit
+    decision: ``authorization_required`` when the user really has to act, or
+    ``authorization_resolved`` when the credential is ALREADY live and no card
+    should ever be shown.
+
+    Everything about the rendezvous except the child's own ``pending_ref`` is
+    decided HERE. The child used to hand us the file path it wanted written;
+    that made the parent's privileged write aimable, so the path is now derived
+    from ``(run_id, pending_ref)`` and the payload's ``response_path`` is
+    ignored outright.
+    """
+    pending_ref = str(payload.get("pending_ref") or "").strip()
+    service = str(payload.get("service") or "").strip()
+    scopes_raw = payload.get("scopes")
+    scopes = (
+        [str(scope).strip() for scope in scopes_raw if str(scope).strip()]
+        if isinstance(scopes_raw, list)
+        else []
+    )
+    owner_open_id = str(run_request.user_key or "").strip()
+    profile_name = str(run_request.profile_name or "").strip()
+    session_id = str(run_request.session_id or "").strip()
+    # The per-run identifier. NOT from RunRequest (it has no such field — reading
+    # it there silently froze "" and left the binding one dimension short); it is
+    # the ``signal_run_id`` minted per HTTP run in ``_stream_run_request`` and
+    # threaded down through ``_default_dispatch_agent(auth_signal_run_id=...)``.
+    run_id = str(run_id or "").strip()
+    # Binds the request to the exact tool call that raised it.
+    tool_call_id = str(payload.get("tool_call_id") or "").strip() or pending_ref
+
+    derived_path = _authorization_response_path(run_id, pending_ref)
+    response_path = str(derived_path) if derived_path is not None else ""
+
+    if not pending_ref or derived_path is None:
+        # Either the child sent no ref, or the ref is not a ref. There is no
+        # legitimate path to answer on, so nothing is written; the child's own
+        # deadline turns this into `expired`.
+        return _authorization_failed_decision(
+            service=service,
+            scopes=scopes,
+            response_path="",
+            reason="the authorization request was malformed",
+        )
+    if service not in _authorization_supported_services():
+        return _authorization_failed_decision(
+            service=service,
+            scopes=scopes,
+            response_path=response_path,
+            reason="this service cannot be authorized inline",
+        )
+    if not owner_open_id or not profile_name or not session_id:
+        return _authorization_failed_decision(
+            service=service,
+            scopes=scopes,
+            response_path=response_path,
+            reason="this run has no owner binding to authorize against",
+        )
+    if not run_id:
+        # No per-run identifier means confirm could never tell a live run from a
+        # superseded one. Refuse rather than register a weaker binding.
+        return _authorization_failed_decision(
+            service=service,
+            scopes=scopes,
+            response_path=response_path,
+            reason="this run has no run identity to bind the authorization to",
+        )
+
+    profile_dir, shared_home = _authorization_profile_paths(profile_name)
+
+    # Scopes are SERVER policy from here on. Whatever the model typed is
+    # normalized + allow-listed before anything is registered, so an arbitrary
+    # string can reach neither Feishu's OAuth call nor the consent card the user
+    # is asked to agree to; only the frozen result is stored and later required
+    # to be covered by the credential.
+    from .. import authorization_verify
+
+    try:
+        scopes = authorization_verify.normalize_requested_scopes(
+            service, scopes, shared_home=shared_home
+        )
+    except authorization_verify.ScopePolicyError as exc:
+        return _authorization_failed_decision(
+            service=service,
+            scopes=[],
+            response_path=response_path,
+            reason=str(exc),
+        )
+
+    now = time.time()
+    authorization_id = "auth_" + secrets.token_urlsafe(24)
+    record = {
+        "authorization_id": authorization_id,
+        "pending_ref": pending_ref,
+        "owner_open_id": owner_open_id,
+        "profile_name": profile_name,
+        "session_id": session_id,
+        "run_id": run_id,
+        "tool_call_id": tool_call_id,
+        "service": service,
+        "scopes": scopes,
+        "response_path": response_path,
+        "created_at": now,
+        "expires_at": now + _AUTHORIZATION_TTL_SECONDS,
+        "consumed": False,
+        "state": "pending",
+        "flow": None,
+    }
+    with _pending_authorizations_lock:
+        # Dead records (expired, consumed, or belonging to a run that has since
+        # exited) are not "one already pending" — they are litter. Drop them
+        # before deciding, or a stopped run poisons its own successor.
+        _purge_dead_pending_authorizations_locked(now)
+        # Keyed on the RUN, not the session. Keying it on session_id poisoned
+        # the whole session for 600s whenever a run died without emitting
+        # authorization_resolved (user pressed 停止, child killed): every later
+        # run in that session was refused by a record nobody could resolve
+        # (prod 2026-09-08, session mtsdfft81v8go7). A run_id belongs to exactly
+        # one (owner, profile, session), so this stays strictly per-Run.
+        duplicate = any(
+            str(existing.get("run_id") or "") == run_id
+            and _authorization_pending_is_live(existing, now)
+            for existing in _pending_authorizations.values()
+        )
+        if not duplicate:
+            _pending_authorizations[authorization_id] = record
+    if duplicate:
+        # Max one per Run. Answer THIS request's own file; the live one is untouched.
+        return _authorization_failed_decision(
+            service=service,
+            scopes=scopes,
+            response_path=response_path,
+            reason="another authorization request is already pending for this run",
+        )
+
+    try:
+        already_authorized = bool(
+            authorization_verify.verify_service_authorized(
+                service,
+                profile_name=profile_name,
+                open_id=owner_open_id,
+                profile_dir=profile_dir,
+                shared_home=shared_home,
+                required_scopes=scopes,
+            )
+        )
+    except Exception:
+        logger.debug("[multitenancy] authorization pre-check failed", exc_info=True)
+        already_authorized = False
+
+    if already_authorized:
+        # Through the SAME guarded terminal transition as every other success.
+        # This branch used to write straight to the file: it checked neither the
+        # deadline nor whether the run was still alive, and it announced success
+        # even when the write failed — so a run stopped (or a machine suspended
+        # past the deadline) during this multi-second probe still got a success
+        # card, and an unwritable rendezvous got a success card while the tool
+        # stayed blocked to expiry.
+        if _write_pending_authorization_response(
+            authorization_id=authorization_id,
+            owner_open_id=owner_open_id,
+            profile_name=profile_name,
+            session_id=session_id,
+            state="success",
+            reason="already_authorized",
+        ):
+            return {
+                "kind": "authorization_resolved",
+                "payload": _sanitize_authorization_payload({**record, "state": "success"}),
+            }
+        # The guard refused (cancelled / expired / run gone) or the publication
+        # failed. Either way there is no success: drop the record and tell the
+        # child the truth so its tool call returns instead of hanging.
+        with _pending_authorizations_lock:
+            stale = _pending_authorizations.pop(authorization_id, None)
+        if stale is not None:
+            _kill_authorization_flow(stale)
+        expired = time.time() >= float(record.get("expires_at") or 0)
+        return _authorization_terminal_decision(
+            service=service,
+            scopes=scopes,
+            response_path=response_path,
+            state="expired" if expired else "failed",
+            reason=(
+                "the authorization window closed while the credential was being checked"
+                if expired
+                else "the authorization result could not be delivered"
+            ),
+        )
+
+    return {
+        "kind": "authorization_required",
+        "payload": _sanitize_authorization_payload(record),
+    }
+
+
+def _clear_pending_authorization(
+    payload: dict[str, Any], *, run_id: str = ""
+) -> dict[str, Any]:
+    """Reconcile the child's terminal claim against the SERVER's decision.
+
+    The child reports what it read out of the rendezvous file. That file is the
+    only thing standing between a compromised/prompt-injected child and a
+    "已授权" card, so its claim is not evidence: a ``success`` is honoured only
+    when this process actually recorded one. Any other success — no record, no
+    server decision, or a server decision that says something else — is reported
+    as ``failed``. Non-success claims are taken at face value (the child's own
+    deadline legitimately produces ``expired`` with no server write).
+
+    ``run_id`` is the CALLER's own trusted run identity — the same
+    ``auth_signal_run_id``/``authorization_run_id`` frozen onto the record at
+    registration, read at the emitting site and never out of ``payload`` (which
+    is child-controlled). ``pending_ref`` is minted by the child and is not
+    guaranteed unique across Runs, so matching on it alone let one Run's
+    terminal event resolve — and tear down the flow of — ANOTHER Run's pending
+    record on a colliding or replayed ref. A caller that supplies no run_id
+    gets the pre-existing ref-only behaviour (direct registry probes that
+    never go through a Run at all); the one production emitting site always
+    freezes a real run_id and always passes it.
+    """
+    pending_ref = str(payload.get("pending_ref") or "").strip()
+    claimed = str(payload.get("state") or "").strip().lower()
+    if claimed not in _AUTHORIZATION_TERMINAL_STATES:
+        claimed = "failed"
+    resolved: dict[str, Any] = {"state": "failed" if claimed == "success" else claimed}
+    trusted_run_id = str(run_id or "").strip()
+    if pending_ref:
+        with _pending_authorizations_lock:
+            for key, pending in list(_pending_authorizations.items()):
+                if str(pending.get("pending_ref") or "") != pending_ref:
+                    continue
+                if trusted_run_id and str(pending.get("run_id") or "") != trusted_run_id:
+                    # Same ref, different run: never let one run's event resolve
+                    # — or tear down the flow of — another run's pending record.
+                    logger.warning(
+                        "[multitenancy] authorization_resolved run_id mismatch for "
+                        "pending_ref=%s; ignoring (event run_id=%s, record run_id=%s)",
+                        pending_ref, trusted_run_id, pending.get("run_id"),
+                    )
+                    continue
+                recorded = str(pending.get("state") or "")
+                if pending.get("consumed") and recorded in _AUTHORIZATION_TERMINAL_STATES:
+                    state = recorded
+                elif claimed == "success":
+                    state = "failed"
+                else:
+                    state = claimed
+                _kill_authorization_flow(pending, _locked=True)
+                resolved.update(
+                    state=state,
+                    authorization_id=key,
+                    service=pending.get("service"),
+                    scopes=pending.get("scopes"),
+                    expires_at=pending.get("expires_at"),
+                )
+                _pending_authorizations.pop(key, None)
+                break
+    return _sanitize_authorization_payload(resolved)
+
+
+def _authorization_run_is_live(pending: dict[str, Any]) -> bool:
+    """True only while the run that raised this request is still EXECUTING.
+
+    Deliberately NOT the ``_auth_signal`` replay cache. That cache is retained
+    past run end whenever the run emitted a whole-message ``auth_required`` (it
+    is what makes JIT re-auth replay work), so treating its presence as
+    execution liveness meant a confirm arriving after the user pressed Stop was
+    still accepted. ``_authorization_live_runs`` is written at run start and
+    cleared by the run's own finally-block, and by nothing else.
+    """
+    run_id = str(pending.get("run_id") or "")
+    if not run_id:
+        return False
+    with _authorization_live_runs_lock:
+        entry = _authorization_live_runs.get(run_id)
+    if entry is None:
+        return False
+    return (
+        str(entry.get("profile_name") or "") == str(pending.get("profile_name") or "")
+        and str(entry.get("subject") or "") == str(pending.get("owner_open_id") or "")
+    )
+
+
+def _clear_pending_authorizations_for_run(run_id: str) -> int:
+    """Drop every pending authorization frozen to a run that has ENDED.
+
+    ``authorization_resolved`` only arrives when the child's bridge returns
+    normally. A run stopped by the user, aborted, or whose child was killed
+    never emits it, so without this the record survived to its 600s expiry and
+    (before the guard was re-keyed) refused every later run in that session.
+
+    Called from the same finally-block that consumes the run's parked
+    auth-signal entry — the existing per-run teardown seam, keyed by the very
+    id frozen on these records. No response file is written: the child that was
+    waiting is already gone. The per-run rendezvous directory goes with it, so
+    no answered/unanswered response file outlives the run that owned it.
+
+    Returns how many records were dropped (0 for the overwhelming majority of
+    runs, which never raise an authorization).
+    """
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return 0
+    _mark_authorization_run_finished(run_id)
+    with _pending_authorizations_lock:
+        doomed = [
+            key
+            for key, pending in _pending_authorizations.items()
+            if str(pending.get("run_id") or "") == run_id
+        ]
+        dropped = [_pending_authorizations.pop(key) for key in doomed]
+    for pending in dropped:
+        _kill_authorization_flow(pending)
+    try:
+        shutil.rmtree(_authorization_response_dir(run_id), ignore_errors=True)
+    except Exception:
+        logger.debug("[multitenancy] authorization rendezvous cleanup failed", exc_info=True)
+    return len(dropped)
+
+
+def _cancel_pending_authorization(
+    *,
+    authorization_id: str,
+    owner_open_id: str,
+    profile_name: str,
+    session_id: str,
+    reason: str = "cancelled_by_user",
+) -> bool:
+    """Cancel one request, INDEPENDENT of whether its run is still executing.
+
+    Stop is exactly the case where the run has already gone: routing cancel
+    through the run-liveness guard meant an explicit Stop could not invalidate
+    its own authorization, so the record sat there with a live device flow and
+    a late confirm remained acceptable. Cancelling never grants anything, so it
+    does not need — and must not have — the liveness precondition that success
+    does. Binding equality and consume-once still hold.
+    """
+    with _pending_authorizations_lock:
+        pending = _pending_authorizations.get(authorization_id)
+        if pending is None:
+            return False
+        if pending.get("consumed"):
+            return False
+        if not _authorization_binding_matches(
+            pending,
+            owner_open_id=owner_open_id,
+            profile_name=profile_name,
+            session_id=session_id,
+        ):
+            return False
+        pending["consumed"] = True
+        pending["state"] = "cancelled"
+        _pending_authorizations.pop(authorization_id, None)
+    # Best-effort: if the child is still blocked it returns now; if it is gone
+    # the write lands in a directory the run teardown will remove.
+    _write_authorization_response_file(str(pending.get("response_path") or ""), "cancelled", reason)
+    _kill_authorization_flow(pending)
+    return True
+
+
+def _cancel_session_authorizations(
+    *, owner_open_id: str, profile_name: str, session_id: str, reason: str = "stopped_by_user"
+) -> int:
+    """Stop hook: invalidate every inline authorization this session still holds.
+
+    The browser's Stop knows the session, not necessarily the authorization id
+    (the card may already be off-screen), and Stop must be distinguishable from
+    an ordinary refresh/reconnect — which deliberately leave the request alone.
+    """
+    with _pending_authorizations_lock:
+        targets = [
+            key
+            for key, pending in _pending_authorizations.items()
+            if not pending.get("consumed")
+            and _authorization_binding_matches(
+                pending,
+                owner_open_id=owner_open_id,
+                profile_name=profile_name,
+                session_id=session_id,
+            )
+        ]
+    cancelled = 0
+    for key in targets:
+        if _cancel_pending_authorization(
+            authorization_id=key,
+            owner_open_id=owner_open_id,
+            profile_name=profile_name,
+            session_id=session_id,
+            reason=reason,
+        ):
+            cancelled += 1
+    return cancelled
+
+
+def _abandon_pending_authorization(payload: dict[str, Any]) -> None:
+    """Drop a request whose run is being cancelled, keyed by the PUBLIC id.
+
+    ``_clear_pending_authorization`` matches the child's ``pending_ref``, which
+    only exists on the internal event. A caller abandoning the run (ingest
+    short-circuit) holds the sanitized payload instead, so it can only address
+    the request by ``authorization_id``. No response file is written: the child
+    is about to be cancelled, so there is nobody left to unblock — but any live
+    login process still has to be torn down.
+    """
+    authorization_id = str((payload or {}).get("authorization_id") or "").strip()
+    if not authorization_id:
+        return
+    with _pending_authorizations_lock:
+        pending = _pending_authorizations.pop(authorization_id, None)
+    if pending is not None:
+        _kill_authorization_flow(pending)
+
+
+def _write_pending_authorization_response(
+    *,
+    authorization_id: str,
+    owner_open_id: str,
+    profile_name: str,
+    session_id: str,
+    state: str,
+    reason: str = "",
+) -> bool:
+    """The ONE guarded terminal transition. Exactly once, under the lock, or not at all.
+
+    Three callers, no fourth: the already-authorized fast path in
+    ``_register_pending_authorization``, the completion resolution in
+    ``_authorization_probe_and_resolve`` (Feishu poll / KEP callback / manual
+    confirm), and the cancel route. Consume-once, binding equality, deadline and
+    RUN liveness are enforced here so no caller can be written without them, and
+    success is reported only after the response has actually been published.
+    """
+    if state not in _AUTHORIZATION_TERMINAL_STATES:
+        return False
+    now = time.time()
+    with _pending_authorizations_lock:
+        pending = _pending_authorizations.get(authorization_id)
+        if pending is None:
+            return False
+        if pending.get("consumed"):
+            return False
+        if str(pending.get("state") or "") != "pending":
+            return False
+        if str(pending.get("owner_open_id") or "") != owner_open_id:
+            return False
+        if str(pending.get("profile_name") or "") != profile_name:
+            return False
+        if str(pending.get("session_id") or "") != session_id:
+            return False
+        if not _authorization_pending_is_live(pending, now):
+            return False
+        if not _authorization_run_is_live(pending):
+            # The run that is waiting on this answer is gone; writing now would
+            # answer nobody, or worse, answer a run that has been superseded.
+            return False
+        if not _write_authorization_response_file(
+            str(pending.get("response_path") or ""), state, reason
+        ):
+            return False
+        pending["consumed"] = True
+        pending["state"] = state
+        if state != "success":
+            # A successful confirm already proved the credential landed; the
+            # login process is done. Any other terminal state must tear the
+            # half-finished flow down.
+            _kill_authorization_flow(pending, _locked=True)
+        return True
+
+
+def _advance_lark_authorization_session(pending: dict[str, Any]) -> str:
+    """Push the frozen Feishu device flow one step. Returns its status.
+
+    ``start_session`` only mints the device code — ``poll_session`` is the ONLY
+    code path that exchanges it for a token and persists the credential. Without
+    this call the user could complete the Feishu consent screen and still wait
+    to the 10-minute timeout, because the confirmation probe only ever looked at
+    stored credentials that nothing had stored.
+    """
+    flow = pending.get("flow")
+    if not isinstance(flow, dict) or str(flow.get("kind") or "") != "lark":
+        return ""
+    session_id = str(flow.get("session_id") or "").strip()
+    if not session_id:
+        return ""
+    try:
+        from .. import feishu_uat_auth
+
+        result = feishu_uat_auth.poll_session(
+            session_id=session_id,
+            profile_name=str(pending.get("profile_name") or ""),
+            open_id=str(pending.get("owner_open_id") or ""),
+        )
+    except Exception:
+        # Transient (network blip, store lock): unknown, NOT a terminal failure.
+        # Only a status the session itself reports may end the request.
+        logger.debug("[multitenancy] feishu authorization poll failed", exc_info=True)
+        return ""
+    return str((result or {}).get("status") or "")
+
+
+def _authorization_probe_and_resolve(
+    authorization_id: str,
+    *,
+    expect_owner_open_id: str = "",
+    expect_profile_name: str = "",
+    expect_session_id: str = "",
+    provider_confirmed: bool = False,
+) -> str:
+    """Advance the login flow, verify LIVE, and resolve on success.
+
+    Blocking (subprocess + HTTPS); every caller runs it off the event loop.
+    Returns ``success`` / ``pending`` / ``failed`` / ``not_found``. Landing on a
+    provider callback is a TRIGGER for this re-check and never proof by itself:
+    the credential still has to verify here before anything is written.
+
+    A caller that HAS a caller identity (the confirm route) passes it in, and it
+    is checked here and carried into the guard, so the guard's binding equality
+    is a real check rather than a tautology. The server-internal triggers (the
+    Feishu watcher, the KEP callback) have no caller identity by construction
+    and use the record's own frozen binding.
+
+    ``provider_confirmed`` is set ONLY by a caller that itself just observed the
+    provider's OWN confirmation land — today that is exactly the kep-cli OAuth
+    callback route, right after ``complete_kep_callback`` returns without error.
+    It is never inferred from anything this function does itself: a plain
+    manual confirm click, or a Feishu poll whose device exchange has not yet
+    finished, must keep returning ``pending`` so the user can still retry. Once
+    the underlying flow HAS genuinely finished — the Lark device exchange
+    itself reporting ``success``, or this explicit flag for kep-cli — there is
+    nothing left to wait FOR: Lark's watcher only keeps polling while the
+    exchange is outstanding, and kep-cli has no watcher at all, so a live check
+    that still fails after that point is not "keep waiting", it is terminal.
+    """
+    with _pending_authorizations_lock:
+        pending = _pending_authorizations.get(authorization_id)
+        snapshot = dict(pending) if pending is not None else None
+    if snapshot is None or not _authorization_pending_is_live(snapshot, time.time()):
+        return "not_found"
+    if (expect_owner_open_id or expect_profile_name or expect_session_id) and not (
+        _authorization_binding_matches(
+            snapshot,
+            owner_open_id=expect_owner_open_id,
+            profile_name=expect_profile_name,
+            session_id=expect_session_id,
+        )
+    ):
+        return "not_found"
+
+    flow_status = _advance_lark_authorization_session(snapshot)
+    if flow_status in {"error", "expired"}:
+        # The device session itself is over (declined, wrong account, timed out).
+        # Resolve through the guard so the blocked tool call returns now instead
+        # of sitting to the full window — and so no success can be emitted.
+        _write_pending_authorization_response(
+            authorization_id=authorization_id,
+            owner_open_id=str(snapshot.get("owner_open_id") or ""),
+            profile_name=str(snapshot.get("profile_name") or ""),
+            session_id=str(snapshot.get("session_id") or ""),
+            state="expired" if flow_status == "expired" else "failed",
+            reason="the authorization flow ended without granting access",
+        )
+        return "failed"
+
+    # Once the underlying flow has genuinely finished — Lark's own exchange
+    # reporting ``success``, or the caller explicitly observing the kep-cli
+    # OAuth callback land — nothing will ever trigger another look at this
+    # request. A live check that still fails from here on is not "keep
+    # waiting"; it is the terminal answer.
+    exchange_completed = flow_status == "success" or provider_confirmed
+
+    profile_name = str(snapshot.get("profile_name") or "")
+    owner_open_id = str(snapshot.get("owner_open_id") or "")
+    profile_dir, shared_home = _authorization_profile_paths(profile_name)
+    try:
+        from .. import authorization_verify
+
+        authorized = bool(
+            authorization_verify.verify_service_authorized(
+                str(snapshot.get("service") or ""),
+                profile_name=profile_name,
+                open_id=owner_open_id,
+                profile_dir=profile_dir,
+                shared_home=shared_home,
+                required_scopes=list(snapshot.get("scopes") or []),
+            )
+        )
+    except Exception:
+        logger.warning("[multitenancy] authorization probe failed", exc_info=True)
+        authorized = False
+    if not authorized:
+        if not exchange_completed:
+            # Nothing provider-side has finished yet — the user may still be
+            # mid-flow. Stay pending so a retry (poll / manual confirm) can
+            # still succeed.
+            return "pending"
+        # The provider-side flow is DONE and the credential still does not
+        # verify (scope mismatch, a store write that never landed, whatever).
+        # There is no further trigger coming, so this has to be the terminal
+        # answer instead of silently waiting out the whole window.
+        _write_pending_authorization_response(
+            authorization_id=authorization_id,
+            owner_open_id=owner_open_id,
+            profile_name=profile_name,
+            session_id=str(snapshot.get("session_id") or ""),
+            state="failed",
+            reason="the credential did not verify after authorization completed",
+        )
+        return "failed"
+    if _write_pending_authorization_response(
+        authorization_id=authorization_id,
+        owner_open_id=owner_open_id,
+        profile_name=profile_name,
+        session_id=str(snapshot.get("session_id") or ""),
+        state="success",
+        reason="authorized",
+    ):
+        return "success"
+    return "not_found"
+
+
+def _authorization_poll_interval(pending: dict[str, Any]) -> float:
+    """The device session's OWN interval, never a made-up one."""
+    flow = pending.get("flow")
+    interval = 0
+    if isinstance(flow, dict):
+        try:
+            interval = int(flow.get("interval") or 0)
+        except (TypeError, ValueError):
+            interval = 0
+    return float(max(interval, 1))
+
+
+async def _watch_authorization_completion(authorization_id: str) -> None:
+    """Notice completion server-side so the user only has to authorize.
+
+    sunke's requirement: the user clicks 去授权, finishes the provider's consent
+    screen, and does nothing else — the server sees it, verifies live, the card
+    flips off and the blocked tool call carries on.
+
+    lark is POLLED, and that is not a shortcut: Feishu's device flow gives the
+    server no completion hook at all, so ``poll_session`` at the session's own
+    interval is the only way to learn the user finished. (KEP does have a
+    server-visible landing — the existing OAuth callback route — and does not
+    use this watcher for the trigger.) Bounded by the request's own 10-minute
+    window and stopped by cancel / Stop / expiry / run end, which all cancel
+    this task through ``_kill_authorization_flow``.
+    """
+    try:
+        while True:
+            with _pending_authorizations_lock:
+                pending = _pending_authorizations.get(authorization_id)
+                snapshot = dict(pending) if pending is not None else None
+            if snapshot is None or not _authorization_pending_is_live(snapshot, time.time()):
+                return
+            if not _authorization_run_is_live(snapshot):
+                return
+            await asyncio.sleep(_authorization_poll_interval(snapshot))
+            outcome = await asyncio.to_thread(_authorization_probe_and_resolve, authorization_id)
+            if outcome in {"success", "failed", "not_found"}:
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("[multitenancy] authorization completion watcher failed", exc_info=True)
+
+
+def _same_authorization_flow(left: Any, right: Any) -> bool:
+    """Are these two flow records the SAME live login?"""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    kind = str(left.get("kind") or "")
+    if kind != str(right.get("kind") or ""):
+        return False
+    if kind == "lark":
+        session_id = str(left.get("session_id") or "")
+        return bool(session_id) and session_id == str(right.get("session_id") or "")
+    return left.get("proc") is not None and left.get("proc") is right.get("proc")
+
+
+def _authorization_flow_still_usable(
+    flow: Any, *, profile_name: str, open_id: str
+) -> bool:
+    """Can the user still complete THIS flow by opening its URL again?
+
+    Asked before minting a second one, because a second authorize used to
+    destroy the session the first one handed out — reopening the card or
+    clicking from another tab broke the real device flow.
+    """
+    if not isinstance(flow, dict) or not str(flow.get("verification_uri") or ""):
+        return False
+    kind = str(flow.get("kind") or "")
+    if kind == "lark":
+        try:
+            from .. import feishu_uat_auth
+
+            active = feishu_uat_auth.find_active_session(
+                profile_name=profile_name, open_id=open_id
+            )
+        except Exception:
+            logger.debug("[multitenancy] feishu active session lookup failed", exc_info=True)
+            return False
+        return bool(active) and str(active.get("session_id") or "") == str(
+            flow.get("session_id") or ""
+        )
+    proc = flow.get("proc")
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
+
+_authorization_flow_locks: dict[str, Any] = {}
+_authorization_flow_locks_guard = threading.Lock()
+
+
+def _authorization_flow_lock(authorization_id: str) -> Any:
+    """Serialize flow creation per pending request (concurrent duplicate authorize)."""
+    with _authorization_flow_locks_guard:
+        # Sweep locks whose request is gone, so the map cannot grow forever.
+        for stale in [
+            key for key in _authorization_flow_locks if key not in _pending_authorizations
+        ]:
+            lock = _authorization_flow_locks[stale]
+            if not lock.locked():
+                _authorization_flow_locks.pop(stale, None)
+        lock = _authorization_flow_locks.get(authorization_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _authorization_flow_locks[authorization_id] = lock
+        return lock
+
+
+def _kep_callback_session_id(verification_uri: str) -> str:
+    """The public-callback session id embedded in a rewritten kep-auth URL.
+
+    ``credential_hub_auth.rewrite_kep_verification_uri`` replaces kep-auth's
+    localhost ``response_url`` with
+    ``<origin>/api/run-broker/credentials/kep-cli/callback/<sid>``; that <sid> is
+    the only server-visible handle tying the user's browser landing back to this
+    request. Empty when no public origin was configured (then no rewrite
+    happened and there is no callback to trigger on).
+    """
+    try:
+        parsed = urllib.parse.urlsplit(str(verification_uri or ""))
+        response_url = dict(
+            urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        ).get("response_url", "")
+        path = urllib.parse.urlsplit(response_url).path
+    except Exception:
+        return ""
+    marker = "/api/run-broker/credentials/kep-cli/callback/"
+    if marker not in path:
+        return ""
+    return path.rsplit("/", 1)[-1].strip()
+
+
+# The callback landing page. Closes itself so the user's only action really was
+# "authorize"; browsers refuse `window.close()` on tabs they did not open, hence
+# the visible fallback line.
+_AUTHORIZATION_CALLBACK_PAGE = (
+    "<html><body style='font-family:sans-serif;padding:24px'>"
+    "<p>{message}</p><p style='color:#888'>可以关闭此页</p>"
+    "<script>setTimeout(function(){{try{{window.close();}}catch(e){{}}}},600);</script>"
+    "</body></html>"
+)
+
+
+def _pending_authorization_for_kep_callback(callback_sid: str) -> str:
+    """The authorization id whose KEP login owns this OAuth callback session."""
+    callback_sid = str(callback_sid or "").strip()
+    if not callback_sid:
+        return ""
+    with _pending_authorizations_lock:
+        for key, pending in _pending_authorizations.items():
+            flow = pending.get("flow")
+            if not isinstance(flow, dict):
+                continue
+            if str(flow.get("callback_sid") or "") == callback_sid:
+                return key
+    return ""
+
+
+def _authorization_binding_matches(
+    pending: dict[str, Any], *, owner_open_id: str, profile_name: str, session_id: str
+) -> bool:
+    return (
+        str(pending.get("owner_open_id") or "") == owner_open_id
+        and str(pending.get("profile_name") or "") == profile_name
+        and str(pending.get("session_id") or "") == session_id
+    )
+
+
 def _register_pending_clarify(run_request: RunRequest, payload: dict[str, Any]) -> dict[str, Any]:
     clarify_id = str(payload.get("clarify_id") or "").strip()
     response_path = str(payload.get("response_path") or "").strip()
@@ -2506,6 +3605,25 @@ async def _default_dispatch_agent(
 
     profile_home = router_mod._profile_name_to_home(request.profile_name)
     event = _build_webui_event(request, trusted_principal=trusted_principal)
+    # The run identity the inline-authorization rendezvous is named after. Set
+    # on the event because that is the only object that reaches the subprocess
+    # env builder; the broker side derives the same directory from the same id.
+    #
+    # Minted here when the caller has none (the ingest paths dispatch without a
+    # streaming `signal_run_id`). Without an id there is no derivable response
+    # path at all, so a refused registration could not even answer the blocked
+    # child and the tool call would sit out its whole window. A minted id is
+    # marked live for the length of THIS dispatch and torn down with it.
+    authorization_run_id = str(auth_signal_run_id or "").strip()
+    minted_authorization_run = not authorization_run_id
+    if minted_authorization_run:
+        authorization_run_id = "dispatch_" + secrets.token_urlsafe(24)
+        _mark_authorization_run_live(
+            authorization_run_id,
+            profile_name=request.profile_name,
+            subject=str(request.user_key or ""),
+        )
+    event.trusted_authorization_run_id = authorization_run_id
     if trusted_harness_admission is not None:
         event.trusted_harness_admission = trusted_harness_admission
     if prepare_codex_evidence is not None:
@@ -2618,6 +3736,12 @@ async def _default_dispatch_agent(
                 # surface one directly; the flag it sets is the same one.
                 turn_tool_context.mark_done(event)
                 continue
+            if kind in {"subagent.start", "subagent.tool", "subagent.progress", "subagent.complete"}:
+                event_payload = dict(payload) if isinstance(payload, dict) else {}
+                event_payload["broker_run_id"] = authorization_run_id
+                event_payload["session_id"] = request.session_id
+                await emitter.emit(RunEvent(kind=kind, payload=event_payload))
+                continue
             if kind == "heartbeat":
                 hb = payload if isinstance(payload, dict) else {}
                 hb_text = str(hb.get("text") or "")
@@ -2647,6 +3771,36 @@ async def _default_dispatch_agent(
                 if kind == "auth_required":
                     event_payload["run_id"] = auth_signal_run_id
                 await emitter.emit(RunEvent(kind=kind, payload=event_payload))
+                continue
+            if kind == "authorization_required":
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {}
+                # Registration runs the LIVE credential probe (subprocess + HTTPS),
+                # so it must never execute on the event loop.
+                decision = await asyncio.to_thread(
+                    functools.partial(
+                        _register_pending_authorization,
+                        request,
+                        event_payload,
+                        run_id=authorization_run_id,
+                    )
+                )
+                await emitter.emit(
+                    RunEvent(
+                        kind=str(decision.get("kind") or "authorization_resolved"),
+                        payload=decision.get("payload") or {},
+                    )
+                )
+                continue
+            if kind == "authorization_resolved":
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {}
+                await emitter.emit(
+                    RunEvent(
+                        kind=kind,
+                        payload=_clear_pending_authorization(
+                            event_payload, run_id=authorization_run_id
+                        ),
+                    )
+                )
                 continue
             if kind == "clarify_required":
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}

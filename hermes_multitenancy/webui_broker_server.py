@@ -85,6 +85,11 @@ _LIVE_STATE_OWNERS = {
     '_auth_signal_store_lock': _periphery,
     '_credential_broker_tokens': _periphery,
     '_credential_broker_tokens_lock': _periphery,
+    # NOTE: `_pending_approvals` / `_pending_authorizations` are deliberately NOT
+    # listed. Live-state names are excluded from the bulk re-export, and this
+    # module's OWN handlers read them as bare globals (which no `__getattr__` can
+    # intercept). They are never reassigned, so the exported reference is the
+    # same object the owner mutates.
     '_pending_clarifies': _periphery,
     '_run_broker_scoped_tokens': _periphery,
     '_run_broker_scoped_tokens_lock': _periphery,
@@ -198,6 +203,49 @@ def build_ingest_run_request(
     )
 
 
+def _lark_scopes_already_covered_by_session(
+    session_id: str,
+    *,
+    profile_name: str,
+    owner_open_id: str,
+    required_scopes: list[str],
+) -> bool:
+    """Would reusing this ALREADY-STARTED Feishu device session actually grant
+    the scopes THIS request is frozen to, or only whatever some other, narrower
+    request asked the user to consent to?
+
+    ``find_active_session``'s public dict deliberately does not carry the scope
+    string it was opened with (``feishu_uat_auth`` is a locked, read-only
+    surface for this fix), so the only scope we can trust is what THIS
+    registry itself already froze for whichever pending record started that
+    same device session — the exact string Feishu's device flow was actually
+    opened with, read straight off ``_pending_authorizations`` rather than
+    re-derived or guessed. A session with no such record (started by something
+    outside this registry entirely, e.g. the plain ``/auth`` route) has no
+    accountable scope, and the safe default is to treat it as NOT covering the
+    request and start a fresh device code, rather than silently ride a grant
+    nobody here can vouch for.
+    """
+    if not required_scopes:
+        return True
+    required = set(required_scopes)
+    with _pending_authorizations_lock:
+        for other in _pending_authorizations.values():
+            flow = other.get("flow")
+            if not isinstance(flow, dict) or str(flow.get("kind") or "") != "lark":
+                continue
+            if str(flow.get("session_id") or "") != session_id:
+                continue
+            if (
+                str(other.get("profile_name") or "") != profile_name
+                or str(other.get("owner_open_id") or "") != owner_open_id
+            ):
+                continue
+            if required.issubset(set(other.get("scopes") or [])):
+                return True
+    return False
+
+
 def create_run_broker_app(
     *,
     dispatch_agent: Optional[DispatchAgent] = None,
@@ -253,6 +301,39 @@ def create_run_broker_app(
         effective_mark_seen = mark_seen if mark_seen is not None else _default_mark_seen
         effective_is_seen = is_seen if is_seen is not None else _default_is_seen
 
+    # Process-local because execution tasks are owned by this broker process.
+    active_cancellable_runs: dict[str, dict[str, Any]] = {}
+
+    async def handle_run_cancel(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if not owner:
+            return web.json_response({"error": "owner identity required"}, status=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "invalid request"}, status=400)
+        run_id = str(request.match_info.get("run_id") or "")
+        entry = active_cancellable_runs.get(run_id)
+        if entry is None or (
+            owner != entry["owner"]
+            or payload.get("profile_name") != entry["profile"]
+            or payload.get("session_id") != entry["session"]
+        ):
+            return web.json_response({"error": "run not found"}, status=404)
+        if not entry["stopping"]:
+            entry["stopping"] = True
+            target = entry["execution"] or entry["handler"]
+            target.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(entry["finished"].wait()), timeout=10)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "run is still stopping"}, status=503)
+        return web.json_response({"ok": True, "cancelled": True})
+
     async def _stream_run_request(
         request, run_request, *, stash_payload, harness_engine: str = ""
     ):
@@ -271,6 +352,14 @@ def create_run_broker_app(
         _auth_signal_stash(
             signal_run_id,
             payload={} if strict_context_enabled() else stash_payload,
+            profile_name=run_request.profile_name,
+            subject=run_request.user_key,
+        )
+        # Execution liveness for inline authorization. Separate from the stash
+        # above on purpose: the stash is RETAINED past run end for re-auth
+        # replay, so it cannot answer "is this run still running?".
+        _mark_authorization_run_live(
+            signal_run_id,
             profile_name=run_request.profile_name,
             subject=run_request.user_key,
         )
@@ -322,6 +411,17 @@ def create_run_broker_app(
                 else:
                     _auth_signal_touch(signal_run_id)  # restart TTL/eviction clock at emission
             await emitter.emit(event)
+
+        cancellation = {
+            "owner": str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip(),
+            "profile": run_request.profile_name,
+            "session": run_request.session_id,
+            "handler": asyncio.current_task(),
+            "execution": None,
+            "stopping": False,
+            "finished": asyncio.Event(),
+        }
+        active_cancellable_runs[signal_run_id] = cancellation
 
         try:
             trusted_principal = None
@@ -384,26 +484,43 @@ def create_run_broker_app(
                     ),
                 )
             )
+            async def execute_cancellable(admitted):
+                cancellation["execution"] = asyncio.current_task()
+                if cancellation["stopping"]:
+                    raise asyncio.CancelledError()
+                return await admission_broker._run_admitted(
+                    admitted, dispatch_agent=broker_dispatch, emit_event=emit_event,
+                )
+
+            await emit_event(RunEvent(kind="run_started", payload={
+                "broker_run_id": signal_run_id, "session_id": run_request.session_id,
+            }))
             result = await admission_broker.prepare_and_execute(
                 run_request,
-                execute=lambda admitted: admission_broker._run_admitted(
-                    admitted,
-                    dispatch_agent=broker_dispatch,
-                    emit_event=emit_event,
-                ),
+                execute=execute_cancellable,
             )
             if result.duplicate:
                 await emit_event(RunEvent(kind="done"))
+        except asyncio.CancelledError:
+            await emit_event(RunEvent(kind="done", payload={"cancelled": True}))
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
             message = "Harness is unavailable" if harness_engine == "harness" else "Run is unavailable"
             await emit_event(RunEvent(kind="error", text=message, payload={"error": message}))
         finally:
+            # This run is over. Any inline-authorization request still frozen to
+            # it can never be answered (its child is gone), so drop it here
+            # rather than letting it sit until the 600s expiry. Unconditional:
+            # a stopped/aborted run is exactly the case that never emits
+            # authorization_resolved.
+            active_cancellable_runs.pop(signal_run_id, None)
+            _clear_pending_authorizations_for_run(signal_run_id)
             # Retain the parked request ONLY when this run signalled re-auth;
             # otherwise drop it so the bounded store holds only pending-reauth
             # entries and normal traffic can't evict a genuine one.
             if not auth_required_seen:
                 _auth_signal_consume(signal_run_id)
+            cancellation["finished"].set()
             if not emitter.disconnected:
                 try:
                     await response.write_eof()
@@ -946,6 +1063,9 @@ def create_run_broker_app(
         elif status == "needs_approval":
             resp["approval"] = dict(job.get("approval") or {})
             resp["result"] = str(job.get("result") or "")
+        elif status == "needs_authorization":
+            resp["authorization"] = dict(job.get("authorization") or {})
+            resp["result"] = str(job.get("result") or "")
         elif status in {"failed", "timeout"}:
             if job.get("error"):
                 resp["error"] = str(job.get("error"))
@@ -961,6 +1081,7 @@ def create_run_broker_app(
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
         approval_holder: dict[str, Any] = {}
+        authorization_holder: dict[str, Any] = {}
         interrupt = asyncio.Event()
 
         async def emit_event(event: RunEvent) -> None:
@@ -973,6 +1094,30 @@ def create_run_broker_app(
                 interrupt.set()
             elif event.kind == "approval_required" and "payload" not in approval_holder:
                 approval_holder["payload"] = event.payload or {}
+                interrupt.set()
+            # Ingest is a machine API: there is no human on the other end to
+            # open an authorization card, so blocking the child's tool call for
+            # the full 600s window would be a stall, not a wait. Short-circuit
+            # like clarify/approval and report a terminal status instead.
+            #
+            # Two shapes reach us, and both mean "this run needs an
+            # authorization it cannot obtain here":
+            #   * authorization_required — a card was raised for a human;
+            #   * a NON-success authorization_resolved with no preceding
+            #     required — the broker refused to register the request at all.
+            #     That is today's ingest reality: build_ingest_run_request sets
+            #     no session_id, and a request with no session has nothing for
+            #     the confirm route to bind to, so it is refused fail-closed.
+            # A SUCCESS resolved (the credential was already live) is not an
+            # interruption — that run carries on normally.
+            elif "payload" not in authorization_holder and (
+                event.kind == "authorization_required"
+                or (
+                    event.kind == "authorization_resolved"
+                    and str((event.payload or {}).get("state") or "") != "success"
+                )
+            ):
+                authorization_holder["payload"] = event.payload or {}
                 interrupt.set()
 
         sink = emit_event if prepared.interactive else None
@@ -1102,6 +1247,16 @@ def create_run_broker_app(
             job["approval"] = _ingest_public_interaction(approval_holder["payload"])
             job["result"] = text
             _ingest_async_touch(job, "needs_approval")
+            return
+        if authorization_holder:
+            # Same leak rule as clarify above: no authorization_resolved will
+            # ever arrive for a run we cancelled, so drop the registration.
+            _abandon_pending_authorization(authorization_holder["payload"])
+            job["authorization"] = _ingest_public_interaction(
+                authorization_holder["payload"]
+            )
+            job["result"] = text
+            _ingest_async_touch(job, "needs_authorization")
             return
         job["result"] = text
         _ingest_async_touch(job, "succeeded")
@@ -1476,9 +1631,10 @@ def create_run_broker_app(
           on the streaming path), so the agent can never block waiting on a
           human; it proceeds with best judgement and returns.
         - ``interactive`` true — streaming dispatch WITH the bridges, but the
-          handler short-circuits on the first clarify/approval event: it
-          cancels the run and returns ``needs_clarification`` / ``needs_approval``
-          immediately instead of letting the bridge block up to its timeout.
+          handler short-circuits on the first clarify/approval/authorization
+          event: it cancels the run and returns ``needs_clarification`` /
+          ``needs_approval`` / ``needs_authorization`` immediately instead of
+          letting the bridge block up to its timeout.
 
         A hard ``HERMES_INGEST_TIMEOUT`` (default 180s) bounds either path.
 
@@ -1642,6 +1798,7 @@ def create_run_broker_app(
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
         approval_holder: dict[str, Any] = {}
+        authorization_holder: dict[str, Any] = {}
         interrupt = asyncio.Event()
 
         async def emit_event(event: RunEvent) -> None:
@@ -1654,6 +1811,30 @@ def create_run_broker_app(
                 interrupt.set()
             elif event.kind == "approval_required" and "payload" not in approval_holder:
                 approval_holder["payload"] = event.payload or {}
+                interrupt.set()
+            # Ingest is a machine API: there is no human on the other end to
+            # open an authorization card, so blocking the child's tool call for
+            # the full 600s window would be a stall, not a wait. Short-circuit
+            # like clarify/approval and report a terminal status instead.
+            #
+            # Two shapes reach us, and both mean "this run needs an
+            # authorization it cannot obtain here":
+            #   * authorization_required — a card was raised for a human;
+            #   * a NON-success authorization_resolved with no preceding
+            #     required — the broker refused to register the request at all.
+            #     That is today's ingest reality: build_ingest_run_request sets
+            #     no session_id, and a request with no session has nothing for
+            #     the confirm route to bind to, so it is refused fail-closed.
+            # A SUCCESS resolved (the credential was already live) is not an
+            # interruption — that run carries on normally.
+            elif "payload" not in authorization_holder and (
+                event.kind == "authorization_required"
+                or (
+                    event.kind == "authorization_resolved"
+                    and str((event.payload or {}).get("state") or "") != "success"
+                )
+            ):
+                authorization_holder["payload"] = event.payload or {}
                 interrupt.set()
 
         # NON-INTERACTIVE (default): one-shot dispatch with NO event sink, so
@@ -1967,6 +2148,22 @@ def create_run_broker_app(
             }
             _ingest_store_result(cache_key, resp)
             return web.json_response(resp, status=200)
+        if authorization_holder:
+            # Same leak rule as clarify above: no authorization_resolved will
+            # ever arrive for a run we cancelled, so drop the registration.
+            _abandon_pending_authorization(authorization_holder["payload"])
+            resp = {
+                "ok": False,
+                "status": "needs_authorization",
+                "authorization": _ingest_public_interaction(
+                    authorization_holder["payload"]
+                ),
+                "result": text,
+                "profile": bound_profile,
+                "duplicate": False,
+            }
+            _ingest_store_result(cache_key, resp)
+            return web.json_response(resp, status=200)
 
         resp = {"ok": True, "result": text, "profile": bound_profile, "duplicate": False}
         _ingest_store_result(cache_key, resp)
@@ -2074,6 +2271,343 @@ def create_run_broker_app(
         if not wrote:
             return web.json_response({"error": "clarify request not found"}, status=404)
         return web.json_response({"ok": True, "clarify_id": clarify_id})
+
+    def _authorization_request_context(request, payload):
+        """Owner/profile/session preamble shared by all three authorization routes.
+
+        Same shape as ``handle_clarify_respond``: the owner comes ONLY from the
+        server-stamped header, the profile from routing, and both must be present.
+        Returns (context, error_response).
+        """
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return None, web.json_response({"ok": False, "error": resolution_error}, status=403)
+        trusted_owner = _trusted_owner_from_request(request)
+        if not trusted_owner:
+            return None, web.json_response(
+                {"ok": False, "error": "owner identity required (X-Hermes-Owner-Open-Id)"},
+                status=403,
+            )
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            return None, web.json_response({"ok": False, "error": "session_id required"}, status=400)
+        return (
+            {
+                "owner_open_id": trusted_owner,
+                "profile_name": resolved_profile_name or "",
+                "session_id": session_id,
+            },
+            None,
+        )
+
+    def _authorization_pending_for(authorization_id, context):
+        """The live pending record for this id, or an error response.
+
+        A wrong/expired/consumed id and a binding mismatch deliberately return the
+        SAME non-leaking body: a caller must not be able to probe which of the
+        three it hit.
+        """
+        with _pending_authorizations_lock:
+            pending = _pending_authorizations.get(authorization_id)
+            if (
+                pending is None
+                or not _authorization_binding_matches(
+                    pending,
+                    owner_open_id=context["owner_open_id"],
+                    profile_name=context["profile_name"],
+                    session_id=context["session_id"],
+                )
+                or not _authorization_pending_is_live(pending, time.time())
+                # The run that raised this request must still be the live one.
+                # A superseded/finished run's confirm is refused here, before
+                # any credential probe runs.
+                or not _authorization_run_is_live(pending)
+            ):
+                return None, web.json_response(
+                    {"ok": False, "error": "authorization request not found"}, status=404
+                )
+            return dict(pending), None
+
+    async def _read_authorization_payload(request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return None, web.json_response({"ok": False, "error": "invalid request"}, status=400)
+        if not isinstance(payload, dict):
+            return None, web.json_response({"ok": False, "error": "invalid request"}, status=400)
+        return payload, None
+
+    async def handle_authorization_authorize(request):
+        """Mint the authorization URL. SERVER-SIDE ONLY — the child never sees it."""
+        if not _authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        authorization_id = str(request.match_info.get("authorization_id") or "").strip()
+        payload, error = await _read_authorization_payload(request)
+        if error is not None:
+            return error
+        context, error = _authorization_request_context(request, payload)
+        if error is not None:
+            return error
+        pending, error = _authorization_pending_for(authorization_id, context)
+        if error is not None:
+            return error
+
+        from . import credential_hub_auth as cha
+        from . import feishu_uat_auth
+        from .credential_hub.model import KEP_CLI_ONLINE, KEP_CLI_PRE, LARK_CLI
+
+        service = str(pending.get("service") or "")
+        scopes = list(pending.get("scopes") or [])
+        profile_name = context["profile_name"]
+        owner_open_id = context["owner_open_id"]
+
+        def _start_flow():
+            if service == LARK_CLI:
+                session = feishu_uat_auth.find_active_session(
+                    profile_name=profile_name, open_id=owner_open_id
+                )
+                if session and not _lark_scopes_already_covered_by_session(
+                    str(session.get("session_id") or ""),
+                    profile_name=profile_name,
+                    owner_open_id=owner_open_id,
+                    required_scopes=scopes,
+                ):
+                    # A live session exists, but it was opened for a DIFFERENT
+                    # (narrower) request's scopes — reusing it would silently
+                    # authorize THIS request against a consent the user was
+                    # never shown a card for. Start this request its own,
+                    # fresh device code instead.
+                    session = None
+                if not session:
+                    session = feishu_uat_auth.start_session(
+                        profile_name=profile_name,
+                        open_id=owner_open_id,
+                        scope=" ".join(scopes) or None,
+                    )
+                verification_uri = str(session.get("verification_uri") or "")
+                return (
+                    verification_uri,
+                    {
+                        "kind": "lark",
+                        "session_id": str(session.get("session_id") or ""),
+                        "verification_uri": verification_uri,
+                        # The session's OWN interval — what the completion
+                        # watcher polls at. Never a number we invented.
+                        "interval": session.get("interval") or 3,
+                    },
+                )
+            env_name = "pre" if service == KEP_CLI_PRE else "online"
+            shared_home = feishu_uat_auth.resolve_shared_home()
+            login = cha.start_kep_cli_login(
+                shared_home / "profiles" / profile_name,
+                profile_name,
+                shared_home,
+                public_origin=os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip(),
+                env_name=env_name,
+            )
+            verification_uri = str(login.get("verification_uri") or "")
+            return (
+                verification_uri,
+                {
+                    "kind": "kep",
+                    "proc": login.get("_proc"),
+                    "env": env_name,
+                    "verification_uri": verification_uri,
+                    # Ties this pending request to the public OAuth callback the
+                    # user's browser will hit, so the landing can trigger the
+                    # server-side re-check without a new endpoint.
+                    "callback_sid": _kep_callback_session_id(verification_uri),
+                },
+            )
+
+        if service in {KEP_CLI_ONLINE, KEP_CLI_PRE} and not os.environ.get(
+            "HERMES_PUBLIC_CALLBACK_ORIGIN", ""
+        ).strip():
+            # No localhost fallback: the OAuth callback would land somewhere the
+            # user's browser cannot reach and the request would hang to expiry.
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "kep-cli authorization needs HERMES_PUBLIC_CALLBACK_ORIGIN to be configured",
+                },
+                status=503,
+            )
+
+        # Idempotent per pending request, and serialized so two concurrent
+        # authorize calls cannot mint two device codes. The previous code
+        # unconditionally killed the live flow immediately after deciding to
+        # reuse it, so a reopened card or a second tab returned a URL whose
+        # device session had just been cancelled — and that is the very session
+        # the completion watcher now depends on.
+        flow_lock = _authorization_flow_lock(authorization_id)
+        async with flow_lock:
+            with _pending_authorizations_lock:
+                live = _pending_authorizations.get(authorization_id)
+                if live is None or not _authorization_pending_is_live(live, time.time()):
+                    return web.json_response(
+                        {"ok": False, "error": "authorization request not found"}, status=404
+                    )
+                existing_flow = live.get("flow")
+                existing_uri = (
+                    str(existing_flow.get("verification_uri") or "")
+                    if isinstance(existing_flow, dict)
+                    else ""
+                )
+            if existing_uri and await asyncio.to_thread(
+                _authorization_flow_still_usable,
+                existing_flow,
+                profile_name=profile_name,
+                open_id=owner_open_id,
+            ):
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "authorization_id": authorization_id,
+                        "verification_uri": existing_uri,
+                    }
+                )
+
+            try:
+                verification_uri, flow = await asyncio.to_thread(_start_flow)
+            except Exception as exc:
+                logger.warning("[multitenancy] authorization flow start failed", exc_info=True)
+                status = int(getattr(exc, "status", 0) or 0)
+                return web.json_response(
+                    {"ok": False, "error": "authorization flow could not be started"},
+                    status=status if 400 <= status < 600 else 502,
+                )
+            if not verification_uri:
+                return web.json_response(
+                    {"ok": False, "error": "authorization flow returned no URL"}, status=502
+                )
+
+            with _pending_authorizations_lock:
+                live = _pending_authorizations.get(authorization_id)
+                if live is None or not _authorization_pending_is_live(live, time.time()):
+                    # Cancelled/expired while the flow was starting: tear it back down
+                    # instead of leaking a live kep-auth process / device code.
+                    _kill_authorization_flow({"flow": flow}, _locked=True)
+                    return web.json_response(
+                        {"ok": False, "error": "authorization request not found"}, status=404
+                    )
+                superseded = live.get("flow")
+                stale_task = live.pop("poll_task", None)
+                live["flow"] = flow
+            if isinstance(superseded, dict) and not _same_authorization_flow(superseded, flow):
+                # Only ever tear down a flow we are NOT keeping.
+                _kill_authorization_flow({"flow": superseded})
+            if stale_task is not None:
+                stale_task.cancel()
+            if str(flow.get("kind") or "") == "lark":
+                # Feishu exposes no completion hook, so the server polls the
+                # frozen session at its own interval until it can verify.
+                task = asyncio.create_task(_watch_authorization_completion(authorization_id))
+                with _pending_authorizations_lock:
+                    live = _pending_authorizations.get(authorization_id)
+                    if live is None:
+                        task.cancel()
+                    else:
+                        live["poll_task"] = task
+        return web.json_response(
+            {
+                "ok": True,
+                "authorization_id": authorization_id,
+                "verification_uri": verification_uri,
+            }
+        )
+
+    async def handle_authorization_confirm(request):
+        """The user says they are done — believe the CREDENTIAL, not the claim."""
+        if not _authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        authorization_id = str(request.match_info.get("authorization_id") or "").strip()
+        payload, error = await _read_authorization_payload(request)
+        if error is not None:
+            return error
+        context, error = _authorization_request_context(request, payload)
+        if error is not None:
+            return error
+        pending, error = _authorization_pending_for(authorization_id, context)
+        if error is not None:
+            return error
+
+        # Manual fallback for the SAME machinery the completion watcher and the
+        # KEP callback use: advance the frozen login flow (for Feishu that is
+        # the only path that exchanges and persists the token), then verify the
+        # credential live, then resolve through the one guarded transition.
+        outcome = await asyncio.to_thread(
+            _authorization_probe_and_resolve,
+            authorization_id,
+            expect_owner_open_id=context["owner_open_id"],
+            expect_profile_name=context["profile_name"],
+            expect_session_id=context["session_id"],
+        )
+        if outcome == "success":
+            return web.json_response({"ok": True, "state": "success"})
+        if outcome == "pending":
+            # Stay pending: the tool call keeps waiting and the user can retry.
+            return web.json_response(
+                {"ok": False, "state": "pending", "reason": "not_authorized"}, status=200
+            )
+        if outcome == "failed":
+            return web.json_response(
+                {"ok": False, "state": "failed", "reason": "authorization_failed"}, status=200
+            )
+        # Lost the race to a concurrent confirm/cancel: exactly one write wins.
+        return web.json_response(
+            {"ok": False, "error": "authorization request not found"}, status=409
+        )
+
+    async def handle_authorization_cancel(request):
+        if not _authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        authorization_id = str(request.match_info.get("authorization_id") or "").strip()
+        payload, error = await _read_authorization_payload(request)
+        if error is not None:
+            return error
+        context, error = _authorization_request_context(request, payload)
+        if error is not None:
+            return error
+        # Deliberately NOT through `_authorization_pending_for`: that gate
+        # requires the run to still be EXECUTING, which is exactly what is no
+        # longer true after Stop — so cancel could not invalidate the very
+        # request Stop was cancelling. Cancelling grants nothing, so binding
+        # equality + consume-once are the whole precondition.
+        if not _cancel_pending_authorization(
+            authorization_id=authorization_id,
+            owner_open_id=context["owner_open_id"],
+            profile_name=context["profile_name"],
+            session_id=context["session_id"],
+            reason="cancelled_by_user",
+        ):
+            return web.json_response(
+                {"ok": False, "error": "authorization request not found"}, status=409
+            )
+        return web.json_response({"ok": True, "state": "cancelled"})
+
+    async def handle_authorization_stop(request):
+        """Explicit Stop: invalidate every inline authorization this session holds.
+
+        Distinct from an ordinary refresh/reconnect, which leave a pending
+        request alone on purpose (the card must survive a page reload). The
+        browser calls this before it detaches; the server tears down the login
+        flows and makes any later confirm impossible.
+        """
+        if not _authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        payload, error = await _read_authorization_payload(request)
+        if error is not None:
+            return error
+        context, error = _authorization_request_context(request, payload)
+        if error is not None:
+            return error
+        cancelled = _cancel_session_authorizations(
+            owner_open_id=context["owner_open_id"],
+            profile_name=context["profile_name"],
+            session_id=context["session_id"],
+            reason="stopped_by_user",
+        )
+        return web.json_response({"ok": True, "cancelled": cancelled})
 
     async def handle_approval_respond(request):
         if not _authorized(request):
@@ -2445,6 +2979,10 @@ def create_run_broker_app(
                     profile=None,
                     db=search_db,
                     current_session_id=payload.get("current_session_id"),
+                    detail=payload.get("detail", "adaptive"),
+                    after=payload.get("after"),
+                    before=payload.get("before"),
+                    exclude_session_ids=payload.get("exclude_session_ids"),
                 )
             finally:
                 try:
@@ -3255,6 +3793,52 @@ def create_run_broker_app(
             logger.exception("GitHub credential operation failed (token redacted)")
             return web.json_response({"error": "GitHub 凭据服务暂不可用，请稍后重试。"}, status=500)
 
+    async def handle_figma_credential(request):
+        """Start or revoke the verified WebUI caller's own Figma MCP authorization.
+
+        Same owner-identity gate as the GitHub handler: the profile comes from the
+        owner-scoped resolver and the subject from the signed owner header, so one
+        employee can never start or revoke another employee's Figma grant.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        profile_name, error = _resolve_owner_scoped_profile(request, {})
+        subject_id = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if error or not profile_name or not subject_id:
+            return web.json_response({"error": error or "owner identity required"}, status=403)
+        from . import figma_connector as figma
+
+        try:
+            broker = figma.get_broker(_shared_home_from_env())
+            if request.method == "DELETE":
+                # Kill any authorization still in flight FIRST. A callback
+                # already open in the employee's browser would otherwise land
+                # after the revoke and quietly re-authorize the profile.
+                await broker.cancel_profile(profile_name)
+                revoked = await asyncio.to_thread(
+                    figma.revoke, _shared_home_from_env(), profile_name
+                )
+                from .connectors import registry
+                registry.clear_cache()
+                return web.json_response({"ok": True, "revoked": revoked})
+            started = await broker.start(profile_name)
+            from .connectors import registry
+            registry.clear_cache()
+            return web.json_response({
+                "ok": True,
+                "profile_name": profile_name,
+                **started,
+            }, status=202)
+        except figma.ConnectorUnavailable as exc:
+            # 503 only for the operator-configuration case, so the card can say
+            # "ask an admin" instead of "you did something wrong".
+            status_code = 503 if figma.PUBLIC_ORIGIN_ENV in str(exc) else 400
+            return web.json_response({"error": str(exc)}, status=status_code)
+        except Exception as exc:
+            # Type only: an OAuth traceback can carry the raw token response.
+            logger.error("Figma credential operation failed type=%s", type(exc).__name__)
+            return web.json_response({"error": "Figma 授权服务暂不可用，请稍后重试。"}, status=500)
+
     async def handle_mcp_oauth_approval(request):
         """Complete one OAuth request with the already authenticated WebUI owner."""
         if not _authorized(request):
@@ -3490,6 +4074,9 @@ def create_run_broker_app(
         from . import credential_hub_auth as cha
 
         sid = request.match_info.get("session_id", "")
+        # Resolve the owning inline-authorization BEFORE forwarding: the forward
+        # pops the callback session, so the mapping is only readable now.
+        authorization_id = _pending_authorization_for_kep_callback(sid)
         try:
             await asyncio.to_thread(cha.complete_kep_callback, sid, request.query_string)
         except cha.HubAuthError as exc:
@@ -3500,6 +4087,31 @@ def create_run_broker_app(
         except Exception as exc:
             logger.exception("[multitenancy] kep-cli callback failed")
             return web.Response(text=f"认证出错：{exc}", content_type="text/html", status=500)
+        if authorization_id:
+            # The landing is a TRIGGER for the server-side re-check, never proof
+            # of success: `_authorization_probe_and_resolve` still has to verify
+            # the credential live before anything is written. `complete_kep_callback`
+            # returning without raising means the OAuth callback itself landed —
+            # there is no further trigger coming for kep-cli after this, so a
+            # failed live check here is terminal, not a reason to keep waiting.
+            outcome = await asyncio.to_thread(
+                _authorization_probe_and_resolve,
+                authorization_id,
+                provider_confirmed=True,
+            )
+            if outcome != "success":
+                return web.Response(
+                    text=_AUTHORIZATION_CALLBACK_PAGE.format(
+                        message="认证未生效，请回到对话页重试授权。"
+                    ),
+                    content_type="text/html",
+                )
+            return web.Response(
+                text=_AUTHORIZATION_CALLBACK_PAGE.format(
+                    message="✅ 认证成功，任务已继续。可以关闭此页。"
+                ),
+                content_type="text/html",
+            )
         return web.Response(
             text="<html><body style='font-family:sans-serif'>✅ kep-cli 认证成功，可关闭本页面，返回飞书查看结果。</body></html>",
             content_type="text/html",
@@ -4064,6 +4676,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/runs/{run_id}/cancel", handle_run_cancel)
     app.router.add_post("/api/run-broker/source-refs/authorize", handle_source_refs_authorize)
     app.router.add_post("/api/run-broker/link-previews", handle_link_previews)
     app.router.add_post(
@@ -4075,6 +4688,21 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/approval/{approval_id}/respond", handle_approval_respond)
+    # NOTE: deliberately absent from `_RUN_SCOPED_TOKEN_PATH_PREFIXES` — the
+    # sandboxed child must never be able to authorize/confirm/cancel its own ask.
+    app.router.add_post(
+        "/api/run-broker/authorization/{authorization_id}/authorize",
+        handle_authorization_authorize,
+    )
+    app.router.add_post(
+        "/api/run-broker/authorization/{authorization_id}/confirm",
+        handle_authorization_confirm,
+    )
+    app.router.add_post(
+        "/api/run-broker/authorization/{authorization_id}/cancel",
+        handle_authorization_cancel,
+    )
+    app.router.add_post("/api/run-broker/authorization/stop", handle_authorization_stop)
     app.router.add_post("/api/run-broker/harness/workflows/{workflow_id}", handle_harness_workflow)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
     app.router.add_post("/api/run-broker/internal/session-search", handle_internal_session_search)
@@ -4088,6 +4716,8 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/credentials/gitlab", handle_gitlab_personal_token)
     app.router.add_post("/api/run-broker/credentials/github", handle_github_credential)
     app.router.add_delete("/api/run-broker/credentials/github", handle_github_credential)
+    app.router.add_post("/api/run-broker/credentials/figma", handle_figma_credential)
+    app.router.add_delete("/api/run-broker/credentials/figma", handle_figma_credential)
     app.router.add_get(
         "/api/run-broker/connectors/mcp-oauth/requests/{request_id}", handle_mcp_oauth_request
     )

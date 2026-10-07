@@ -51,6 +51,7 @@ _KIND_TO_STATE: dict[str, str] = {
     "tool_started": "waiting_tool",
     "tool_completed": "running",
     "approval_required": "waiting_gate",
+    "authorization_required": "waiting_gate",
     "approval_resolved": "running",
     "auth_required": "waiting_gate",
 }

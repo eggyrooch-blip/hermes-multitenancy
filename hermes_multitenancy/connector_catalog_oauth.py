@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
 
-import httpx
+from .compat.mcp_server import httpx
+from .figma_connector import _callback_result
+from mcp.client.auth import oauth2
 from mcp.client.auth.oauth2 import OAuthClientProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken
 
@@ -162,8 +164,9 @@ class CatalogOAuthBroker:
             pending.expiry = asyncio.create_task(self._expire(state, pending))
             pending.redirect.set_result(url)
 
-        async def callback_handler() -> tuple[str, str | None]:
-            return await pending.callback
+        async def callback_handler() -> Any:
+            code, state = await pending.callback
+            return _callback_result(oauth2, code, state, None)
 
         provider = OAuthClientProvider(
             endpoint,
@@ -177,7 +180,6 @@ class CatalogOAuthBroker:
             storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
-            timeout=self.flow_timeout,
         )
         pending.task = asyncio.create_task(self._complete_flow(profile, subject, row, endpoint, provider, storage))
         done, _ = await asyncio.wait({pending.redirect, pending.task}, return_when=asyncio.FIRST_COMPLETED)
@@ -325,7 +327,6 @@ async def refresh_catalog_oauth(
             token_endpoint_auth_method=storage.client.token_endpoint_auth_method,
         ),
         storage,
-        timeout=30,
     )
     oauth.context.current_tokens = storage.tokens
     oauth.context.client_info = storage.client

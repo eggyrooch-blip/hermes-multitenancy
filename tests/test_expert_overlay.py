@@ -55,6 +55,8 @@ description: 资源投放专家
 """
 
 EXPERT_ID = "kep-trevi-resource-delivery-expert"
+PROD_EXPERT_FIXTURE = Path(__file__).parent / "fixtures" / "keep_expert_builder_expert.json"
+_ABSENT = object()  # distinguishes "key missing" from an explicit null
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
     b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
@@ -190,6 +192,36 @@ def test_experts_duplicate_id_rejected(tmp_path):
     mf.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(pi.PluginIngestError, match="duplicate"):
         pi.load_plugin_manifest(repo)
+
+
+def test_experts_sample_prompts_non_list_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"][0]["sample_prompts"] = "not a list"
+    mf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="sample_prompts must be an array of strings"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_experts_sample_prompts_non_string_item_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"][0]["sample_prompts"] = ["ok", 42]
+    mf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="sample_prompts must be an array of strings"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_experts_sample_prompts_absent_or_null_accepted(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    # a pre-sample_prompts manifest, and one that compiled the key to null
+    data["experts"][0]["sample_prompts"] = None
+    mf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert pi.load_plugin_manifest(repo)["experts"][0]["sample_prompts"] is None
 
 
 # ─────────────────────────── ingest persistence ──────────────────────────────
@@ -393,6 +425,76 @@ def test_list_experts_ignores_invalid_ingested_at_fallback(tmp_path, monkeypatch
     row = eo.list_experts(shared / "profiles" / "feishu_test")[0]
 
     assert "release_installed_at" not in row
+
+
+def _ingest_with_sample_prompts(tmp_path, monkeypatch, prompts):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text(encoding="utf-8"))
+    if prompts is _ABSENT:
+        data["experts"][0].pop("sample_prompts", None)
+    else:
+        data["experts"][0]["sample_prompts"] = prompts
+    mf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    return eo.list_experts(shared / "profiles" / "feishu_test")[0]
+
+
+def test_list_experts_cleans_sample_prompts(tmp_path, monkeypatch):
+    row = _ingest_with_sample_prompts(
+        tmp_path,
+        monkeypatch,
+        ["  投放一批新资源  ", "帮我复盘上周的投放", "", "圈一批人出来", "看看昨天的量", "这个位置还能放什么"],
+    )
+
+    # empty dropped, each value stripped, ORDER PRESERVED
+    assert row["sample_prompts"] == [
+        "投放一批新资源",
+        "帮我复盘上周的投放",
+        "圈一批人出来",
+        "看看昨天的量",
+        "这个位置还能放什么",
+    ]
+
+
+def test_list_experts_caps_sample_prompts_at_five(tmp_path, monkeypatch):
+    row = _ingest_with_sample_prompts(
+        tmp_path, monkeypatch, [f"问题 {i}" for i in range(1, 8)]
+    )
+
+    # expert.yaml documents 1-5; extras are dropped silently, never a listing error
+    assert row["sample_prompts"] == [f"问题 {i}" for i in range(1, 6)]
+    assert len(row["sample_prompts"]) == eo.MAX_SAMPLE_PROMPTS
+
+
+def test_list_experts_sample_prompts_default_empty(tmp_path, monkeypatch):
+    assert _ingest_with_sample_prompts(tmp_path, monkeypatch, _ABSENT)["sample_prompts"] == []
+
+
+def test_list_experts_sample_prompts_null_is_empty(tmp_path, monkeypatch):
+    assert _ingest_with_sample_prompts(tmp_path, monkeypatch, None)["sample_prompts"] == []
+
+
+def test_list_experts_passes_through_production_sample_prompts(tmp_path, monkeypatch):
+    """The live keep-expert-builder managed manifest row, verbatim."""
+    prod_expert = json.loads(PROD_EXPERT_FIXTURE.read_text(encoding="utf-8"))
+    repo = _plugin_repo(tmp_path / "plug", experts=[prod_expert])
+    (repo / "agents" / "kep-expert-builder.md").write_text(AGENT_MD, encoding="utf-8")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    row = eo.list_experts(shared / "profiles" / "feishu_test")[0]
+
+    assert row["id"] == "kep-expert-builder"
+    assert row["sample_prompts"] == prod_expert["sample_prompts"]
+    assert row["sample_prompts"] == [
+        "我想把我们组的业务做成一个专家，先带我看看要准备什么",
+        "帮我给已发布的专家发个新版本，改动是更新了两个技能",
+        "建专家和写普通 skill 有什么区别？我该选哪个",
+    ]
 
 
 def test_list_experts_audience_filter(tmp_path, monkeypatch):

@@ -1,8 +1,8 @@
-.PHONY: test skills-uat skills-uat-strict
+.PHONY: test ci-core-source-probe skills-uat skills-uat-strict
 
 HERMES_SKILLS_UAT_EVIDENCE_DIR ?= /tmp/hermes-skills-uat
-HERMES_REAL_HOME ?= /Users/hermes/.hermes
-HERMES_OBSIDIAN_VAULT ?= /Users/hermes/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain
+HERMES_REAL_HOME ?= /Users/dev/.hermes
+HERMES_OBSIDIAN_VAULT ?= /Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain
 HERMES_FEEDBACK_TRANSCRIPT ?= $(HERMES_SKILLS_UAT_EVIDENCE_DIR)/current-production-feedback.txt
 HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE ?=
 HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL ?= Image \#1
@@ -10,6 +10,11 @@ HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_REASON ?= lark_group_invite_qr_not_fe
 
 test:
 	scripts/run_tests.sh
+
+# Download + sha256-check + throwaway-install the production core wheel from the
+# MT GitLab generic package registry (needs CI_JOB_TOKEN or HERMES_CORE_PKG_TOKEN).
+ci-core-source-probe:
+	python3 scripts/ci_core_source_probe.py
 
 skills-uat:
 	@mkdir -p "$(HERMES_SKILLS_UAT_EVIDENCE_DIR)"

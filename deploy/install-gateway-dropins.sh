@@ -22,6 +22,9 @@
 #   45-meegle-bin.conf — pin a FAST meegle binary for the feishu-project connector
 #       reader (avoids the ~11s `npx -y` path that tripped the Connectors panel
 #       fail-safe). See deploy/README-meegle.md.
+#   50-mcp-public-origin.conf — the public origin upstream OAuth redirects come
+#       back to (Figma connector, connector catalog, Hermes MCP consent). Without
+#       it those flows fail closed with 503. See the file header.
 #
 # Idempotent + safe to re-run. No gateway restart (drop-ins apply on next start;
 # the binary is ensured now). Run as the hermes user.
@@ -65,6 +68,24 @@ for _warm_dir in "$DROPIN_DIR" "$TEMPLATE_DROPIN_DIR"; do
     "$_warm_dir/35-warm-worker.conf"
   echo "install-gateway-dropins: wrote ${_warm_dir}/35-warm-worker.conf"
 done
+
+# --- 50-mcp-public-origin.conf ----------------------------------------------
+# HERMES_MCP_PUBLIC_ORIGIN may already be set from the unit EnvironmentFile on a
+# host that is not hermes.example.com; a drop-in Environment= is overridden by a
+# later-loaded EnvironmentFile, so this is a default, not a clamp. Override for a
+# different host by exporting HERMES_MCP_PUBLIC_ORIGIN before running this script.
+_mcp_origin="${HERMES_MCP_PUBLIC_ORIGIN:-}"
+if [ -n "$_mcp_origin" ]; then
+  sed "s#^Environment=HERMES_MCP_PUBLIC_ORIGIN=.*#Environment=HERMES_MCP_PUBLIC_ORIGIN=${_mcp_origin}#" \
+    "$REPO/deploy/hermes-gateway-mcp-public-origin.conf" \
+    > "$DROPIN_DIR/50-mcp-public-origin.conf"
+  chmod 0644 "$DROPIN_DIR/50-mcp-public-origin.conf"
+else
+  install -m 0644 \
+    "$REPO/deploy/hermes-gateway-mcp-public-origin.conf" \
+    "$DROPIN_DIR/50-mcp-public-origin.conf"
+fi
+echo "install-gateway-dropins: wrote ${DROPIN_DIR}/50-mcp-public-origin.conf"
 
 # --- 45-meegle-bin.conf (@REPO@ -> this checkout) ---------------------------
 sed "s#@REPO@#${REPO}#g" "$REPO/deploy/hermes-gateway-meegle.conf" \

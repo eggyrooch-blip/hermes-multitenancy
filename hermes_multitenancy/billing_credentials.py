@@ -16,6 +16,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 from .billing_employee_key import (
+    CREDENTIAL_SOURCE,
     _MIN_LIFETIME_MS,
     _NO_REDIRECT_OPENER,
     AccountDriftError,
@@ -436,7 +437,7 @@ class BillingCredentialManager:
             stored = self._load_payload(payer.profile_name, payer.employee_user_id)
         return str((stored or {}).get("source") or "")
 
-    def employee_key_needed(self, payer: _ResolvedPayer) -> bool:
+    def employee_key_needed(self, payer: _ResolvedPayer, *, existing: BillingIdentity | None = None) -> bool:
         """Read-only: does this payer need a key minted right now?
 
         The caller mints only when this says so, then hands the result to
@@ -446,6 +447,10 @@ class BillingCredentialManager:
         """
         with self._payer_lock(payer.employee_user_id):
             stored = self._load_payload(payer.profile_name, payer.employee_user_id)
+        if stored is not None:
+            self._validate_local_payload(stored, payer=payer, existing=existing)
+            if stored.get("source") == CREDENTIAL_SOURCE and stored.get("account_identity_verified") is not True:
+                raise RunRejected("billing credential account identity is unverified")
         return needs_new_key(stored, self._now_ms())
 
     def runtime_api_key(self, metadata: dict[str, Any]) -> str:

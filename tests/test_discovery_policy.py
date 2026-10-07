@@ -166,7 +166,7 @@ def test_resolve_enabled_toolsets_filters_x_search_when_policy_blocks(tmp_path: 
         shared_home=tmp_path,
     )
 
-    assert result == ["file", "web"]
+    assert result == ["file", "request-authorization", "web"]
 
 
 def test_resolve_enabled_toolsets_keeps_x_search_when_policy_allows(tmp_path: Path):
@@ -197,4 +197,4 @@ def test_resolve_enabled_toolsets_keeps_x_search_when_policy_allows(tmp_path: Pa
         xai_credentials={"available": True, "source": "env", "api_key": "secret"},
     )
 
-    assert result == ["file", "web", "x_search"]
+    assert result == ["file", "request-authorization", "web", "x_search"]

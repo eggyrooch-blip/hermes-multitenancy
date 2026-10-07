@@ -178,7 +178,7 @@ def test_stdio_launcher_forwards_through_the_bound_http_policy(tmp_path: Path):
         server.should_exit = True
         thread.join(timeout=5)
         store.close()
-    assert [(item.profile_name, item.subject_id, item.client_id) for item in seen] == [
+    assert len(seen) >= 2
+    assert {(item.profile_name, item.subject_id, item.client_id) for item in seen} == {
         ("alice", "subject-alice", "stdio-launcher"),
-        ("alice", "subject-alice", "stdio-launcher"),
-    ]
+    }

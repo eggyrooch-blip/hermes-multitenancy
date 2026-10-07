@@ -233,7 +233,7 @@ def test_codex_exec_callback_allows_only_reviewed_workspace_status(monkeypatch):
         assert callback("pytest -q tests/test_one.py", "test") == "once"
         assert callback("apply_patch: README.md", "write") == "once"
         assert callback("git push origin HEAD", "push") == "deny"
-        assert callback("rg token /Users/hermes/.hermes", "read") == "deny"
+        assert callback("rg token /Users/dev/.hermes", "read") == "deny"
         assert callback("rg token ../profile", "read") == "deny"
         assert callback("g=git; $g push origin HEAD", "push") == "deny"
         assert callback("c=commit; git $c -m bypass", "commit") == "deny"

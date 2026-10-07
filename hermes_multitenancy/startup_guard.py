@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -88,16 +89,51 @@ def validate_startup(
         raise StartupGuardError("isolation_environment_missing")
     _validate_billing_cohort(env)
 
-    _compile_package(package_dir or Path(__file__).resolve().parent)
+    package_dir = package_dir or Path(__file__).resolve().parent
+    _compile_package(package_dir)
+    try:
+        compatibility = importlib.import_module("hermes_cli.plugin_compat")
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.plugin_compat":
+            raise
+    else:
+        if compatibility.scan_plugin(package_dir.parent):
+            raise StartupGuardError("plugin_removed_core_imports")
     _import_boundaries()
+
+
+RUN_BROKER_WAIT_ENV = "HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS"
+DEFAULT_RUN_BROKER_WAIT_SECONDS = 20.0
+MAX_RUN_BROKER_WAIT_SECONDS = 3600.0
+
+
+def run_broker_wait_seconds(env: Mapping[str, str] | None = None) -> float:
+    """How long ``wait-broker`` waits; the unit sets it for slow production disks.
+
+    Unset/empty keeps the 20s default. Anything that is not a finite number in
+    (0, 3600] is a configuration error, not a silent fallback.
+    """
+    env = os.environ if env is None else env
+    raw = str(env.get(RUN_BROKER_WAIT_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_RUN_BROKER_WAIT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise StartupGuardError("run_broker_wait_invalid") from exc
+    if not math.isfinite(value) or not 0 < value <= MAX_RUN_BROKER_WAIT_SECONDS:
+        raise StartupGuardError("run_broker_wait_invalid")
+    return value
 
 
 def wait_run_broker(
     *,
     env: Mapping[str, str] | None = None,
-    timeout_seconds: float = 20.0,
+    timeout_seconds: float | None = None,
 ) -> None:
     env = os.environ if env is None else env
+    if timeout_seconds is None:
+        timeout_seconds = run_broker_wait_seconds(env)
     key = str(env.get("HERMES_MULTITENANCY_RUN_BROKER_KEY", "")).strip()
     host = str(env.get("HERMES_MULTITENANCY_RUN_BROKER_HOST", "127.0.0.1")).strip() or "127.0.0.1"
     try:
@@ -125,10 +161,33 @@ def wait_run_broker(
         time.sleep(0.2)
 
 
+def run_gateway() -> None:
+    """Refuse to connect unless this process installed the tenant dispatch hook."""
+    validate_startup()
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+    discover_plugins()
+    manager = get_plugin_manager()
+    plugin = manager._plugins.get("multitenancy")
+    if plugin is None or not plugin.enabled or plugin.error:
+        raise StartupGuardError("plugin_not_loaded")
+    package = importlib.import_module(plugin.module.register.__module__)
+    dispatch = getattr(package, "_dispatch_with_worker_init", None)
+    if dispatch is None or dispatch not in manager.iter_hook_callbacks("pre_gateway_dispatch"):
+        raise StartupGuardError("tenant_dispatch_hook_missing")
+    wait_run_broker()
+    from hermes_cli.main import main as core_main
+
+    sys.argv = [sys.argv[0], "gateway", "run"]
+    core_main()
+
+
 def main(argv: list[str] | None = None) -> int:
     command = (argv or sys.argv[1:] or ["preflight"])[0]
     try:
-        if command == "preflight":
+        if command == "gateway":
+            run_gateway()
+        elif command == "preflight":
             validate_startup()
         elif command == "wait-broker":
             wait_run_broker()

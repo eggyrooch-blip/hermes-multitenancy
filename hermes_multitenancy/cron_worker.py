@@ -160,6 +160,14 @@ class _CronWorkerShimModule(_ModuleType):
         owner = _LIVE_STATE_OWNERS.get(name)
         if owner is not None:
             return getattr(owner, name)
+        # Circular imports can leave the initial re-export snapshot incomplete.
+        for mod in _CRON_SUBMODULES:
+            try:
+                value = getattr(mod, name)
+            except AttributeError:
+                continue
+            globals()[name] = value
+            return value
         raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:

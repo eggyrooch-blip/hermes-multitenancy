@@ -18,6 +18,8 @@ Default DB path is ``~/.hermes/multitenancy.db`` so it co-resides with
 from __future__ import annotations
 
 import sqlite3
+
+from .shared_db import connect_shared
 import threading
 import time
 from pathlib import Path
@@ -58,10 +60,8 @@ class SessionStore:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = connect_shared(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 

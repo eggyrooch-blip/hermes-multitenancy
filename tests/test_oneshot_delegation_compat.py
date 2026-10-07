@@ -101,3 +101,50 @@ def test_feishu_oneshot_disables_detached_delivery(monkeypatch, tmp_path: Path):
     assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
     assert captured[0]["async_delivery"] is False
     assert observed["async_delivery"] is False
+
+
+def test_home_keyed_dict_without_core_predicate_uses_registered_allow_set(monkeypatch, tmp_path: Path):
+    # Review P1 (filter-bypass): a transitional core whose register rejects a
+    # provider credential must not see it widened back into the process cache.
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    cache: dict[str, frozenset[str]] = {}
+    allowed: set[str] = set()
+
+    def register(names):
+        allowed.update(name for name in names if name != "OPENAI_API_KEY")
+
+    module = SimpleNamespace(
+        register_env_passthrough=register,
+        _get_allowed=lambda: allowed,
+        _config_passthrough=cache,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = module
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", module)
+
+    agent_real._register_env_passthrough_process_wide(
+        ["OPENAI_API_KEY", "GOOGLE_TENANTS_FILE"]
+    )
+
+    assert list(cache.values()) == [frozenset({"GOOGLE_TENANTS_FILE"})]
+
+
+def test_home_keyed_dict_without_any_core_filter_drops_model_provider_keys(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    cache: dict[str, frozenset[str]] = {}
+    _install_fake_env_passthrough(monkeypatch, cache)
+
+    agent_real._register_env_passthrough_process_wide(
+        ["OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "GOOGLE_TENANTS_FILE"]
+    )
+
+    assert list(cache.values()) == [frozenset({"GOOGLE_TENANTS_FILE"})]

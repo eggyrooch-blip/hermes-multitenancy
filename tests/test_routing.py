@@ -816,8 +816,9 @@ def _insert_legacy_row(
     chat_id: str | None = None,
     owner_open_id: str | None = None,
     display_label: str | None = None,
+    connection=None,
 ) -> None:
-    conn = sqlite3.connect(path)
+    conn = connection if connection is not None else sqlite3.connect(path)
     conn.execute(
         """
         INSERT INTO multitenancy_routing
@@ -844,8 +845,9 @@ def _insert_legacy_row(
             display_label,
         ),
     )
-    conn.commit()
-    conn.close()
+    if connection is None:
+        conn.commit()
+        conn.close()
 
 
 def _snapshot_rows(path) -> list[tuple]:
@@ -1130,40 +1132,46 @@ def test_us03_scale_idempotency_1300_rows(tmp_path):
 
     db_path = tmp_path / "us03-scale.db"
     _create_legacy_db(db_path)
-    for i in range(500):
-        _insert_legacy_row(
-            db_path,
-            user_id=f"u_sync_{i:04d}",
-            profile_name=f"psync_{i:04d}",
-            open_id=f"ou_sync_{i:04d}",
-            synced_at=1000 + i,
-            created_at=1000 + i,
-            updated_at=2000 + i,
-        )
-    for i in range(500):
-        _insert_legacy_row(
-            db_path,
-            user_id=f"ou_auto_{i:04d}",
-            profile_name=f"feishu_ou_auto_{i:04d}",
-            open_id=f"ou_auto_{i:04d}",
-            synced_at=3000 + i,
-            created_at=3000 + i,
-            updated_at=4000 + i,
-        )
-    for i in range(300):
-        _insert_legacy_row(
-            db_path,
-            user_id=f"group:oc_{i:04d}",
-            profile_name=f"feishu_group_{i:04d}",
-            open_id="",
-            synced_at=5000 + i,
-            created_at=5000 + i,
-            updated_at=6000 + i,
-            kind="group",
-            chat_id=f"oc_{i:04d}",
-            owner_open_id=f"ou_sync_{i:04d}",
-            display_label=f"Group {i:04d}",
-        )
+    # Fixture construction needs one durable transaction, not 1300 fsyncs.
+    with sqlite3.connect(db_path) as connection:
+        for i in range(500):
+            _insert_legacy_row(
+                db_path,
+                connection=connection,
+                user_id=f"u_sync_{i:04d}",
+                profile_name=f"psync_{i:04d}",
+                open_id=f"ou_sync_{i:04d}",
+                synced_at=1000 + i,
+                created_at=1000 + i,
+                updated_at=2000 + i,
+            )
+        for i in range(500):
+            _insert_legacy_row(
+                db_path,
+                connection=connection,
+                user_id=f"ou_auto_{i:04d}",
+                profile_name=f"feishu_ou_auto_{i:04d}",
+                open_id=f"ou_auto_{i:04d}",
+                synced_at=3000 + i,
+                created_at=3000 + i,
+                updated_at=4000 + i,
+            )
+        for i in range(300):
+            _insert_legacy_row(
+                db_path,
+                connection=connection,
+                user_id=f"group:oc_{i:04d}",
+                profile_name=f"feishu_group_{i:04d}",
+                open_id="",
+                synced_at=5000 + i,
+                created_at=5000 + i,
+                updated_at=6000 + i,
+                kind="group",
+                chat_id=f"oc_{i:04d}",
+                owner_open_id=f"ou_sync_{i:04d}",
+                display_label=f"Group {i:04d}",
+            )
+    connection.close()
 
     table = RoutingTable(db_path)
     table.close()
@@ -1173,6 +1181,7 @@ def test_us03_scale_idempotency_1300_rows(tmp_path):
     table.close()
     second_snapshot = _snapshot_rows(db_path)
 
+    assert len(first_snapshot) == 1300
     assert second_snapshot == first_snapshot
 
 

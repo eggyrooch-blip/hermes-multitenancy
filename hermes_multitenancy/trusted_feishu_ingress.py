@@ -1,4 +1,4 @@
-"""Fail-closed admission for Agent-issued Feishu ingress tickets."""
+"""Fail-closed admission for adapter-issued Feishu ingress tickets."""
 from __future__ import annotations
 
 import hashlib
@@ -399,8 +399,15 @@ def _validate_bot_admission(
     )
 
 
-def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
-    """Recheck the route immediately before MT schedules model/tool work."""
+def validate_admitted_feishu_event(
+    event: Any, gateway: Any = None, *, adapter: Any = None
+) -> bool:
+    """Recheck the route immediately before MT schedules model/tool work.
+
+    ``adapter`` is the adapter instance that admitted the ticket; when a caller
+    has it (the adapter-level envelope/guard checks), the ticket class is taken
+    from that adapter's issuer, not from a possibly re-materialized module.
+    """
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
     if platform != "feishu":
@@ -411,8 +418,7 @@ def validate_admitted_feishu_event(event: Any, gateway: Any = None) -> bool:
         _deny("missing_or_inauthentic_admission", ticket, stage="validation")
         return False
 
-    adapter = None
-    if gateway is not None:
+    if adapter is None and gateway is not None:
         from .router import _get_feishu_adapter
 
         adapter = _get_feishu_adapter(gateway)
@@ -494,7 +500,17 @@ def install_trusted_feishu_ingress_admission() -> None:
     module = load_live_feishu_module()
     adapter = getattr(module, "FeishuAdapter")
     if not hasattr(adapter, "_trusted_ingress_admitter"):
-        raise RuntimeError("Feishu core lacks trusted ingress contract")
+        from .feishu_ingress_compat import install_stock_feishu_ingress
+
+        install_stock_feishu_ingress(module)
+    current = getattr(adapter, "_trusted_ingress_admitter", None)
+    if current is not None and getattr(current, "__module__", None) != __name__:
+        # Another copy of MT owns ingress; replacing its admitter would make its
+        # seal check drop every inbound (round6 incident).
+        raise RuntimeError(
+            f"trusted ingress admitter already installed by {getattr(current, '__module__', None)}; "
+            f"refusing to replace it from {__name__}"
+        )
     adapter._trusted_ingress_admitter = staticmethod(admit_trusted_feishu_ingress)
     live_module = load_live_feishu_module()
     if (

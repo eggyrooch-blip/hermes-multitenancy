@@ -72,7 +72,7 @@ def test_upstream_codex_spawn_scrub_requires_non_hermes_alias(monkeypatch):
     key = "sk-employee-runtime-key-123456"
     source_override = os.environ.get("HERMES_UPSTREAM_0191_ROOT")
     source_root = Path(
-        source_override or "/Users/hermes/code/hermes-agent-release-v0191"
+        source_override or "/Users/dev/code/hermes-agent-release-v0191"
     )
     if not source_root.is_dir():
         if source_override:

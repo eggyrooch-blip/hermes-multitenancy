@@ -332,11 +332,30 @@ def _send_media_files_via_live_adapter(
     job: dict,
 ) -> Optional[str]:
     try:
-        import cron.scheduler as scheduler
+        try:
+            from cron.scheduler_delivery import _send_media_via_adapter
+        except ImportError:  # older core
+            from cron.scheduler import _send_media_via_adapter
         from gateway.config import Platform
 
-        receipt = scheduler._send_media_via_adapter(
-            adapter,
+        class ReceiptCheckedAdapter:
+            def __getattr__(self, name):
+                method = getattr(adapter, name)
+                if name not in {"send_voice", "send_video", "send_image_file", "send_document"}:
+                    return method
+
+                async def checked_send(**kwargs):
+                    sent = await method(**kwargs)
+                    if getattr(sent, "success", None) is not True:
+                        raise RuntimeError("Feishu media send did not confirm success")
+                    if not str(getattr(sent, "message_id", "") or "").strip():
+                        raise RuntimeError("Feishu media send missing message_id")
+                    return sent
+
+                return checked_send
+
+        receipt = _send_media_via_adapter(
+            ReceiptCheckedAdapter(),
             chat_id,
             media_files,
             metadata,
@@ -344,6 +363,8 @@ def _send_media_files_via_live_adapter(
             job,
             platform=Platform("feishu"),
         )
+        if isinstance(receipt, list):
+            return "; ".join(str(error) for error in receipt) if receipt else None
         if getattr(receipt, "success", None) is not True:
             code = str(getattr(receipt, "error_code", None) or "unconfirmed")
             return f"cron media delivery unconfirmed ({code})"

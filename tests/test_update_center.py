@@ -1492,3 +1492,54 @@ def test_send_advisory_alert_posts_redacted_when_webhook_set(monkeypatch) -> Non
     assert rc == 0
     text = captured["body"]["content"]["text"]
     assert "abc.def" not in text and "[REDACTED]" in text  # routed through redact()
+
+
+def test_kep_platform_skip_covers_binary_and_skills_and_retains_failures(monkeypatch, tmp_path, capsys):
+    import pytest
+    from hermes_multitenancy import update_center as uc, update_center_cli as cli
+
+    telemetry = uc.KepCliSystem(system="telemetry", binary="kep-telemetry")
+    monkeypatch.setattr(uc.sys, "platform", "linux")
+    monkeypatch.setattr(cli, "refresh_kep_cli", lambda **kwargs: {})
+    for command in (["kep-sync", "--from-registry"], ["kep-maintain"]):
+        for include_failure in (False, True):
+            calls = []
+            systems = [telemetry]
+            if include_failure:
+                systems.append(uc.KepCliSystem(system="hades", binary="hades-cli"))
+            monkeypatch.setattr(cli, "build_kep_systems_from_registry", lambda **kwargs: systems)
+            def runner(argv):
+                calls.append(argv)
+                return {"returncode": 1, "stdout": "", "stderr": "real install failure"}
+            monkeypatch.setattr(uc, "_run_kep_cli", runner)
+            monkeypatch.setattr(uc, "resolve_kep_binary", lambda name: pytest.fail("unexpected binary resolution"))
+            assert cli.main(["--shared-home", str(tmp_path), *command]) == (2 if include_failure else 0)
+            report = json.loads(capsys.readouterr().out)
+            assert report["systems"][0]["action"] == "skipped-unsupported-platform"
+            assert "macOS" in report["systems"][0]["reason"]
+            assert not any("telemetry" in argv for argv in calls)
+            assert not any("telemetry" in row["skill_path"] for row in report["skills"])
+            if include_failure:
+                assert report["systems"][1]["action"] == "quarantined"
+            else:
+                assert calls == []
+    assert any(row["event"] == "kep_system_platform_skipped" for row in uc.UpdateLedger(shared_home=tmp_path).read_events())
+
+
+def test_kep_platform_skip_is_exact_and_macos_keeps_real_failure(monkeypatch, tmp_path):
+    from hermes_multitenancy import update_center as uc
+
+    for host, name, binary in (("darwin", "telemetry", "kep-telemetry"),
+                               ("linux", "telemetry", "other-cli"),
+                               ("linux", "other", "kep-telemetry")):
+        monkeypatch.setattr(uc.sys, "platform", host)
+        calls = []
+        def runner(argv):
+            calls.append(argv)
+            return {"returncode": 1, "stdout": "", "stderr": "real install failure"}
+        report = uc.sync_kep_cli_systems(
+            systems=[uc.KepCliSystem(system=name, binary=binary)], shared_home=tmp_path,
+            ledger=uc.UpdateLedger(shared_home=tmp_path), runner=runner,
+        )
+        assert ["kep-cli", "install", name] in calls
+        assert report["systems"][0]["action"] == "quarantined"

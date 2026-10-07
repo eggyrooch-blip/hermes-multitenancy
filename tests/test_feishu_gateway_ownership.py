@@ -10,6 +10,30 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
+
+@pytest.mark.parametrize("platform", ["feishu", "telegram"])
+def test_update_text_answers_remain_available_only_outside_feishu(platform):
+    from types import SimpleNamespace
+    from gateway.run_inbound import GatewayInboundMixin
+    from hermes_multitenancy.gateway_ownership import _patch_gateway_update_text_reply
+
+    class Runner(GatewayInboundMixin):
+        pass
+
+    _patch_gateway_update_text_reply(Runner)
+    runner = Runner()
+    state = SimpleNamespace(persistent=SimpleNamespace(update_prompt_pending=True))
+    runner._peek_session_state = lambda key: state
+    writes = []
+    runner._hm_write_update_response = lambda text: writes.append(text)
+    event = SimpleNamespace(source=SimpleNamespace(platform=platform), text="y", get_command=lambda: None)
+    reply = runner._hm_update_prompt_reply(event, "probe_session")
+    assert writes == ([] if platform == "feishu" else ["y"])
+    assert state.persistent.update_prompt_pending == (platform == "feishu")
+    assert (reply is None) == (platform == "feishu")
+
 
 class _PlatformKey:
     def __init__(self, value: str):
@@ -31,8 +55,13 @@ class _PlatformConfig:
 
 
 def _install_fake_gateway_runner(monkeypatch):
+    from hermes_constants import get_process_hermes_home
+
     gateway_pkg = types.ModuleType("gateway")
     gateway_run = types.ModuleType("gateway.run")
+    gateway_status = types.ModuleType("gateway.status")
+    gateway_status._get_process_hermes_home = get_process_hermes_home
+    gateway_pkg.status = gateway_status
 
     class FakeGatewayRunner:
         def __init__(self, config=None):
@@ -42,9 +71,16 @@ def _install_fake_gateway_runner(monkeypatch):
         def _create_adapter(self, platform, config):
             return SimpleNamespace(platform=platform, config=config)
 
+        async def _handle_message(self, event):
+            return None
+
+        async def _handle_active_session_busy_message(self, event):
+            return False
+
     gateway_run.GatewayRunner = FakeGatewayRunner
     monkeypatch.setitem(sys.modules, "gateway", gateway_pkg)
     monkeypatch.setitem(sys.modules, "gateway.run", gateway_run)
+    monkeypatch.setitem(sys.modules, "gateway.status", gateway_status)
     return FakeGatewayRunner
 
 
@@ -55,6 +91,49 @@ def _gateway_config() -> SimpleNamespace:
             _PlatformKey("api_server"): _PlatformConfig(enabled=True),
         }
     )
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_mt_runner_keeps_core_multiplexer_out_of_tenant_admission(monkeypatch, tmp_path, injected):
+    from gateway.config import GatewayConfig
+    from gateway import config as config_module, run as run_module
+    from hermes_multitenancy import gateway_ownership as go
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "multitenancy_router"))
+    config = GatewayConfig.from_dict({"multiplex_profiles": True})
+    monkeypatch.setattr(config_module, "load_gateway_config", lambda: config)
+    monkeypatch.setattr(run_module, "load_gateway_config_for_runner", lambda: pytest.fail("native host preflight bypassed MT admission"))
+    runner_type = run_module.GatewayRunner
+    # Keep real core construction/config selection; isolate unrelated I/O.
+    for name in ("_warn_if_docker_media_delivery_is_risky", "_init_runtime_settings",
+                 "_init_session_store", "_init_lifecycle_state", "_init_runtime_caches",
+                 "_init_startup_checks", "_init_session_db", "_init_registries_and_clocks"):
+        monkeypatch.setattr(runner_type, name, lambda self: None)
+    monkeypatch.setattr(runner_type, "__init__", runner_type.__init__)
+    go._patch_gateway_runner_init(runner_type)
+    runner = runner_type(config) if injected else runner_type()
+    assert runner.config is config
+    assert runner.config.multiplex_profiles is False
+
+
+def test_mt_native_cron_never_enumerates_or_switches_to_peer_stores(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+    from hermes_cli import profiles
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_multitenancy import gateway_ownership as go
+
+    home = tmp_path / "profiles" / "multitenancy_router"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(profiles, "profiles_to_serve", lambda **kw: pytest.fail("native ticker enumerated MT tenant stores"))
+    monkeypatch.setattr(gateway_run, "_cron_tick_profile_homes", lambda cfg: profiles.profiles_to_serve(multiplex=True))
+    go._patch_gateway_cron_profile_scope()
+    assert gateway_run._cron_tick_profile_homes(None) == [("multitenancy_router", home)]
+    token = set_hermes_home_override(tmp_path / "profiles" / "peer")
+    try:
+        assert gateway_run._cron_tick_profile_homes(None) == [("multitenancy_router", home)]
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_non_router_profile_strips_feishu_before_gateway_start(monkeypatch, tmp_path):

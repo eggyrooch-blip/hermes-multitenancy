@@ -964,7 +964,7 @@ def test_unverified_account_identity_degrades_the_run_but_stores_nothing(tmp_pat
     "url,expect_config_error",
     [
         ("https://hermes.example.com", False),
-        ("https://HERMES.GoToKeep.com", False),
+        ("https://HERMES.example.com", False),
         ("https://broker.example:8443/", False),
         ("https://xn--fsq.example", False),        # punycode
         ("https://例え.jp", False),                 # Unicode IDN

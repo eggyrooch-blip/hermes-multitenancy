@@ -90,6 +90,21 @@
 --bind-try ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
 --bind-try ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
 
+# ── Inline-authorization rendezvous — READ-ONLY, explicitly ─────────
+# The parent publishes the verified authorization result here and the blocked
+# `request_authorization` tool call polls it. Two reasons this line must exist:
+#   1. `--tmpfs /tmp` above gives the child a PRIVATE /tmp, so the old
+#      $TMPDIR-based rendezvous was invisible in here and every inline
+#      authorization timed out on Linux no matter what the parent wrote.
+#   2. Read-only is the enforcement: a writable rendezvous lets the child
+#      publish its own {"state":"success"} — a one-write self-authorization.
+#      Mode bits cannot express that (parent and child share a uid); the mount
+#      can, and the kernel enforces it.
+# `--dir` first so the ro-bind has a mountpoint even before the parent has
+# created any per-run subdirectory.
+--dir ${SHARED_HOME}/authorization
+--ro-bind-try ${SHARED_HOME}/authorization ${SHARED_HOME}/authorization
+
 # ── This profile — read + write ─────────────────────────────────────
 # Placed AFTER the SHARED_HOME ro-bind so it overrides the parent ro
 # mount (bwrap evaluates --bind / --ro-bind in source order, with the

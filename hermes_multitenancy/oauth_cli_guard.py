@@ -15,14 +15,42 @@ OAUTH_CLI_GATE_BY_DETAIL = {
 }
 
 
+#: Invocation type whose ``detail`` is a remote endpoint URL, not a local binary.
+#: Nothing is placed on the agent's PATH for these, so there is no headless
+#: terminal entry point that could launch an interactive OAuth and hang the run.
+#: Their whole authorization happens in the run broker and the employee's
+#: browser, and the agent only ever sees an already-minted token.
+_REMOTE_INVOCATION_TYPE = "mcp"
+
+
+def requires_headless_cli_gate(definition: object) -> bool:
+    """True when this connector could launch interactive OAuth in a headless run.
+
+    The single source of truth for both the runtime guard below and the contract
+    test that enumerates gated connectors, so the two cannot drift apart and
+    quietly stop covering a new CLI.
+    """
+    if getattr(getattr(definition, "ui", None), "action", "") not in {
+        "oauth_url",
+        "feishu_device_flow",
+    }:
+        return False
+    invocation = getattr(definition, "invocation", None)
+    if str(getattr(invocation, "type", "") or "") == _REMOTE_INVOCATION_TYPE:
+        return False
+    return bool(str(getattr(invocation, "detail", "") or ""))
+
+
 def require_registered_oauth_cli_gates(definitions: object) -> None:
-    """Fail closed when an OAuth connector names no concrete headless gate."""
+    """Fail closed when an OAuth CLI connector names no concrete headless gate.
+
+    Stays fail-closed for every connector that actually fronts a binary: an
+    unmapped CLI still raises. Only a remote ``mcp`` endpoint is exempt, because
+    there is no command for a shim to wrap — see ``_REMOTE_INVOCATION_TYPE``.
+    """
     items = getattr(definitions, "items", lambda: ())()
     for connector_id, definition in items:
-        if getattr(getattr(definition, "ui", None), "action", "") not in {
-            "oauth_url",
-            "feishu_device_flow",
-        }:
+        if not requires_headless_cli_gate(definition):
             continue
         detail = str(getattr(getattr(definition, "invocation", None), "detail", "") or "")
         if detail not in OAUTH_CLI_GATE_BY_DETAIL:

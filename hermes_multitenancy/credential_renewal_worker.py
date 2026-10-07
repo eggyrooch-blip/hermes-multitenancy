@@ -199,10 +199,16 @@ def _refresh_one(
     # and skip — L3 will surface, no point hitting Feishu.
     broken_reason = classify_uat_payload(payload)
     if broken_reason is not None:
+        broken_marker = marker_path_for_open_id(
+            shared_home / "profiles" / profile_name / "feishu_uat", open_id
+        )
+        existing = read_needs_reauth_marker(broken_marker) if broken_marker.is_file() else None
+        if existing and existing.get("reason") == broken_reason:
+            # Same cause as the marker on disk: leave it (and its ts) alone,
+            # like L5, so every 60s tick does not look like a new failure.
+            return "skipped"
         write_needs_reauth_marker(
-            marker_path_for_open_id(
-                shared_home / "profiles" / profile_name / "feishu_uat", open_id
-            ),
+            broken_marker,
             reason=broken_reason,
             detail="L2 detected broken UAT before refresh attempt",
             extra={"layer": "L2", "profile": profile_name},

@@ -67,7 +67,7 @@ _synthetic_session_guards: dict[str, Any] = {}
 import threading as _threading
 from collections import OrderedDict as _OrderedDict
 
-from ..plugin_script_policy import PLUGIN_SCRIPT_SOUL_RULE
+from ..plugin_script_policy import PLUGIN_SCRIPT_SOUL_RULE, RETIRED_PLUGIN_SCRIPT_SOUL_RULES
 
 _CHAT_INVITER_CACHE_MAX = 512
 _CHAT_INVITER_CACHE_TTL_S = 3600  # compatibility fallback TTL
@@ -2232,6 +2232,11 @@ def _ensure_soul_guidance(soul_path: Path, guidance: str) -> None:
         text = soul_path.read_text(encoding="utf-8")
     except OSError:
         return
+    lines = text.splitlines(keepends=True)
+    kept = [line for line in lines if line.rstrip("\r\n") not in RETIRED_PLUGIN_SCRIPT_SOUL_RULES]
+    if len(kept) != len(lines):
+        text = "".join(kept)
+        soul_path.write_text(text, encoding="utf-8")
     guidance_lines = guidance.splitlines()
     missing_lines = [line for line in guidance_lines if line and line not in text]
     if not missing_lines:

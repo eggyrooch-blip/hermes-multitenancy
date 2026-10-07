@@ -1,6 +1,8 @@
 """Stdio MCP facade over the run-scoped connector broker."""
 from __future__ import annotations
 
+from .compat.mcp_server import handler
+
 import asyncio
 import json
 import logging
@@ -51,7 +53,7 @@ async def _serve_broker() -> None:
 
     server = Server("hermes-connectors")
 
-    @server.list_tools()
+    @handler(server, "list_tools")
     async def list_tools():
         try:
             body = await _request("GET", "/api/run-broker/connectors/github-mcp/tools")
@@ -68,7 +70,7 @@ async def _serve_broker() -> None:
             if isinstance(row, dict) and row.get("name")
         ]
 
-    @server.call_tool()
+    @handler(server, "call_tool")
     async def call_tool(name: str, arguments: dict[str, Any]):
         body = await _request(
             "POST",
@@ -94,41 +96,41 @@ def _http_target() -> tuple[str, str] | None:
 
 
 async def _serve_http(url: str, token: str) -> None:
-    import httpx
+    from .compat.mcp_server import httpx
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
 
     async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}) as client:
-        async with streamable_http_client(url, http_client=client) as (up_read, up_write, _):
+        async with streamable_http_client(url, http_client=client) as (up_read, up_write, *_):
             async with ClientSession(up_read, up_write) as upstream:
                 initialized = await upstream.initialize()
                 server = Server("hermes-connectors")
 
-                @server.list_tools()
+                @handler(server, "list_tools")
                 async def list_tools():
                     return await upstream.list_tools()
 
-                @server.call_tool()
+                @handler(server, "call_tool")
                 async def call_tool(name: str, arguments: dict[str, Any]):
                     return await upstream.call_tool(name, arguments)
 
                 if initialized.capabilities.prompts is not None:
-                    @server.list_prompts()
+                    @handler(server, "list_prompts")
                     async def list_prompts():
                         return await upstream.list_prompts()
 
-                    @server.get_prompt()
+                    @handler(server, "get_prompt")
                     async def get_prompt(name: str, arguments: dict[str, str] | None):
                         return await upstream.get_prompt(name, arguments)
 
                 if initialized.capabilities.resources is not None:
-                    @server.list_resources()
+                    @handler(server, "list_resources")
                     async def list_resources():
                         return await upstream.list_resources()
 
-                    @server.read_resource()
+                    @handler(server, "read_resource")
                     async def read_resource(uri):
                         return await upstream.read_resource(uri)
 

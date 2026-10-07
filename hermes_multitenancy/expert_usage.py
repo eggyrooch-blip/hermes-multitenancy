@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+
+from .shared_db import connect_shared
 import time
 from pathlib import Path
 
@@ -37,15 +39,18 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     # 30s(不是 5s):满载机器上 5s busy timeout 会被真实超过,bump 把
     # OperationalError 吞成 False = 计数静默丢失(CI 2026-08-14 实测 40 丢 16)。
     # 计数是对账口径,宁可等也不丢;真死锁场景这里本来就不该发生(单条 UPSERT)。
-    conn = sqlite3.connect(str(db_path), timeout=30.0)
-    conn.execute("PRAGMA busy_timeout=30000")
+    # The old code tolerated a failed WAL switch and carried on. That is no
+    # longer safe: giving back a connection that never reached
+    # synchronous=NORMAL puts an fsync-per-commit writer back on the shared
+    # file, which is exactly the queue this slug removes (codex r1 #p1). A
+    # half-configured connection is closed and the error propagates — both
+    # callers (`bump`, `counts`) already catch Exception and degrade.
+    conn = connect_shared(str(db_path), check_same_thread=True)
     try:
-        # WAL is a persistent DB property; switching can hit SQLITE_BUSY during
-        # concurrent first-connect — non-fatal, this call just runs non-WAL once
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute(_SCHEMA)
+        conn.execute(_SCHEMA)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

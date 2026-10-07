@@ -59,3 +59,20 @@ def test_explicit_off_wins_even_under_strict(monkeypatch):
     from hermes_multitenancy.security_audit import security_audit_enabled
 
     assert security_audit_enabled() is False  # operator override beats strict
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_audit_default_path_and_explicit_worker_override(monkeypatch, tmp_path, platform):
+    from hermes_multitenancy import security_audit
+
+    monkeypatch.setattr(security_audit.sys, "platform", platform)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_MT_SECURITY_AUDIT_PATH", raising=False)
+    expected = (
+        tmp_path / "Library/Logs/hermes/multitenancy-security.jsonl"
+        if platform == "darwin" else security_audit.DEFAULT_AUDIT_PATH
+    )
+    assert security_audit.security_audit_path() == expected
+    worker_path = tmp_path / "profile/logs/security-audit.jsonl"
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(worker_path))
+    assert security_audit.security_audit_path() == worker_path

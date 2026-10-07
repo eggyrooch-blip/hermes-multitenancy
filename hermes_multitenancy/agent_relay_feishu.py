@@ -53,6 +53,33 @@ def _card_with_actions(
     return card
 
 
+def _with_shared_card_config(card: dict[str, Any]) -> dict[str, Any]:
+    """确保卡片 config 里声明了 update_multi。
+
+    不声明 = 飞书按**独享卡片**处理：消息 PATCH 改得动消息体（`GET /im/v1/messages`
+    和转发都读到新内容），但卡片渲染**不保证持久化** —— 客户端重启 / 冷启动重新拉取
+    会渲染回原始内容，表现成「答过的卡又变回带按钮的样子」，随机出现、跨设备一致。
+    飞书官方 2026-09-15 给出该结论；2026-09-10 的受控实验里 5 张单点卡回退了 3 张。
+
+    为什么发送和更新两条路都补：官方明确「必须首次发送就声明，PATCH 时补上无法把
+    已发出的独享卡转成共享卡」。发送那条是治本；更新那条是防止调用方给的新内容漏掉
+    这个字段 —— PATCH 是整体替换语义，漏掉它有把共享卡打回独享的风险。
+
+    为什么只在缺失时补：调用方显式写 `false` 是它自己要独享卡（配合交互回调逐人
+    返回不同卡片），不替它改主意。
+
+    在 relay 这层兜底而不是只改调用方：存量安装不升级也立刻生效。
+    """
+    config = card.get("config")
+    if isinstance(config, dict) and "update_multi" in config:
+        return card
+    patched = json.loads(json.dumps(card, ensure_ascii=False))
+    if not isinstance(patched.get("config"), dict):
+        patched["config"] = {}
+    patched["config"]["update_multi"] = True
+    return patched
+
+
 class FeishuApiError(RuntimeError):
     def __init__(
         self,
@@ -150,6 +177,8 @@ class FeishuRelayClient:
         uuid: str,
     ) -> dict[str, str]:
         feishu_type = "interactive" if msg_type == "card" else msg_type
+        if feishu_type == "interactive":
+            content = _with_shared_card_config(content)
         data = self._request_json(
             "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
             method="POST",
@@ -206,7 +235,9 @@ class FeishuRelayClient:
         if content is not None:
             # ponytail: caller-supplied content goes out verbatim — wrapping it would
             # break schema 2.0 cards, whose elements live under body.elements.
-            card = content
+            # 唯一的例外是补 config.update_multi（见 _with_shared_card_config）：
+            # PATCH 是整体替换，新内容漏掉它就有把共享卡打回独享卡的风险。
+            card = _with_shared_card_config(content)
         else:
             text = f"Status: {status}" + (f" ({action_id})" if action_id else "")
             card = {"elements": [{"tag": "markdown", "content": text}]}

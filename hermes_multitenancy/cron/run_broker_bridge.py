@@ -319,7 +319,13 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
     job_name = str(job.get("name") or job_id or "scheduled task")
     try:
         build_prompt = getattr(scheduler, "_build_job_prompt")
-        prompt = _cw._force_visible_cron_prompt(build_prompt(job, prerun_script=None))
+        from .continuity import scoped_job, remember_success
+
+        prompt_job, continuity_scope = scoped_job(job, profile_home)
+        built_prompt = build_prompt(prompt_job, prerun_script=None)
+        if built_prompt is None:
+            return True, "", "", None
+        prompt = _cw._force_visible_cron_prompt(built_prompt)
         request = _cw._build_cron_run_request(job, profile_home=profile_home, prompt=prompt)
         broker = _cw.RunBroker(
             dispatch_agent=lambda run_request: _cw._dispatch_cron_request(run_request, profile_home),
@@ -328,6 +334,14 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
             prepare_request=prepare_billing_request,
         )
         result = asyncio.run(broker.run(request))
+        if continuity_scope and not getattr(result, "completed", True):
+            raise RuntimeError("cron run did not complete")
+        if continuity_scope:
+            scoped_job(job, profile_home)  # Recheck ownership after the model/tool run.
+        remember_success(
+            continuity_scope, result.content,
+            completed=getattr(result, "completed", True) and not result.duplicate,
+        )
         final_response = _cw._visible_cron_response(job, result.content)
         output = (
             f"# Cron Job: {job_name}\n\n"

@@ -9,12 +9,21 @@ from typing import Any, Literal, Optional
 
 RunChannel = Literal["feishu", "webui", "cron", "kanban"]
 RunEventKind = Literal[
+    "run_started",
     "content",
     "thinking",
     "tool_started",
     "tool_completed",
+    "subagent.start",
+    "subagent.tool",
+    "subagent.progress",
+    "subagent.complete",
     "approval_required",
     "approval_resolved",
+    # Inline RequestAuthorization — the tool call itself blocks while the
+    # owner authorizes, so this pair rides the same control channel.
+    "authorization_required",
+    "authorization_resolved",
     "auth_required",
     "auth_resolved",
     "gate_required",
@@ -156,3 +165,4 @@ class RunResult:
     content: str
     duplicate: bool = False
     run_id: Optional[str] = None
+    completed: bool = True

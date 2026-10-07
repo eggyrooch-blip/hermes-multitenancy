@@ -250,6 +250,54 @@ def test_repair_group_profile_feishu_platforms_updates_only_group_profiles(tmp_p
     assert _read_yaml(user / "config.yaml")["platforms"]["feishu"]["enabled"] is True
 
 
+def test_repair_group_profile_feishu_platforms_never_follows_symlinked_profile(tmp_path):
+    # Review P1 (directory-symlink-escape): a symlinked group profile must not
+    # make the startup repair rewrite a config outside the profiles root.
+    from hermes_multitenancy.router import repair_group_profile_feishu_platforms
+
+    shared = tmp_path / ".hermes"
+    profiles = shared / "profiles"
+    profiles.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    stale = "platforms:\n  feishu:\n    enabled: true\n"
+    (outside / "config.yaml").write_text(stale, encoding="utf-8")
+    (profiles / "feishu_group_linked").symlink_to(outside, target_is_directory=True)
+    linked_cfg = profiles / "feishu_group_cfglink"
+    linked_cfg.mkdir()
+    (linked_cfg / "config.yaml").symlink_to(outside / "config.yaml")
+
+    stats = repair_group_profile_feishu_platforms(shared_home=shared)
+
+    assert stats["updated"] == 0
+    assert stats["skipped_unsafe_path"] == 2
+    assert (outside / "config.yaml").read_text(encoding="utf-8") == stale
+
+
+def test_repair_group_profile_feishu_platforms_preserves_config_mode(tmp_path):
+    # Review P1 (mode-not-preserved): 0600 must stay 0600 after the rewrite.
+    import os
+    import stat
+
+    from hermes_multitenancy.router import repair_group_profile_feishu_platforms
+
+    shared = tmp_path / ".hermes"
+    group = shared / "profiles" / "feishu_group_private"
+    group.mkdir(parents=True)
+    config = group / "config.yaml"
+    config.write_text("platforms:\n  feishu:\n    enabled: true\n", encoding="utf-8")
+    os.chmod(config, 0o600)
+    old_umask = os.umask(0o022)
+    try:
+        stats = repair_group_profile_feishu_platforms(shared_home=shared)
+    finally:
+        os.umask(old_umask)
+
+    assert stats["updated"] == 1
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert _read_yaml(config)["platforms"]["feishu"] == {"enabled": False}
+
+
 def test_ensure_group_profile_extends_existing_lark_guidance_without_duplicate_heading(tmp_path):
     from hermes_multitenancy.router import _ensure_group_profile
 
@@ -284,8 +332,8 @@ def test_ensure_group_profile_extends_existing_lark_guidance_without_duplicate_h
     assert "terminal" in soul_text
     assert "npx" in soul_text
     assert 'mode="script"' in soul_text
-    assert "任何解释器或直接执行方式" in soul_text
-    assert "不限文件类型或所在目录" in soul_text
+    assert "AiDock 分发安装的 Skill/Plugin" in soul_text
+    assert "可以使用 terminal/execute_code" in soul_text
 
 
 def test_lark_cli_defaults_cover_webui_api_server_platform():
@@ -1047,11 +1095,14 @@ def test_short_chat_id_collision_resistance():
     assert len(_short_chat_id(a).split("_")[-1]) == 16
 
 
-def test_chat_inviter_cache_is_bounded():
+def test_chat_inviter_cache_is_bounded(monkeypatch):
     """Spamming bot-add across throwaway chats must not grow the cache
     without bound."""
     from hermes_multitenancy import router as router_mod
 
+    # Cache capacity does not require provisioning 562 real group profiles.
+    # Persistence has separate integration coverage in this module.
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: None)
     with router_mod._chat_inviter_cache_lock:
         router_mod._chat_inviter_cache.clear()
     cap = router_mod._CHAT_INVITER_CACHE_MAX
@@ -1059,7 +1110,7 @@ def test_chat_inviter_cache_is_bounded():
         router_mod.register_chat_inviter(f"oc_spam_{i}", f"ou_{i:040d}")
     with router_mod._chat_inviter_cache_lock:
         size = len(router_mod._chat_inviter_cache)
-    assert size <= cap, f"cache grew past cap: {size} > {cap}"
+    assert size == cap, f"cache grew past cap: {size} > {cap}"
     with router_mod._chat_inviter_cache_lock:
         router_mod._chat_inviter_cache.clear()
 

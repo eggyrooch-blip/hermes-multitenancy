@@ -57,7 +57,11 @@ def _strict_env(monkeypatch, tmp_path: Path) -> tuple[dict[str, str], Path, Path
     return env, profile_home, real_binary
 
 
-def test_strict_on_shim_denies_direct_exec_and_audits(monkeypatch, tmp_path: Path) -> None:
+def test_strict_on_shim_self_serves_direct_exec_and_audits(monkeypatch, tmp_path: Path) -> None:
+    # 2026-09-11: the strict runtime no longer refuses a direct call (see
+    # lark_cli_guard for why the path gate protected no credential). What must
+    # still hold is the audit trail, and that the audit line leaks nothing —
+    # argv here carries an access token in a query string.
     from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
 
     env, profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
@@ -73,20 +77,55 @@ def test_strict_on_shim_denies_direct_exec_and_audits(monkeypatch, tmp_path: Pat
     )
 
     assert shim_dir.is_relative_to(profile_home)
-    assert proc.returncode != 0
-    assert "Use the registered lark_cli tool." in proc.stderr
-    assert proc.stdout == ""
+    assert proc.returncode == 0, proc.stderr
+    assert "REAL:api GET /open-apis/authen/v1/user_info?access_token=token-secret-value" in proc.stdout
     assert token not in proc.stderr
     assert "proxy-secret-value" not in proc.stderr
     assert "ou_secret_open_id" not in proc.stderr
     rows = _read_jsonl(audit_path)
-    assert rows[-1]["event_type"] == "lark_cli.direct_exec.denied"
+    assert rows[-1]["event_type"] == "lark_cli.direct_exec.self_served"
     assert rows[-1]["command_name"] == "lark-cli"
     assert rows[-1]["profile"] == "alice"
     assert rows[-1]["open_id_hash"] == hashlib.sha256(b"ou_secret_open_id").hexdigest()[:12]
+    assert rows[-1]["argv_redacted"] == "api GET /open-apis/authen/v1/user_info"
     serialized = json.dumps(rows[-1], ensure_ascii=False)
     assert "token-secret-value" not in serialized
     assert "proxy-secret-value" not in serialized
+    assert token not in serialized
+    assert "ou_secret_open_id" not in serialized
+
+
+def test_strict_on_shim_denies_bot_identity_without_leaking(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
+
+    env, _profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+    shim_dir = Path(env["PATH"].split(os.pathsep)[0])
+    audit_path = Path(env["HERMES_MT_SECURITY_AUDIT_PATH"])
+    token = env[HERMES_LARK_CLI_RUN_TOKEN]
+    proc = subprocess.run(
+        [
+            str(shim_dir / "lark-cli"),
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--content",
+            "token-secret-value",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert proc.returncode == 126
+    assert "Direct execution denied for bot identity" in proc.stderr
+    assert proc.stdout == ""
+    rows = _read_jsonl(audit_path)
+    assert rows[-1]["event_type"] == "lark_cli.direct_exec.denied"
+    assert rows[-1]["argv_redacted"] == "im +messages-send --as <redacted> --content <redacted>"
+    serialized = json.dumps(rows[-1], ensure_ascii=False)
+    assert "token-secret-value" not in serialized
     assert token not in serialized
     assert "ou_secret_open_id" not in serialized
 
@@ -305,3 +344,22 @@ def test_registered_lark_cli_blocks_headless_auth_login_before_spawn_when_policy
     assert "provide token" not in visible
     assert "粘贴 token" not in visible
     assert "提供 token" not in visible
+
+
+def test_strict_env_mirrors_the_self_serve_marker_but_never_the_run_token(monkeypatch, tmp_path: Path) -> None:
+    # Regression guard for 2026-09-11: the shim's self-serve lane is reachable
+    # from terminal children ONLY through the _HERMES_FORCE_ mirror, and the run
+    # token must never travel that channel (a child holding it could mint its
+    # own AUTHORIZED grant and skip the bot-identity narrowing).
+    from hermes_multitenancy.lark_cli_guard import (
+        HERMES_LARK_CLI_RUN_TOKEN,
+        HERMES_LARK_CLI_SELF_SERVE,
+    )
+
+    env, _profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+
+    assert env[f"_HERMES_FORCE_{HERMES_LARK_CLI_SELF_SERVE}"] == "1"
+    assert f"_HERMES_FORCE_{HERMES_LARK_CLI_RUN_TOKEN}" not in env
+    token = env[HERMES_LARK_CLI_RUN_TOKEN]
+    forced = {key: value for key, value in env.items() if key.startswith("_HERMES_FORCE_")}
+    assert token not in forced.values()

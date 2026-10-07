@@ -1923,10 +1923,33 @@ def _resolve_skill_script(argv0: str, env: dict[str, str]) -> tuple[Path | None,
                 raise ValueError("Codex Plugin copy differs from trusted source")
             resolved = mapped
         except (KeyError, OSError, RuntimeError, ValueError):
-            return None, "script must be an AiDock-distributed skill script"
+            return None, (
+                "not an AiDock-distributed script; mode=script only runs AiDock-distributed "
+                "skill scripts — run it per its SKILL.md via terminal instead"
+            )
     if not resolved.is_file():
         return None, "script path is not a regular file"
     return resolved, None
+
+
+_SCRIPT_NODE_CANDIDATES = ("/usr/bin/node", "/opt/homebrew/bin/node", "/usr/local/bin/node")
+
+
+def _trusted_script_node() -> str | None:
+    # These system trees are read-only to tenants in the OS sandbox. Resolve
+    # Homebrew symlinks, but never follow one into a profile or use ambient PATH.
+    for candidate in _SCRIPT_NODE_CANDIDATES:
+        try:
+            node = Path(candidate).resolve(strict=True)
+            if (
+                any(node.is_relative_to(root) for root in ("/usr", "/opt/homebrew"))
+                and node.is_file()
+                and os.access(node, os.X_OK)
+            ):
+                return str(node)
+        except (OSError, RuntimeError):
+            continue
+    return None
 
 
 def _handle_script_channel(*, argv: list[str], risk: str, timeout_raw: Any) -> str:
@@ -2024,11 +2047,21 @@ def _handle_script_channel(*, argv: list[str], risk: str, timeout_raw: Any) -> s
         workspace = _workspace_root(env)
         cwd = str(workspace) if workspace is not None and workspace.exists() else None
 
-        # Interpreter dispatch: .py rides the trusted sys.executable (P0-2);
-        # an executable file runs as shipped (its env-shebang can only search
-        # the narrowed PATH above); anything else goes through /bin/bash.
+        # Pin language interpreters even for executable env-shebang scripts;
+        # other executables keep the narrowed PATH, shell scripts use bash.
         if script.suffix == ".py":
             cmd = [sys.executable, str(script), *argv[1:]]
+        elif script.suffix in {".js", ".mjs", ".cjs"}:
+            node = _trusted_script_node()
+            if node is None:
+                return _classified_tool_error(
+                    "skill script requires Node.js in a trusted system location",
+                    failure_hint="dependency_unavailable",
+                    mode="script",
+                    command=argv,
+                    risk=risk,
+                )
+            cmd = [node, str(script), *argv[1:]]
         elif os.access(script, os.X_OK):
             cmd = [str(script), *argv[1:]]
         else:
@@ -2109,10 +2142,12 @@ LARK_CLI_SCHEMA = {
                 "description": (
                     "Command family: shortcut, schema method, raw OpenAPI api call, or "
                     "script (run any packaged skill script/executable that may call "
-                    "lark-cli itself). MANDATORY: when an installed Skill/Plugin instructs "
-                    "running any file it distributes (through any interpreter or direct "
-                    "execution, in any subdirectory), resolve that path relative to its "
-                    "SKILL.md and call mode=script; do not use terminal/execute_code."
+                    "lark-cli itself). MANDATORY for AiDock-distributed Skills/Plugins: when "
+                    "an AiDock-installed Skill/Plugin instructs running any file it distributes "
+                    "(through any interpreter or direct execution, in any subdirectory), resolve "
+                    "that path relative to its SKILL.md and call mode=script. Other installed "
+                    "Skills run per their SKILL.md via terminal/execute_code; if mode=script "
+                    "answers 'not an AiDock-distributed script', use terminal instead."
                 ),
             },
             "argv": {
@@ -2121,9 +2156,8 @@ LARK_CLI_SCHEMA = {
                 "description": (
                     "lark-cli arguments excluding the binary name. For mode=script: "
                     "[installed_script_path, ...script_args]; preserve the Skill command's "
-                    "remaining arguments. The script must be a file this "
-                    "profile's installed skills/plugins distribute (any type: .py, "
-                    ".sh, executables)."
+                    "remaining arguments. The script must be a file an AiDock-installed "
+                    "skill/plugin distributes (any type: .py, .sh, executables)."
                 ),
             },
             "identity": {

@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 def test_rich_mcp_capabilities_round_trip_without_policy_bypass(tmp_path: Path):
-    import httpx
+    from hermes_multitenancy.compat.mcp_server import httpx
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
     from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -117,20 +117,20 @@ def test_rich_mcp_capabilities_round_trip_without_policy_bypass(tmp_path: Path):
                 base_url=issuer,
                 headers={"Authorization": f"Bearer {token}"},
             ) as client:
-                async with streamable_http_client(resource, http_client=client) as (read, write, _):
+                async with streamable_http_client(resource, http_client=client) as (read, write, *_):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         tools = await session.list_tools()
                         assert tools.meta == {"catalog": "owner-scoped"}
-                        assert tools.tools[0].outputSchema["required"] == ["ok"]
-                        assert tools.tools[0].annotations.readOnlyHint is True
+                        assert tools.tools[0].model_dump(by_alias=True)["outputSchema"]["required"] == ["ok"]
+                        assert tools.tools[0].annotations.model_dump(by_alias=True)["readOnlyHint"] is True
                         assert tools.tools[0].meta["ui"]["resourceUri"] == "ui://github/result"
                         result = await session.call_tool("rich_read", {})
-                        assert result.structuredContent == {"ok": True}
+                        assert result.model_dump(by_alias=True)["structuredContent"] == {"ok": True}
                         assert result.meta["ui"]["resourceUri"] == "ui://github/result"
                         assert [item.type for item in result.content] == ["text", "image", "resource_link"]
                         denied = await session.call_tool("write_repo", {})
-                        assert denied.isError is True
+                        assert denied.model_dump(by_alias=True)["isError"] is True
 
                         prompts = await session.list_prompts()
                         assert prompts.meta == {"source": "bundle"}

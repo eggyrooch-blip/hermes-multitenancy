@@ -83,6 +83,9 @@
 
 ;; ── File reads — system + venv + repos ────────────────────────────────
 
+;; Resolve Homebrew interpreter symlinks without allowing /opt listing.
+(allow file-read-metadata (literal "/opt"))
+
 (allow file-read*
     (subpath "/usr")
     (subpath "/System")
@@ -177,7 +180,7 @@
 ;; Audio cache directory for tts_tool — read AND write because hermes
 ;; populates it at runtime. Verified necessary during sandbox e2e
 ;; probe: ``Could not import tool module tools.tts_tool: [Errno 1]
-;; Operation not permitted: '/Users/hermes/.hermes/audio_cache'``.
+;; Operation not permitted: '/Users/dev/.hermes/audio_cache'``.
 (allow file-read* file-write*
     (subpath (string-append (param "SHARED_HOME") "/audio_cache")))
 
@@ -221,6 +224,24 @@
 (allow file-read-metadata
     (literal "/private"))
 
+;; ── Inline-authorization rendezvous — readable, NEVER writable ────────
+;;
+;; The parent publishes the verified authorization result under
+;; SHARED_HOME/authorization/<per-run>/ and the blocked `request_authorization`
+;; tool call polls it. The child must read it and must NOT be able to write it:
+;; a writable rendezvous is a one-write self-authorization ("write
+;; {"state":"success"} to the path I already know"). Parent and child share a
+;; uid here, so file modes cannot express that — only the sandbox can.
+;;
+;; Order matters: sandbox-exec is last-match-wins, so the deny must follow the
+;; read allow (and follow the /private/tmp allow above, in case SHARED_HOME is
+;; ever relocated under it). Deleting is a write on the parent directory, so
+;; unlink is covered too.
+(allow file-read*
+    (subpath (string-append (param "SHARED_HOME") "/authorization")))
+(deny file-write*
+    (subpath (string-append (param "SHARED_HOME") "/authorization")))
+
 ;; ── Network — outbound HTTPS / HTTP only ──────────────────────────────
 ;;
 ;; Default policy is "deny network" but with explicit allowance for the
@@ -249,7 +270,7 @@
 (allow network-bind (local udp "localhost:*"))
 
 ;; Intranet egress — explicitly denied. Skills should not be able to
-;; reach 192.0.2.249 (Keep production) or any office subnet from inside
+;; reach 10.0.0.249 (Keep production) or any office subnet from inside
 ;; the sandbox. If a legitimate use case shows up, lift this surgically
 ;; under the "trusted" policy variant, not in the default.
 ;;

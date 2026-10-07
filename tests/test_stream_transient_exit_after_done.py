@@ -1,6 +1,6 @@
 """A non-zero subprocess exit AFTER the ``done`` event must not become a red error.
 
-Production (qiaojunlong, webui session ms747y7rm8nlmu, 2026-07-30 17:00): the
+Production (wangwu, webui session ms747y7rm8nlmu, 2026-07-30 17:00): the
 user switched model families mid-session, the core rejected the replayed
 encrypted reasoning blob, self-healed (``disabled replay and stripped 1
 item(s) ... retrying...``) and finished the turn — then the child process was

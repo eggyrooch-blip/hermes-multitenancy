@@ -36,17 +36,28 @@ def _cgroup_cpu_quota() -> int | None:
     return None
 
 
-_quota = _cgroup_cpu_quota()
-if _quota is None and os.environ.get("CI"):
-    # 配额读不到(cpu.max="max" 或 cgroup v1)但在共享 runner 上:host nproc
-    # 永远不是正确答案 —— 别的 pipeline 在同机竞争。钉一个保守值。
-    _quota = 8
-if _quota is not None and not os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
-    os.environ["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(_quota)
-    import sys as _sys
+def _configure_xdist_workers() -> None:
+    _quota = _cgroup_cpu_quota()
+    if _quota is None and os.environ.get("CI"):
+        # 配额读不到(cpu.max="max" 或 cgroup v1)但在共享 runner 上:host nproc
+        # 永远不是正确答案 —— 别的 pipeline 在同机竞争。钉一个保守值。
+        _quota = 8
+    if _quota is not None:
+        requested = os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS")
+        try:
+            workers = min(int(requested), _quota) if requested else _quota
+        except ValueError:
+            # xdist ignores malformed overrides; keep that behavior within quota.
+            workers = _quota
+        os.environ["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(workers)
+        print(
+            f"[conftest] xdist workers capped: requested={requested or 'auto'} "
+            f"quota={_quota} workers={workers}",
+            file=sys.stderr,
+        )
 
-    print(f"[conftest] xdist workers capped: quota={_quota}", file=_sys.stderr)
 
+_configure_xdist_workers()
 
 _CARD_MESSAGES = itertools.count()
 _SYNTHETIC_FEISHU_ADAPTER = "hermes_plugins.feishu_platform.adapter"
@@ -172,6 +183,13 @@ def _isolate_loaded_feishu_plugin(monkeypatch):
         monkeypatch.delitem(entries, "feishu", raising=False)
     if isinstance(deferred, dict):
         monkeypatch.delitem(deferred, "feishu", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mt_registration_owner(monkeypatch):
+    """Each test starts with no MT copy recorded as the process-wide owner."""
+    monkeypatch.delattr(sys, "_hermes_multitenancy_registered_module", raising=False)
+    monkeypatch.delattr(sys, "_hermes_multitenancy_registered_manager", raising=False)
 
 
 @pytest.fixture(autouse=True)

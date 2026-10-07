@@ -400,7 +400,7 @@ def test_receipt_delivery_builds_card_for_media_only_payload(monkeypatch):
 def test_media_provider_receipt_failure_is_consumed(monkeypatch):
     import types
 
-    scheduler = types.ModuleType("cron.scheduler")
+    scheduler = types.ModuleType("cron.scheduler_delivery")
     scheduler._send_media_via_adapter = lambda *a, **k: SimpleNamespace(
         success=False,
         error_code="missing_receipt",
@@ -408,7 +408,7 @@ def test_media_provider_receipt_failure_is_consumed(monkeypatch):
     cron_pkg = types.ModuleType("cron")
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
-    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "cron.scheduler_delivery", scheduler)
     monkeypatch.setitem(sys.modules, "gateway.config", SimpleNamespace(Platform=lambda value: value))
 
     error = cron_worker._send_media_files_via_live_adapter(
@@ -426,12 +426,12 @@ def test_media_provider_receipt_failure_is_consumed(monkeypatch):
 def test_media_provider_missing_receipt_fails_closed(monkeypatch):
     import types
 
-    scheduler = types.ModuleType("cron.scheduler")
+    scheduler = types.ModuleType("cron.scheduler_delivery")
     scheduler._send_media_via_adapter = lambda *a, **k: None
     cron_pkg = types.ModuleType("cron")
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
-    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "cron.scheduler_delivery", scheduler)
     monkeypatch.setitem(sys.modules, "gateway.config", SimpleNamespace(Platform=lambda value: value))
 
     error = cron_worker._send_media_files_via_live_adapter(

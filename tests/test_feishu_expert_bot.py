@@ -314,7 +314,7 @@ def test_readonly_toolsets_and_env_allowlist(monkeypatch: pytest.MonkeyPatch) ->
     ) == ["file", "lark-cli", "web"]
 
     disabled = agent_real._resolve_disabled_toolsets({"agent": {"disabled_toolsets": ["browser"]}})
-    assert disabled == ["browser", "delegation", "execute_code", "terminal"]
+    assert disabled == ["browser", "delegation", "execute_code", "request-authorization", "terminal"]
 
 
 def _tool_json(payload: str) -> dict:
@@ -565,6 +565,6 @@ def test_env_unset_regression_paths_are_inert(
         {"platform_toolsets": {"webui": ["lark-cli"]}},
         "webui",
         platform_tools_resolver=None,
-    ) == ["file", "lark-cli", "terminal", "web"]
+    ) == ["file", "lark-cli", "request-authorization", "terminal", "web"]
     assert agent_real._resolve_disabled_toolsets({"agent": {"disabled_toolsets": ["browser"]}}) == ["browser"]
     router_mod.override_routing_table(None)

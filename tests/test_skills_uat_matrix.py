@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import time
 import urllib.error
+import asyncio
 from pathlib import Path
 
 
@@ -120,8 +121,23 @@ def test_registry_audit_uat_collects_all_profile_skill_sources(tmp_path: Path):
     assert result["source_counts"]["unknown"] >= 1
 
 
-def test_continue_turn_reconstructs_interrupted_request(tmp_path: Path):
+class _GenerousWaitFor:
+    """asyncio proxy for the matrix module: the probe gives the first turn 1 s to
+    reach the runner, but on a cold CI worker that turn first imports core 0.21.4's
+    gateway/agent stack (~420 modules, no .pyc; 0.8-1.3 s even on a fast laptop).
+    Only the wait budget changes; the assertions below are the probe's own."""
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+    @staticmethod
+    def wait_for(aw, timeout=None):
+        return asyncio.wait_for(aw, timeout=None if timeout is None else max(timeout, 30))
+
+
+def test_continue_turn_reconstructs_interrupted_request(tmp_path: Path, monkeypatch):
     matrix_mod = _load_matrix_module()
+    monkeypatch.setattr(matrix_mod, "asyncio", _GenerousWaitFor())
 
     result = matrix_mod.case_continue_turn_reconstructs_interrupted_request(tmp_path)
 

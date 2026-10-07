@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
+
+from tests._sync import SYNC_TIMEOUT
 
 from hermes_multitenancy.agent_real.tool_heartbeat import (
     EVENT,
@@ -27,13 +30,42 @@ def _collector():
     return got, emit
 
 
-def _wait_for(pred, timeout: float = 2.0) -> bool:
+def _wait_for(pred, timeout: float = SYNC_TIMEOUT) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pred():
             return True
         time.sleep(0.005)
     return pred()
+
+
+@pytest.fixture
+def heartbeat_clock(monkeypatch):
+    from hermes_multitenancy.agent_real import tool_heartbeat
+
+    now = [0.0]
+    # Replace only this module's clock, leaving watchdog waits on real time.
+    monkeypatch.setattr(tool_heartbeat, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    return now
+
+
+def _assert_no_heartbeats_after(hb, got, clock, elapsed):
+    observed_empty = threading.Event()
+    snapshot = hb._snapshot
+
+    def observe_snapshot():
+        result = snapshot()
+        if not result:
+            observed_empty.set()
+        return result
+
+    hb._snapshot = observe_snapshot
+    clock[0] = elapsed
+    assert observed_empty.wait(SYNC_TIMEOUT), "heartbeat loop did not suppress expired calls"
+    seen = len(got)
+    observed_empty.clear()
+    assert observed_empty.wait(SYNC_TIMEOUT), "heartbeat loop did not recheck expired calls"
+    assert len(got) == seen, "heartbeats must stop once the oldest tool outlives max_s"
 
 
 def test_emits_while_tool_in_flight_and_stops_after_completion():
@@ -56,21 +88,18 @@ def test_emits_while_tool_in_flight_and_stops_after_completion():
         hb.stop()
 
 
-def test_stops_vouching_after_max_seconds():
+def test_stops_vouching_after_max_seconds(heartbeat_clock):
     got, emit = _collector()
     hb = ToolHeartbeat(emit, interval_s=0.02, max_s=0.06)
     try:
         hb.started("call-1", "terminal")
-        time.sleep(0.3)
-        assert got, "expected heartbeats before max_s"
+        assert _wait_for(lambda: bool(got)), "expected heartbeats before max_s"
         assert all(
             item["elapsed"] <= 0.06 + 0.03
             for _, payload in got
             for item in payload["inflight"]
         ), got
-        seen = len(got)
-        time.sleep(0.1)
-        assert len(got) == seen, "heartbeats must stop once the tool outlives max_s"
+        _assert_no_heartbeats_after(hb, got, heartbeat_clock, 0.1)
     finally:
         hb.stop()
 
@@ -136,22 +165,21 @@ def test_duplicate_start_keeps_original_clock():
         hb.stop()
 
 
-def test_oldest_call_over_ceiling_stops_all_heartbeats():
+def test_oldest_call_over_ceiling_stops_all_heartbeats(heartbeat_clock):
     got, emit = _collector()
     hb = ToolHeartbeat(emit, interval_s=0.02, max_s=0.08)
     try:
         hb.started("old", "terminal")
-        time.sleep(0.06)
+        assert _wait_for(lambda: bool(got)), "heartbeats expected while old was under the ceiling"
+        heartbeat_clock[0] = 0.06
         hb.started("young", "lark_cli")  # started shortly before old's ceiling
-        time.sleep(0.15)
-        assert got, "heartbeats expected while old was under the ceiling"
+
         assert all(
             max(item["elapsed"] for item in payload["inflight"]) <= 0.08 + 0.03
             for _, payload in got
         ), got
-        seen = len(got)
-        time.sleep(0.1)
-        assert len(got) == seen, "a younger sibling must not keep vouching past the oldest call's ceiling"
+        # Old is expired at 0.1 while young is only 0.04 seconds old.
+        _assert_no_heartbeats_after(hb, got, heartbeat_clock, 0.1)
     finally:
         hb.stop()
 

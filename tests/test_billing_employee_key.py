@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import io
 import json
 import urllib.error
@@ -720,7 +721,7 @@ def test_one_members_failure_never_aborts_the_sweep():
     r, stored = _sweep(list("abcde"), lambda m: True, issue)
     assert r.issued == 4
     assert r.failed == 1
-    assert ("c", "RuntimeError") in r.failures
+    assert r.failures == [("2e7d2c03a950", "RuntimeError")]
     assert [m for m, _ in stored] == ["a", "b", "d", "e"]
 
 
@@ -822,7 +823,7 @@ def test_dry_run_mints_nothing(monkeypatch, tmp_path):
     import hermes_multitenancy.billing_identity as bi
 
     monkeypatch.setattr(
-        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds()})()
+        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds(), "refresh_identity": lambda self, p: nullcontext(self._credentials.employee_key_needed(p))})()
     )
 
     out = bek.run_refresh(dry_run=True)
@@ -859,7 +860,7 @@ def test_cohort_member_missing_from_routing_is_reported_not_guessed(
 
     monkeypatch.setattr(
         bi, "_default_preparer",
-        lambda: type("P", (), {"_credentials": type("C", (), {
+        lambda: type("P", (), {"refresh_identity": lambda self, p: nullcontext(True), "_credentials": type("C", (), {
             "employee_key_needed": lambda self, p: True})()})(),
     )
 
@@ -903,7 +904,7 @@ def test_synthetic_ou_id_in_cohort_is_rejected_not_swept(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         bi, "_default_preparer",
-        lambda: type("P", (), {"_credentials": type("C", (), {
+        lambda: type("P", (), {"refresh_identity": lambda self, p: nullcontext(True), "_credentials": type("C", (), {
             "employee_key_needed": lambda self, p: True})()})(),
     )
 
@@ -1440,17 +1441,10 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
         BillingIdentityStore,
     )
 
+    from hermes_multitenancy.routing import RoutingTable
     db = tmp_path / "routing.db"
-    conn = sqlite3.connect(db)
-    conn.execute(
-        "CREATE TABLE multitenancy_routing (user_id TEXT, profile_name TEXT, "
-        "active INTEGER, kind TEXT, provenance TEXT)"
-    )
-    conn.execute(
-        "INSERT INTO multitenancy_routing VALUES ('sunke','sunke',1,'user','sync')"
-    )
-    conn.commit()
-    conn.close()
+    routing = RoutingTable(db)
+    routing.upsert(user_id="sunke", profile_name="sunke", open_id="ou_sunke", provenance="sync")
 
     # A snapshot email that deliberately differs from the fabricated fallback
     # (sunke@example.com) so the assertion cannot pass by accident.
@@ -1475,7 +1469,7 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
     manager = _manager(tmp_path)
     identity_store = BillingIdentityStore(tmp_path / "identity.db")
     preparer = BillingIdentityPreparer(
-        routing=None, store=identity_store, credentials=manager
+        routing=routing, store=identity_store, credentials=manager
     )
     import hermes_multitenancy.billing_identity as bi
 
@@ -1577,7 +1571,7 @@ def test_refresh_without_a_vault_key_stops_before_the_gateway(
     import hermes_multitenancy.billing_identity as bi
 
     monkeypatch.setattr(
-        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds()})()
+        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds(), "refresh_identity": lambda self, p: nullcontext(self._credentials.employee_key_needed(p))})()
     )
 
     with pytest.raises(EmployeeKeyError) as excinfo:
@@ -1613,7 +1607,7 @@ def test_vault_key_check_agrees_with_the_vault_itself(monkeypatch, tmp_path):
     import hermes_multitenancy.billing_identity as bi
 
     monkeypatch.setattr(
-        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds()})()
+        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds(), "refresh_identity": lambda self, p: nullcontext(self._credentials.employee_key_needed(p))})()
     )
     monkeypatch.setattr(bek, "EmployeeKeyClient", lambda *a, **k: object())
 
@@ -1865,20 +1859,20 @@ def _refresh_env(monkeypatch, db, payer_ids):
 
     monkeypatch.setattr(
         bi, "_default_preparer",
-        lambda: type("P", (), {"_credentials": type("C", (), {
+        lambda: type("P", (), {"refresh_identity": lambda self, p: nullcontext(True), "_credentials": type("C", (), {
             "employee_key_needed": lambda self, p: True})()})(),
     )
 
 
 def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
-    """The 2026-08-14 gap: chenjunjiang joined, feishu-sync routed him, and the
+    """The 2026-08-14 gap: lisi joined, feishu-sync routed him, and the
     frozen HERMES_LITELLM_BILLING_PAYER_IDS list still didn't know him — so the
     sweep never minted. With "@routing" the routing table IS the cohort."""
     from hermes_multitenancy import billing_employee_key as bek
 
     db = _routing_db(tmp_path, [
         ("sunke", "sunke", 1, "user", "sync"),
-        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
+        ("lisi", "lisi", 1, "user", "sync"),
         ("departed", "departed", 0, "user", "sync"),      # inactive: retired
         ("svc-bot", "svc-bot", 1, "user", "manual"),      # not sync: excluded
         ("grp", "grp", 1, "group", "sync"),               # not a user: excluded
@@ -1886,7 +1880,7 @@ def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
     _refresh_env(monkeypatch, db, "@routing")
 
     out = bek.run_refresh(dry_run=True)
-    assert out["would_issue"] == ["chenjunjiang", "sunke"]
+    assert out["would_issue"] == ["lisi", "sunke"]
     assert out["cohort"] == 2
 
 
@@ -1915,13 +1909,13 @@ def test_a_list_containing_the_sentinel_stays_static(monkeypatch, tmp_path):
 
     db = _routing_db(tmp_path, [
         ("sunke", "sunke", 1, "user", "sync"),
-        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
+        ("lisi", "lisi", 1, "user", "sync"),
     ])
     _refresh_env(monkeypatch, db, "sunke,@routing")
 
     out = bek.run_refresh(dry_run=True)
     assert out["would_issue"] == ["sunke"]
-    assert "chenjunjiang" not in out["would_issue"]
+    assert "lisi" not in out["would_issue"]
     assert out["unrouted"] == ["@routing"]
 
 
@@ -1959,3 +1953,51 @@ def test_routing_sentinel_refuses_a_cohort_with_no_mintable_member(
 
     with pytest.raises(bek.EmployeeKeyError, match="routing_cohort_empty"):
         bek.run_refresh(dry_run=True)
+
+
+@pytest.mark.parametrize("stage", ["needs", "issue", "store"])
+@pytest.mark.parametrize("message,reason", [
+    ("billing credential account changed: stored=secret-account issued=private-account", "account_drift"),
+    ("billing credential failed activation probe: Bearer secret-token", "activation_probe_failed"),
+    ("billing credential is for a different email", "email_mismatch"),
+    ("unexpected secret-token private@example.com", "unknown"),
+])
+def test_sweep_failure_diagnostics_are_private_and_stage_specific(stage, message, reason):
+    from hermes_multitenancy.billing_credentials import _ResolvedPayer
+    from hermes_multitenancy.run_broker import RunRejected
+    events = []
+    member = _ResolvedPayer("private-person", "private-profile", "private@example.com", "")
+
+    def fail(*args):
+        raise RunRejected(message)
+
+    result = sweep_cohort(
+        [member], needs=fail if stage == "needs" else lambda _: True,
+        issue=fail if stage == "issue" else lambda _: "secret-token",
+        store=fail if stage == "store" else lambda *_: None,
+        on_event=lambda *event: events.append(event),
+    )
+    assert result.failed == 1 and result.issued == 0 and result.deferred_budget == 0
+    fingerprint, exception_type = result.failures[0]
+    assert len(fingerprint) == 12 and all(c in "0123456789abcdef" for c in fingerprint)
+    assert exception_type == "RunRejected"
+    assert result.failure_details == [{"member": fingerprint, "stage": stage, "reason": reason}]
+    assert events == [("failed", fingerprint, "RunRejected")]
+    output = repr((result, events))
+    assert all(secret not in output for secret in ["private-person", "private-profile", "private@example.com", "secret-token", "secret-account", "private-account"])
+
+
+def test_refresh_cli_keeps_failure_exit_and_safe_details(monkeypatch, capsys):
+    import hermes_multitenancy.billing_employee_key as bek
+    from hermes_multitenancy.run_broker import RunRejected
+
+    def reject(_):
+        raise RunRejected("billing credential failed activation probe: secret-token")
+
+    result = bek.sweep_cohort(["private-person"], needs=reject, issue=lambda _: None, store=lambda *_: None)
+    summary = {"failed": result.failed, "failures": result.failures, "failure_details": result.failure_details}
+    monkeypatch.setattr(bek, "run_refresh", lambda **_: summary)
+    assert bek.refresh_main([]) == 2
+    output = capsys.readouterr().out
+    assert "secret-token" not in output and "private-person" not in output
+    assert json.loads(output)["failure_details"][0]["stage"] == "needs"

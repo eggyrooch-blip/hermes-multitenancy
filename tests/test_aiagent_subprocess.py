@@ -851,6 +851,10 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
             limit=2,
             current_session_id="current-session",
             profile="owner",
+            detail="compact",
+            after="7d",
+            before="1d",
+            exclude_session_ids=["seen-session"],
         )
         recall_db = FakeAIAgent._get_session_db_for_recall(object())
     finally:
@@ -863,6 +867,10 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
     assert requests[0]["body"]["query"] == "marker"
     assert requests[0]["body"]["current_session_id"] == "current-session"
     assert requests[0]["body"]["profile"] == "owner"
+    assert requests[0]["body"]["detail"] == "compact"
+    assert requests[0]["body"]["after"] == "7d"
+    assert requests[0]["body"]["before"] == "1d"
+    assert requests[0]["body"]["exclude_session_ids"] == ["seen-session"]
     assert json.loads(result) == {"success": True, "count": 1}
     assert recall_db is not None
 
@@ -991,7 +999,7 @@ agent_real._install_session_search_recall_db_proxy(FakeAIAgent)
 result = agent_runtime_helpers.invoke_tool(
     FakeAIAgent(),
     "session_search",
-    {"query": "marker", "limit": 2},
+    {"query": "marker", "limit": 2, "detail": "compact", "after": "7d", "before": "1d", "exclude_session_ids": ["seen-session"]},
     "task-id",
     pre_tool_block_checked=True,
     skip_tool_request_middleware=True,
@@ -1007,7 +1015,7 @@ os._exit(0)
     env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
     env["PYTHONPATH"] = os.pathsep.join([
         str(Path.cwd()),
-        "/Users/hermes/.hermes/hermes-feishu-uat",
+        env.get("HERMES_AGENT_REPO", ""),
         env.get("PYTHONPATH", ""),
     ])
     completed = subprocess.run(
@@ -1024,6 +1032,10 @@ os._exit(0)
     assert len(payload["requests"]) == 1
     assert payload["requests"][0]["body"]["query"] == "marker"
     assert payload["requests"][0]["body"]["current_session_id"] == "current-session"
+    assert payload["requests"][0]["body"]["detail"] == "compact"
+    assert payload["requests"][0]["body"]["after"] == "7d"
+    assert payload["requests"][0]["body"]["before"] == "1d"
+    assert payload["requests"][0]["body"]["exclude_session_ids"] == ["seen-session"]
     assert payload["result"] == {"success": True, "count": 1}
 
 
@@ -1327,7 +1339,7 @@ def test_apply_runtime_env_for_aiagent_forces_profile_boundary(monkeypatch, tmp_
 def test_apply_runtime_env_for_aiagent_allows_execute_code_profile_boundary(
     monkeypatch, tmp_path: Path
 ):
-    from tools.code_execution_tool import _scrub_child_env
+    from tools.code_execution_env import _scrub_child_env
 
     from hermes_multitenancy import agent_real
 
@@ -1339,6 +1351,8 @@ def test_apply_runtime_env_for_aiagent_allows_execute_code_profile_boundary(
     fake_env_passthrough = SimpleNamespace(
         register_env_passthrough=register_env_passthrough,
         is_env_passthrough=lambda name: name in registered,
+        resolve_passthrough_value=lambda name, fallback: fallback,
+        scoped_passthrough_additions=lambda present: {},
         _config_passthrough=frozenset(),
     )
     tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
@@ -3932,6 +3946,9 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
         "_role_override_block_for_event",
         lambda event, home: "ROLE OVERRIDE\n我是资源投放专家",
     )
+    monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _: [])
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_skill_env_policy", lambda _: ("pre", ("pre", "online")))
+    monkeypatch.setattr(agent_real.credential_hub, "kep_auth_state_line", lambda **_: "VERIFIED: pre=needs_auth")
     _install_fake_feishu_oapi(monkeypatch)
 
     event = _event()
@@ -3944,7 +3961,7 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
     # the two share one kwarg and must never overwrite each other).
     ephemeral = captured["ephemeral_system_prompt"]
     assert isinstance(ephemeral, str)
-    assert ephemeral.startswith("ROLE OVERRIDE\n我是资源投放专家")
+    assert ephemeral.startswith("VERIFIED: pre=needs_auth\n\nROLE OVERRIDE\n我是资源投放专家")
     assert "任务进度规则" in ephemeral
     assert ephemeral.index("ROLE OVERRIDE") < ephemeral.index("任务进度规则")
     assert 'lark_cli` tool with `mode="script"' in ephemeral
@@ -4226,7 +4243,7 @@ def test_run_with_aiagent_preserves_short_parent_tmp_and_profile_child_tmp(
             pass
 
         def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
-            from tools import code_execution_tool
+            from tools import code_execution_env as code_execution_tool
 
             cached_tempdir = tempfile.tempdir
             tempfile.tempdir = None
@@ -4488,7 +4505,7 @@ def test_resolve_enabled_toolsets_merges_webui_lark_cli_with_api_server_defaults
         config,
         "webui",
         platform_tools_resolver=fake_get_platform_tools,
-    ) == ["file", "lark-cli", "terminal", "web"]
+    ) == ["file", "lark-cli", "request-authorization", "terminal", "web"]
     assert seen == {
         "platform_toolsets": {
             "feishu": ["lark-cli"],
@@ -4505,7 +4522,7 @@ def test_resolve_enabled_toolsets_preserves_webui_core_tools_without_resolver():
         {"platform_toolsets": {"webui": ["lark-cli"]}},
         "webui",
         platform_tools_resolver=None,
-    ) == ["file", "lark-cli", "terminal", "web"]
+    ) == ["file", "lark-cli", "request-authorization", "terminal", "web"]
 
 
 def test_resolve_enabled_toolsets_removes_browser_unless_profile_enabled(tmp_path: Path):
@@ -4522,14 +4539,14 @@ def test_resolve_enabled_toolsets_removes_browser_unless_profile_enabled(tmp_pat
         "webui",
         platform_tools_resolver=fake_get_platform_tools,
         profile_home=profile_home,
-    ) == ["file", "web"]
+    ) == ["file", "request-authorization", "web"]
 
     assert agent_real._resolve_enabled_toolsets(
         {"multitenancy": {"browser": {"enabled": True}}},
         "webui",
         platform_tools_resolver=fake_get_platform_tools,
         profile_home=profile_home,
-    ) == ["browser", "file", "web"]
+    ) == ["browser", "file", "request-authorization", "web"]
 
 
 def test_resolve_enabled_toolsets_denies_browser_for_router_profile(tmp_path: Path):
@@ -4546,7 +4563,7 @@ def test_resolve_enabled_toolsets_denies_browser_for_router_profile(tmp_path: Pa
         "webui",
         platform_tools_resolver=None,
         profile_home=profile_home,
-    ) == ["file", "terminal", "web"]
+    ) == ["file", "request-authorization", "terminal", "web"]
 
 
 def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp_path: Path):
@@ -6562,7 +6579,7 @@ def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypa
     assert "Local image path for tools: uploads/receipt.png" in user_message
 
 
-def test_run_with_aiagent_disables_async_delivery_for_feishu_oneshot(monkeypatch, tmp_path: Path):
+def test_run_with_aiagent_keeps_non_webui_delegation_in_run(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -8553,13 +8570,16 @@ def test_aiagent_subprocess_env_scope_exposes_ingest_secret_dir_without_values(
                 "usage": "Authorization Bearer",
             }
         ]
-        from tools.code_execution_tool import _scrub_child_env
+        from tools.code_execution_env import _scrub_child_env
         import tools
 
         registered_passthrough: set[str] = set()
         fake_env_passthrough_mod = SimpleNamespace(
             _config_passthrough=frozenset(),
             register_env_passthrough=lambda names: registered_passthrough.update(names),
+            is_env_passthrough=lambda name: name in registered_passthrough,
+            resolve_passthrough_value=lambda name, fallback: fallback,
+            scoped_passthrough_additions=lambda present: {},
         )
         monkeypatch.setattr(tools, "env_passthrough", fake_env_passthrough_mod, raising=False)
         monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough_mod)
@@ -8991,7 +9011,7 @@ def test_sandbox_policy_file_is_valid_syntax():
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec behavior")
-def test_macos_sandbox_can_resolve_profile_ancestor_without_listing_home(monkeypatch):
+def test_macos_sandbox_can_resolve_profile_ancestor_without_listing_home(monkeypatch, request):
     """A production-shaped profile is reachable without exposing its peers or home."""
     import subprocess
     import tempfile
@@ -8999,8 +9019,11 @@ def test_macos_sandbox_can_resolve_profile_ancestor_without_listing_home(monkeyp
 
     from hermes_multitenancy import agent_real
 
-    user_home = _P.home().resolve()
-    shared_home = user_home / ".hermes"
+    import pwd
+    user_home = _P(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    shared_fixture = tempfile.TemporaryDirectory(prefix=".hermes-sandbox-fixture-", dir=user_home)
+    request.addfinalizer(shared_fixture.cleanup)
+    shared_home = _P(shared_fixture.name)
     profiles_home = shared_home / "profiles"
     profiles_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
@@ -9470,8 +9493,8 @@ def test_wrap_linux_bwrap_binds_installed_shared_skill_symlink_targets(monkeypat
     assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
 
 
-def test_wrap_linux_bwrap_binds_shared_skill_symlink_chain_targets(monkeypatch, tmp_path: Path):
-    """Shared managed skills may themselves symlink to an external skill store."""
+def test_wrap_linux_bwrap_rejects_shared_skill_symlink_chain_outside_trusted_roots(monkeypatch, tmp_path: Path):
+    """Shared symlink chains cannot expose sources outside trusted roots."""
     import os as _os
     from hermes_multitenancy import agent_real
 
@@ -9505,8 +9528,8 @@ def test_wrap_linux_bwrap_binds_shared_skill_symlink_chain_targets(monkeypatch, 
     wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
 
     triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
-    assert ("--dir", str(shared / "skills"), "--ro-bind") in triples
-    assert ("--ro-bind", str(external_skill), str(shared_link)) in triples
+    assert "--ro-bind" not in wrapped
+    assert ("--ro-bind", str(external_skill), str(shared_link)) not in triples
     assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
 
 
@@ -10504,3 +10527,29 @@ async def test_stream_run_agent_stall_without_tool_or_content_still_raises(monke
     with pytest.raises(AiagentToolStallTimeout):
         async for _item in agent_real.stream_run_agent(_event(), tmp_path):
             pass
+
+
+def test_real_execute_code_child_builder_keeps_profile_anchors(monkeypatch, tmp_path):
+    from tools import code_execution_env
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / 'profiles' / 'owner'
+    anchors = agent_real._profile_anchor_env_for_aiagent(profile)
+    for name, value in anchors.items():
+        monkeypatch.setenv(name, value)
+        monkeypatch.setenv('_HERMES_FORCE_' + name, value)
+    monkeypatch.setenv('OPENAI_API_KEY', 'must-not-leak')
+    original = code_execution_env._scrub_child_env
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(profile)
+    try:
+        child = code_execution_env._build_child_env(
+            rpc_endpoint='/tmp/test-rpc.sock', rpc_token='test-token',
+            tmpdir=str(profile / 'tmp'), child_python=sys.executable,
+        )
+        for name in ('HOME', 'HERMES_HOME', 'KEP_PROFILE', 'KEP_WORKSPACE_DIR', 'TMPDIR'):
+            assert child[name] == anchors[name]
+        assert 'OPENAI_API_KEY' not in child
+        assert not any(name.startswith('_HERMES_FORCE_') for name in child)
+    finally:
+        cleanup()
+    assert code_execution_env._scrub_child_env is original

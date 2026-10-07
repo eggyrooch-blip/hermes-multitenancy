@@ -360,6 +360,46 @@ def test_store_uat_l1_rejection_keeps_both_new_reauth_markers(
     assert not (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").exists()
 
 
+def test_l2_broken_payload_same_reason_does_not_rewrite_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Renewal ticks every 60s; an unchanged cause must leave the marker (and ts) alone."""
+    profile_name = "alice"
+    open_id = "ou_broken_tick"
+    payload = _valid_payload(open_id)
+    payload["refresh_token"] = ""
+    monkeypatch.setattr(fua, "_load_best_uat_payload", lambda *args, **kwargs: payload)
+    marker = tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+
+    assert credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    ) == "skipped"
+    body = common.read_needs_reauth_marker(marker)
+    assert body is not None and body["reason"] == common.REASON_EMPTY_REFRESH_TOKEN
+    body["ts"] = 111
+    marker.write_text(json.dumps(body), encoding="utf-8")
+    os.utime(marker, ns=(1_000_000_000, 1_000_000_000))
+    before = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+    for _ in range(2):
+        assert credential_renewal_worker._refresh_one(
+            tmp_path, profile_name, open_id, headroom_seconds=300
+        ) == "skipped"
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == before
+
+    # A different cause is a real change and rewrites the marker.
+    payload["refresh_token"] = "rt"
+    payload["scope"] = "im:message"
+    assert common.classify_uat_payload(payload) == common.REASON_SCOPE_STRIPPED_BY_FEISHU
+    assert credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    ) == "skipped"
+    rewritten = common.read_needs_reauth_marker(marker)
+    assert rewritten["reason"] == common.REASON_SCOPE_STRIPPED_BY_FEISHU
+    assert rewritten["ts"] != 111
+
+
 def test_identity_lock_is_reentrant_when_refresh_stores_uat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

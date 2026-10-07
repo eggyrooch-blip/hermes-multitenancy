@@ -4,6 +4,22 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import sys
+
+
+@pytest.fixture(autouse=True)
+def _isolate_real_feishu_plugin(monkeypatch) -> None:
+    """Keep core 0.21.4's real feishu plugin out of these fake-adapter tests.
+
+    An earlier test on the same xdist worker may leave the plugin loader's
+    synthetic module in sys.modules (or a deferred loader that re-materializes
+    it); load_feishu_module() prefers it, so patches would land on the real
+    adapter instead of this file's fake one.
+    """
+    from hermes_multitenancy import feishu_adapter_compat
+
+    monkeypatch.delitem(sys.modules, feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAME, raising=False)
+    monkeypatch.setattr(feishu_adapter_compat, "_materialize_deferred_feishu_platform", lambda: None)
 
 
 @pytest.fixture(autouse=True)

@@ -338,11 +338,11 @@ async def _session(token: str):
 
 
 async def _remote_list_tools(token: str) -> list[dict[str, Any]]:
-    import httpx
+    from .compat.mcp_server import httpx
 
     ClientSession, transport = await _session(token)
     async with httpx.AsyncClient(headers=_headers(token), timeout=120) as client:
-        async with transport(REMOTE_URL, http_client=client) as (read, write, _):
+        async with transport(REMOTE_URL, http_client=client) as (read, write, *_):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.list_tools()
@@ -350,19 +350,19 @@ async def _remote_list_tools(token: str) -> list[dict[str, Any]]:
                     {
                         "name": tool.name,
                         "description": tool.description or "",
-                        "inputSchema": tool.inputSchema,
+                        "inputSchema": tool.model_dump(by_alias=True)["inputSchema"],
                     }
                     for tool in result.tools
                 ]
 
 
 async def _remote_call_tool(token: str, tool_name: str, arguments: dict[str, Any]) -> Any:
-    import httpx
+    from .compat.mcp_server import httpx
 
     ClientSession, transport = await _session(token)
     async with httpx.AsyncClient(headers=_headers(token), timeout=120) as client:
-        async with transport(REMOTE_URL, http_client=client) as (read, write, _):
+        async with transport(REMOTE_URL, http_client=client) as (read, write, *_):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
-                return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+                return result.model_dump(mode="json", by_alias=True) if hasattr(result, "model_dump") else result

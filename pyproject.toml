@@ -26,14 +26,14 @@ classifiers = [
 dependencies = [
     # hermes-agent provides the plugin host (PluginContext / pre_gateway_dispatch hook)
     # plus all the FeishuAdapter/MessageEvent/RoutingTable types we extend. Keep
-    # this aligned with the published Hermes Agent line; 0.14.0 is the current
-    # upgrade target, while 1.x has not been published yet.
+    # this aligned with the published Hermes Agent line; local development is
+    # verified against 0.21.4 while retaining the existing host version range.
     "hermes-agent>=0.14,<1.0",
     "aiohttp>=3.9",
     "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
-    "mcp>=1.26,<2",
+    "mcp>=1.26,<3",
     "cryptography>=43.0",
     "tencentcloud-sdk-python-vod>=3.0",
 ]
@@ -79,6 +79,24 @@ hermes-multitenancy-connector-stdio-sandbox = "hermes_multitenancy.connector_std
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"
+
+# hermes-agent comes from the production core line (tag prod-core-v0214-2082ff0c17,
+# hermes-agent 0.21.4), published as a wheel to this project's GitLab PyPI
+# registry — the fork is never on public PyPI. Only `uv lock` needs credentials for
+# the simple index (UV_INDEX_HERMES_CORE_USERNAME / _PASSWORD, e.g. any user + a
+# read_api token); installing from uv.lock downloads the sha256-addressed file URL
+# and needs none. Production does not use this: hermes-release.sh installs MT with
+# `uv pip install --no-deps -e` into the separately released core venv.
+[[tool.uv.index]]
+name = "hermes-core"
+url = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/simple"
+explicit = true
+
+[tool.uv.sources]
+hermes-agent = { index = "hermes-core" }
+
+[tool.uv]
+constraint-dependencies = ["hermes-agent==0.21.4"]
 
 [tool.setuptools]
 packages = ["hermes_multitenancy", "hermes_multitenancy.agent_real", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.compat", "hermes_multitenancy.connectors", "hermes_multitenancy.cron", "hermes_multitenancy.credential_hub", "hermes_multitenancy.credential_hub.readers", "hermes_multitenancy.router", "hermes_multitenancy.sync", "hermes_multitenancy.webui_broker"]

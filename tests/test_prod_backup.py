@@ -650,3 +650,118 @@ def test_drill_refuses_when_scratch_space_cannot_hold_restore(env):
     assert result.returncode != 0
     assert "恢复空间不足" in result.stderr
     assert not list(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+
+
+@pytest.mark.parametrize("limit, expected", [(None, "1024"), ("2048", "2048")])
+def test_profiles_rsync_rate_limit_keeps_complete_backup(env, tmp_path, limit, expected):
+    real_rsync = shutil.which("rsync")
+    wrapper = tmp_path / "bin"
+    wrapper.mkdir()
+    args_file = tmp_path / "rsync-args"
+    script = wrapper / "rsync"
+    script.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > "{args_file}"\nexec "{real_rsync}" "$@"\n')
+    script.chmod(0o755)
+    overrides = {"PATH": str(wrapper) + ":" + env["PATH"]}
+    if limit is not None:
+        overrides["RSYNC_BWLIMIT_KBPS"] = limit
+    result = _run(BACKUP_SH, env, **overrides)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"--bwlimit={expected}" in args_file.read_text().splitlines()
+    snap = _state_snapshots(env)[-1]
+    assert (snap / "COMPLETE").is_file()
+    assert (snap / "PROFILE_SHA256SUMS").is_file()
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "abc", "1.5", "00", " 5"])
+def test_invalid_rsync_rate_limit_refused_before_backup(env, limit):
+    result = _run(BACKUP_SH, env, RSYNC_BWLIMIT_KBPS=limit)
+    assert result.returncode != 0
+    assert "RSYNC_BWLIMIT_KBPS" in result.stderr
+    assert not Path(env["BACKUP_ROOT"]).exists()
+
+
+# ── 7. 重 IO 的优先级包裹 ──────────────────────────────────────────
+#
+# 发布前回滚包（SKIP_PROFILES=1）这条路径上 RSYNC_BWLIMIT_KBPS 根本不生效，
+# 于是 230MB 的 sqlite .backup + integrity_check 是裸着打在机械盘上的 ——
+# 2026-09-18 / 09-21 两次发布各把 gateway 卡死 13 分钟。这两条守住：
+# 每一个重 IO 命令都走 idle 类，且机器上没有 ionice 时能退化而不是炸掉。
+
+
+def _io_stub_bin(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
+    """PATH 桩：ionice/nice 记录自己被怎么调用，并把「我被包着」的标记传下去；
+    sqlite3/cp 记录自己有没有带着那个标记跑 —— 漏包一个就会留下 wrapped=0。"""
+    bin_dir = tmp_path / "io-bin"
+    bin_dir.mkdir()
+    logs = {n: tmp_path / f"{n}-calls.log" for n in ("ionice", "nice", "sqlite3", "cp")}
+
+    for name, marker in (("ionice", "HERMES_IO_WRAPPED"), ("nice", "HERMES_IO_NICED")):
+        stub = bin_dir / name
+        stub.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$*" >> "{logs[name]}"\n'
+            f"export {marker}=1\n"
+            # 吃掉自己的选项（-c3 / -n19），剩下的原样执行下去
+            "while [ $# -gt 0 ]; do case \"$1\" in -*) shift ;; *) break ;; esac; done\n"
+            'exec "$@"\n'
+        )
+        stub.chmod(0o755)
+
+    for name in ("sqlite3", "cp"):
+        real = shutil.which(name)
+        assert real, f"测试机上找不到 {name}"
+        stub = bin_dir / name
+        stub.write_text(
+            "#!/bin/bash\n"
+            f'printf "wrapped=%s niced=%s %s\\n" "${{HERMES_IO_WRAPPED:-0}}" '
+            f'"${{HERMES_IO_NICED:-0}}" "$*" >> "{logs[name]}"\n'
+            f'exec "{real}" "$@"\n'
+        )
+        stub.chmod(0o755)
+
+    return bin_dir, logs
+
+
+def test_every_heavy_io_command_runs_in_idle_class(env, tmp_path):
+    """发布前备份路径上的每一次 sqlite3 / cp 都必须经 ionice -c3 nice -n19。"""
+    bin_dir, logs = _io_stub_bin(tmp_path)
+
+    result = _run(
+        BACKUP_SH, env,
+        PATH=f"{bin_dir}:{env['PATH']}",
+        SKIP_PROFILES="1",     # 发布前回滚包就是这条路径
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (_state_snapshots(env)[-1] / "COMPLETE").is_file()
+
+    ionice_calls = logs["ionice"].read_text().splitlines()
+    nice_calls = logs["nice"].read_text().splitlines()
+    assert ionice_calls, "一次 ionice 都没调到 = 限速没生效"
+    assert all(c.startswith("-c3 nice -n19 ") for c in ionice_calls), ionice_calls
+    assert all(c.startswith("-n19 ") for c in nice_calls), nice_calls
+    assert len(nice_calls) == len(ionice_calls), "每次 ionice 后面都应接着 nice"
+
+    sqlite_calls = logs["sqlite3"].read_text().splitlines()
+    cp_calls = logs["cp"].read_text().splitlines()
+    for line in sqlite_calls + cp_calls:
+        assert line.startswith("wrapped=1 niced=1 "), f"这条没被包住：{line}"
+    assert any(".backup" in c for c in sqlite_calls), "sqlite .backup 没跑？"
+    assert any("integrity_check" in c for c in sqlite_calls), "integrity_check 没跑？"
+    assert len(cp_calls) >= 4, f"config + feishu_uat 的拷贝应当都记到：{cp_calls}"
+    # 校验和是遍历整份备份的第二大 IO 源，也必须在 idle 类里
+    assert any("xargs" in c for c in ionice_calls), ionice_calls
+
+
+def test_backup_degrades_to_nice_when_ionice_is_absent(env):
+    """macOS 本地、以及任何没装 util-linux 的机器上，备份必须照跑并说明退化。"""
+    result = _run(
+        BACKUP_SH, env,
+        IONICE_BIN="ionice-not-installed-on-purpose",
+        SKIP_PROFILES="1",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ionice 不可用，退化为 nice" in result.stdout
+    snap = _state_snapshots(env)[-1]
+    assert (snap / "COMPLETE").is_file()
+    assert (snap / "SHA256SUMS").is_file()

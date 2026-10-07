@@ -25,6 +25,7 @@ if [[ -n "${CI:-}" ]]; then
   # --ignore, so the CI-only exclusions above must be applied to the argument list
   # too — otherwise the local-only matrix runners come straight back (2026-09-03,
   # tiered gate probe: 17 failed on test_lark_cli_matrix_runner in CI).
+  # `${ci_paths[@]+...}` below: bash 3.2 (macOS /bin/bash) treats an empty array as unbound under set -u.
   ci_paths=()
   for arg in "$@"; do
     case "$arg" in
@@ -40,10 +41,10 @@ if [[ -n "${CI:-}" ]]; then
     if [[ "$HERMES_CREATED_TEST_HOME" == "1" ]]; then
       chown ci "$HERMES_HOME"
     fi
-    printf -v shell_command '%q ' "${command[@]}" "${ci_args[@]}" "${ci_paths[@]}"
+    printf -v shell_command '%q ' "${command[@]}" "${ci_args[@]}" ${ci_paths[@]+"${ci_paths[@]}"}
     exec su ci -c "$shell_command"
   fi
-  exec "${command[@]}" "${ci_args[@]}" "${ci_paths[@]}"
+  exec "${command[@]}" "${ci_args[@]}" ${ci_paths[@]+"${ci_paths[@]}"}
 fi
 
 exec "${command[@]}" "$@"

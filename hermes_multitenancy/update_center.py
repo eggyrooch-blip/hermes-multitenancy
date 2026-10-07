@@ -438,9 +438,18 @@ def sync_kep_cli_systems(
         raw if isinstance(raw, KepCliSystem) else KepCliSystem(**dict(raw))
         for raw in systems
     ]
+    supported_systems: list[KepCliSystem] = []
     for system in normalized_systems:
+        # ponytail: upstream list/info omit platform metadata; this exact package's
+        # installer requires macOS LaunchAgent. Replace when the registry exposes support.
+        if system.system == "telemetry" and system.binary == "kep-telemetry" and sys.platform != "darwin":
+            reason = "telemetry requires macOS LaunchAgent; unsupported host platform"
+            rows.append({**asdict(system), "action": "skipped-unsupported-platform", "reason": reason})
+            ledger.append("kep_system_platform_skipped", component="kep-cli", system=system.system, reason=reason)
+            continue
+        supported_systems.append(system)
         rows.append(_sync_one_kep_system(system, shared_bin=shared_bin, resolve_binary=resolve, runner=run, ledger=ledger))
-    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run, adopt=adopt, ledger=ledger)
+    skill_rows = ensure_kep_cli_skills(supported_systems, shared_home=shared_home, profiles=profiles or (), runner=run, adopt=adopt, ledger=ledger)
     report = {"component": "kep-cli", "systems": rows, "skills": skill_rows, "secret_free": True}
     ledger.append("kep_cli_sync_completed", component="kep-cli", systems=rows)
     return redact(report)

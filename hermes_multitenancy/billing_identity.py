@@ -7,6 +7,7 @@ model runtime after RunBroker admission.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from .billing_credentials import (
 from .billing_employee_key import CREDENTIAL_SOURCE, EmployeeKeyClient, store_binding
 from .credentials import CredentialStore
 from .routing import DEFAULT_DB_PATH, RoutingTable
+from .shared_db import apply_shared_pragmas
 from .run_broker import RunRejected
 from .run_models import RunRequest
 from .token_usage_uploader import make_owner_resolver
@@ -121,7 +123,17 @@ class BillingIdentityStore:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        # This store shares ~/.hermes/multitenancy.db with the session, routing
+        # and expert-usage stores, plus one connection per cron subprocess. WAL
+        # serialises writers, so a burst of session appends can hold the write
+        # lock for seconds at a time. 5s was the SHORTEST timeout of every hot
+        # writer on this file (sessions 10s, expert_usage 30s) and it is the one
+        # that fired: 2026-09-17 14:35-14:44 it dropped 10 Feishu turns across 6
+        # employees with "database is locked". Match the longest one instead.
+        # busy_timeout FIRST: switching a shared file to WAL needs a brief
+        # exclusive lock, and with the default timeout of 0 that pragma errors
+        # out the moment any other connection holds the file.
+        apply_shared_pragmas(self._conn)
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS multitenancy_billing_identities (
@@ -192,43 +204,55 @@ class BillingIdentityStore:
             identity = replace(identity, migration_state="enforced")
         now = int(time.time() * 1000)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO multitenancy_billing_identities (
-                    employee_user_id, profile_name, email, litellm_user_id,
-                    team_id, team_alias, key_id, credential_version,
-                    expires_at, migration_state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(employee_user_id) DO UPDATE SET
-                    profile_name = excluded.profile_name,
-                    email = excluded.email,
-                    litellm_user_id = excluded.litellm_user_id,
-                    team_id = excluded.team_id,
-                    team_alias = excluded.team_alias,
-                    key_id = excluded.key_id,
-                    credential_version = excluded.credential_version,
-                    expires_at = excluded.expires_at,
-                    migration_state = CASE
-                        WHEN multitenancy_billing_identities.migration_state = 'enforced'
-                        THEN 'enforced' ELSE excluded.migration_state END,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    identity.employee_user_id,
-                    identity.profile_name,
-                    identity.email,
-                    identity.litellm_user_id,
-                    identity.team_id,
-                    identity.team_alias,
-                    identity.key_id,
-                    int(identity.credential_version),
-                    int(identity.expires_at),
-                    identity.migration_state,
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO multitenancy_billing_identities (
+                        employee_user_id, profile_name, email, litellm_user_id,
+                        team_id, team_alias, key_id, credential_version,
+                        expires_at, migration_state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(employee_user_id) DO UPDATE SET
+                        profile_name = excluded.profile_name,
+                        email = excluded.email,
+                        litellm_user_id = excluded.litellm_user_id,
+                        team_id = excluded.team_id,
+                        team_alias = excluded.team_alias,
+                        key_id = excluded.key_id,
+                        credential_version = excluded.credential_version,
+                        expires_at = excluded.expires_at,
+                        migration_state = CASE
+                            WHEN multitenancy_billing_identities.migration_state = 'enforced'
+                            THEN 'enforced' ELSE excluded.migration_state END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        identity.employee_user_id,
+                        identity.profile_name,
+                        identity.email,
+                        identity.litellm_user_id,
+                        identity.team_id,
+                        identity.team_alias,
+                        identity.key_id,
+                        int(identity.credential_version),
+                        int(identity.expires_at),
+                        identity.migration_state,
+                        now,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except BaseException:
+                # sqlite3 opens an implicit transaction for this INSERT, and a
+                # write that dies on the lock leaves it open on a connection we
+                # keep for the process lifetime. Every later read would then run
+                # inside that stale snapshot and every later write would fail
+                # with SQLITE_BUSY_SNAPSHOT — which `prepare` now swallows, so
+                # one lost write would silently freeze this store's view of the
+                # world (codex r1 #p1). Roll back, then raise unchanged: only
+                # `prepare` degrades, repair_metadata and the sweep still fail.
+                self._conn.rollback()
+                raise
 
 
 class BillingIdentityPreparer:
@@ -247,6 +271,39 @@ class BillingIdentityPreparer:
             self._group_owner,
             self._profile_owner,
         )
+
+    def _validate_payer_binding(self, payer: _ResolvedPayer) -> BillingIdentity | None:
+        existing = self._store.get(payer.employee_user_id)
+        if existing is not None:
+            if existing.profile_name and existing.profile_name != payer.profile_name:
+                raise RunRejected("billing payer profile drift detected")
+            if existing.email and existing.email.lower() != payer.email.lower():
+                raise RunRejected("billing payer email drift detected")
+        return existing
+
+    @contextlib.contextmanager
+    def refresh_identity(self, payer: _ResolvedPayer):
+        """Validate before provider I/O; serialize against normal route writers."""
+        if not _is_canonical_employee_id(payer.employee_user_id):
+            raise RunRejected("employee billing identity could not be resolved")
+        if self._routing is None:
+            raise RunRejected("billing routing dependency unavailable")
+        with self._routing.identity_mutation_guard():
+            row = self._routing.resolve_billing_root(payer.employee_user_id, payer.profile_name)
+            if row is None:
+                raise RunRejected("employee billing identity could not be resolved")
+            email, _ = _employee_org_fields(payer.employee_user_id, require_verified=True)
+            if email.lower() != payer.email.lower():
+                raise RunRejected("billing payer email drift detected")
+            profile_binding = self._store.get_by_profile(payer.profile_name)
+            if profile_binding is not None and profile_binding.employee_user_id != payer.employee_user_id:
+                raise RunRejected("billing payer profile drift detected")
+            existing = self._validate_payer_binding(payer)
+            if existing is not None and (not existing.profile_name or not existing.email):
+                raise RunRejected("billing credential identity drift detected")
+            # Also validate current vault identity before issuing, even if it is expired.
+            needed = self._credentials.employee_key_needed(payer, existing=existing)
+            yield needed
 
     def prepare(self, request: RunRequest, *, actor_open_id: str = "") -> RunRequest:
         metadata = _clean_metadata(request.metadata)
@@ -300,11 +357,7 @@ class BillingIdentityPreparer:
             raise RunRejected("billing payer profile drift detected")
         email, department = _employee_org_fields(payer.employee_user_id)
         payer = replace(payer, email=email, department_alias=department)
-        if existing is not None:
-            if existing.profile_name and existing.profile_name != payer.profile_name:
-                raise RunRejected("billing payer profile drift detected")
-            if existing.email and existing.email.lower() != payer.email.lower():
-                raise RunRejected("billing payer email drift detected")
+        self._validate_payer_binding(payer)
         try:
             # allow_mint=False: this is the employee's own request path, and the
             # employee never triggers issuance (sunke 2026-08-06). A missing or
@@ -330,7 +383,23 @@ class BillingIdentityPreparer:
                 request, metadata=metadata
             )
         binding = replace(binding, migration_state="enforced")
-        self._store.put(binding)
+        # Persisting is a CACHE write: `metadata` below is built from the
+        # in-memory binding, so this run is attributed correctly whether or not
+        # the row lands, and the next run simply re-resolves. Losing the write
+        # lock must therefore never reach commands.py's catch-all, which
+        # answers the employee "请求状态暂时无法保存，请稍后重试。" and drops the
+        # whole turn (2026-09-17 production incident). Only OperationalError is
+        # swallowed — a schema or value error is a real defect and still raises.
+        try:
+            self._store.put(binding)
+        except sqlite3.OperationalError as exc:
+            logging.getLogger(__name__).warning(
+                "multitenancy: billing binding persist failed employee=%s profile=%s: %s "
+                "(run continues on the in-memory binding)",
+                binding.employee_user_id,
+                binding.profile_name,
+                exc,
+            )
         metadata.update(_metadata_for_binding(binding, _billing_model_base_url()))
         if actor_open_id:
             metadata["litellm_billing_actor_subject"] = actor_open_id
@@ -712,18 +781,31 @@ def _latest_org_snapshot() -> Optional[dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
-def _employee_org_fields(employee_id: str) -> tuple[str, str]:
+def _employee_org_fields(employee_id: str, *, require_verified: bool = False) -> tuple[str, str]:
     domain = os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "example.com").strip().lower()
     if not domain or "@" in domain or "/" in domain:
         raise RunRejected("employee email domain is invalid")
     email = f"{employee_id}@{domain}"
     snapshot = _latest_org_snapshot()
     if snapshot is None:
+        if require_verified:
+            raise RunRejected("employee billing org identity unavailable")
         return email, ""
     employees = snapshot.get("employees")
     departments = snapshot.get("departments")
     if not isinstance(employees, dict) or not isinstance(departments, list):
+        if require_verified:
+            raise RunRejected("employee billing org identity unavailable")
         return email, ""
+    if require_verified:
+        matches = [value for key, value in employees.items()
+                   if isinstance(value, dict)
+                   and (str(key) == employee_id or str(value.get("user_id") or "") == employee_id)]
+        if len(matches) != 1 or str(matches[0].get("user_id") or "") != employee_id:
+            raise RunRejected("employee billing org identity ambiguous")
+        verified_email = str(matches[0].get("enterprise_email") or matches[0].get("email") or "").strip()
+        if not verified_email or "@" not in verified_email:
+            raise RunRejected("employee billing org email missing")
     employee = next(
         (
             value for key, value in employees.items()

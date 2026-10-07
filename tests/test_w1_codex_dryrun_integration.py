@@ -54,9 +54,9 @@ from hermes_multitenancy.agent_real import executor_unavailable_ux as ux
 from hermes_multitenancy.agent_real import run_workspace
 from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
 
-CODEX_BIN = shutil.which("codex") or "/Users/hermes/.local/bin/codex"
+CODEX_BIN = shutil.which("codex") or "/Users/dev/.local/bin/codex"
 CODEX_AVAILABLE = bool(CODEX_BIN) and Path(CODEX_BIN).is_file()
-LOCAL_FIXTURE_CHECKOUT = Path("/Users/hermes/code/hermes-web-ui")
+LOCAL_FIXTURE_CHECKOUT = Path("/Users/dev/code/hermes-web-ui")
 FIXTURE_REMOTE_URL = "git@gitlab.example.com:sunke/hermes-web-ui.git"
 
 requires_codex = pytest.mark.skipif(

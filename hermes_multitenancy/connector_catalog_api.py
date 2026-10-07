@@ -61,6 +61,30 @@ def _prune_cli_env_files(runtime_base: Path, *, now: float | None = None) -> Non
             continue
 
 
+#: RFC 9207 issuer identifiers are URIs; anything longer or non-textual is not
+#: one, and the value is never logged or echoed back to the caller.
+_MAX_ISSUER_LEN = 512
+
+
+def _callback_issuer(raw: Any) -> str | None:
+    """Type/length-check an optional ``iss`` from an OAuth redirect body.
+
+    Only accepted for Figma states. The value itself is still checked against
+    the discovered metadata issuer by the MCP SDK, so a wrong ``iss`` fails the
+    flow (which is the RFC 9207 mix-up defence) rather than being trusted here.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("invalid catalog OAuth callback issuer")
+    issuer = raw.strip()
+    if not issuer:
+        return None
+    if len(issuer) > _MAX_ISSUER_LEN or any(ch.isspace() or ord(ch) < 0x20 for ch in issuer):
+        raise ValueError("invalid catalog OAuth callback issuer")
+    return issuer
+
+
 def _get_catalog() -> ConnectorCatalog:
     global _catalog
     if _catalog is None:
@@ -715,11 +739,29 @@ def register_routes(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
-            if not isinstance(body, dict) or set(body) != {"state", "code"}:
+            if not isinstance(body, dict) or not {"state", "code"} <= set(body):
                 raise ValueError("catalog OAuth callback must contain state and code")
             state, code = str(body["state"]), str(body["code"])
             if not state or len(state) > 512 or not code or len(code) > 8192:
                 raise ValueError("invalid catalog OAuth callback")
+            # The builtin Figma connector reuses this one public callback route
+            # instead of opening a second one. Dispatch is by pending state, which
+            # only its own broker minted, so no catalog state can be diverted and
+            # a state neither broker knows still 403s exactly as before.
+            from . import figma_connector
+
+            figma_broker = figma_connector.get_broker(shared_home())
+            if figma_broker.has_pending(state):
+                # Figma DOES send RFC 9207 ``iss`` on the redirect (confirmed
+                # live 2026-09-21), and mcp >= 2.0 validates it. Rejecting the
+                # body for carrying it would 400 every real Figma callback.
+                result = await figma_broker.complete(
+                    state, code, iss=_callback_issuer(body.get("iss"))
+                )
+                return web.json_response({"ok": True, "connector": result})
+            # Non-Figma callbacks keep the exact {state, code} contract.
+            if set(body) != {"state", "code"}:
+                raise ValueError("catalog OAuth callback must contain state and code")
             connector = await _get_oauth_broker(shared_home() / "multitenancy.db").complete(state, code)
             return web.json_response({"ok": True, "connector": connector})
         except ValueError as exc:
@@ -727,7 +769,8 @@ def register_routes(
         except PermissionError as exc:
             return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
-            _logger.exception("catalog OAuth callback failed type=%s", type(exc).__name__)
+            # Type only: an OAuth traceback can carry the token response body.
+            _logger.error("catalog OAuth callback failed type=%s", type(exc).__name__)
             return web.json_response({"error": "catalog OAuth callback failed"}, status=502)
 
     app.router.add_get("/api/run-broker/connector-catalog", catalog)

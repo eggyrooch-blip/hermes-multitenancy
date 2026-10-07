@@ -529,7 +529,7 @@ class RunBroker:
                 error_code = "OUTPUT_INCOMPLETE"
             else:
                 answer_completed = True
-            return RunResult(content=content, duplicate=False)
+            return RunResult(content=content, duplicate=False, completed=answer_completed)
         except asyncio.CancelledError:
             terminal_status = "cancelled"
             error_code = "RUN_CANCELLED"

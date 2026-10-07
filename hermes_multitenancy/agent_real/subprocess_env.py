@@ -106,6 +106,11 @@ def _build_subprocess_env(
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    # NOTE: HERMES_MULTITENANCY_AUTHORIZATION_DIR is deliberately NOT set here.
+    # It is per-RUN (derived from the run id in `_aiagent_subprocess_env_scope`
+    # and passed through `extra`), because a single shared directory is what let
+    # a child write another request's response file. A run without an
+    # authorization run id gets no pin, and therefore no inline-auth bridge.
     # NOTE: KEP_AGENT_MODE / KEP_WORKSPACE_DIR are NOT set here. They are
     # profile anchors (`_profile_anchor_env_for_aiagent`), applied above with
     # HOME/WORKSPACE/KEP_PROFILE and mirrored through the force channel below —
@@ -148,6 +153,21 @@ def _build_subprocess_env(
         install_lark_cli_shim(shim_dir, real_binary=real_bin)
         env[HERMES_LARK_CLI_REAL_BIN] = str(real_bin)
         env[HERMES_LARK_CLI_RUN_TOKEN] = generate_lark_cli_run_token()
+        # Terminal/code tools scrub secret-looking names before spawning, so a
+        # child only sees what was mirrored through the _HERMES_FORCE_ channel
+        # (_force_env_for_terminal_passthrough, called above at the credential
+        # and lark-cli layers — both run BEFORE this strict block). The run
+        # token therefore never reached the terminal, and the shim's self-serve
+        # lane stayed dead on the very path it was written for (2026-09-11
+        # production replay, profile sunke, session mtwo16zbocg27z).
+        #
+        # We mirror a NON-SECRET marker instead of the token. The token doubles
+        # as the AUTHORIZED password (authorized == run_token execs verbatim and
+        # skips the bot-identity narrowing), so a child that could read it would
+        # mint its own grant and walk straight past the one real gate. The
+        # marker buys nothing but self-serve — which every terminal child is
+        # getting anyway — so it being forgeable costs nothing.
+        env.update(_force_env_for_terminal_passthrough({HERMES_LARK_CLI_SELF_SERVE: "1"}))
         # Audit controls are SEALED at the end of this function from trusted
         # sources only (extra > gateway parent env > profile-local default) —
         # never set here, where a profile .env value merged above would win a
@@ -403,6 +423,12 @@ def _readonly_enabled_toolsets(toolsets: Optional[list[str]]) -> Optional[list[s
     return filtered or None
 
 
+# The inline-authorization toolset (alias of ``multitenancy_authorization``,
+# registered by ``request_authorization_tool`` at plugin import). Named by its
+# alias so the profile-facing switch and the default are the same string.
+_INLINE_AUTHORIZATION_TOOLSET = "request-authorization"
+
+
 def _resolve_enabled_toolsets(
     config: dict[str, Any],
     platform_key: str,
@@ -510,6 +536,30 @@ def _resolve_enabled_toolsets(
 
     if explicit_toolsets and not default_toolsets:
         default_toolsets = _fallback_default_toolsets(platform_key)
+
+    # Inline authorization ships ON for every WebUI tenant, without touching a
+    # single profile config.yaml. Listing it per profile was tried and does not
+    # hold: a config writer holding a pre-edit in-memory copy re-dumped
+    # profiles/sunke/config.yaml 40 minutes later and silently dropped the line
+    # (2026-09-09, lost update). Production is uniform here — every profile that
+    # pins platform_toolsets.webui does so in merge_default mode (2117/2117
+    # measured), so joining the DEFAULT set reaches all of them plus the 34 that
+    # pin nothing. explicit/strict/replace still wins: a profile that asks for a
+    # strict tool list keeps getting exactly that list, which is why this sits
+    # after the explicit-mode return above.
+    # WebUI only, deliberately: the tool needs a browser the owner is already
+    # logged into and the broker seam that verifies the credential live
+    # (see agent_real/run.py `_configure_webui_authorization_bridge`).
+    # `explicit_toolsets or default_toolsets` is the guard, not a nicety: with a
+    # missing resolver AND no profile list, this function returns None, which
+    # means "core decides — every toolset". Appending here would turn that into
+    # a one-item list and silently strip the tenant down to a single tool.
+    if (
+        platform_key == "webui"
+        and (explicit_toolsets or default_toolsets)
+        and _INLINE_AUTHORIZATION_TOOLSET not in default_toolsets
+    ):
+        default_toolsets = [*default_toolsets, _INLINE_AUTHORIZATION_TOOLSET]
 
     if explicit_toolsets:
         merged = sorted(set(default_toolsets) | set(explicit_toolsets))

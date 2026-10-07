@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import fcntl
 import time
 from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
+
+from tests._sync import SYNC_TIMEOUT
 
 
 class FakeVODClient:
@@ -45,7 +48,7 @@ def _success_detail(url="https://example.invalid/generated.png"):
     }
 
 
-def _wait_for_file(path: Path, timeout_s: float = 5.0) -> None:
+def _wait_for_file(path: Path, timeout_s: float = SYNC_TIMEOUT) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if path.exists():
@@ -59,12 +62,25 @@ def _vod_lock_worker(lock_dir: str, marker_dir: str, worker: str) -> None:
     os.environ["HERMES_VOD_LOCK_DIR"] = lock_dir
 
     marker_root = Path(marker_dir)
+    real_flock = fcntl.flock
+
+    def observed_flock(fd, operation):
+        if worker == "second" and operation == fcntl.LOCK_EX:
+            try:
+                real_flock(fd, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                (marker_root / "second.waiting").touch()
+            else:
+                raise AssertionError("second worker acquired first worker's lock")
+        return real_flock(fd, operation)
+
+    fcntl.flock = observed_flock
 
     class BlockingVODClient:
         def create_aigc_image_task(self, payload):
             (marker_root / f"{worker}.entered").write_text(str(time.monotonic()), encoding="utf-8")
             if worker == "first":
-                _wait_for_file(marker_root / "release-first", timeout_s=5.0)
+                _wait_for_file(marker_root / "release-first", timeout_s=SYNC_TIMEOUT)
             return {"TaskId": f"vod-task-{worker}", "RequestId": f"req-{worker}"}
 
         def describe_task_detail(self, payload):
@@ -299,13 +315,13 @@ def test_generate_serializes_vod_tasks_across_processes(tmp_path: Path):
     try:
         _wait_for_file(markers / "first.entered")
         second.start()
-        time.sleep(0.35)
+        _wait_for_file(markers / "second.waiting")
 
         assert not (markers / "second.entered").exists()
 
         (markers / "release-first").write_text("go", encoding="utf-8")
-        first.join(5)
-        second.join(5)
+        first.join(SYNC_TIMEOUT)
+        second.join(SYNC_TIMEOUT)
         assert first.exitcode == 0
         assert second.exitcode == 0
         assert (markers / "second.done").exists()

@@ -300,6 +300,13 @@ def _validate_experts(experts: Any, *, repo: Path, path: Path) -> None:
         skills = ex.get("skills")
         if skills is not None and not isinstance(skills, list):
             raise PluginIngestError(f"{path}: experts[{eid}].skills must be an array")
+        prompts = ex.get("sample_prompts")
+        if prompts is not None and (
+            not isinstance(prompts, list) or not all(isinstance(s, str) for s in prompts)
+        ):
+            raise PluginIngestError(
+                f"{path}: experts[{eid}].sample_prompts must be an array of strings"
+            )
         gov = ex.get("governance")
         if gov is not None and not isinstance(gov, dict):
             raise PluginIngestError(f"{path}: experts[{eid}].governance must be an object")

@@ -27,13 +27,21 @@ import pytest
 
 
 def _oauth_connector_ids() -> tuple[str, ...]:
+    """Connectors that front a real CLI binary and so need a headless stop gate.
+
+    Uses the same predicate as the runtime guard rather than re-deriving it, so
+    the enumeration here and the fail-closed check in
+    ``require_registered_oauth_cli_gates`` cannot drift. A remote mcp connector
+    (figma) is excluded there and here for the same reason: it puts no command on
+    the agent's PATH, so there is nothing to shim.
+    """
     from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
+    from hermes_multitenancy.oauth_cli_guard import requires_headless_cli_gate
 
     return tuple(
         connector_id
         for connector_id, definition in BUILTIN_CONNECTORS.items()
-        if definition.ui.action in {"oauth_url", "feishu_device_flow"}
-        and definition.invocation.detail
+        if requires_headless_cli_gate(definition)
     )
 
 
@@ -108,14 +116,34 @@ def test_every_registered_oauth_cli_has_a_headless_stop_gate(
     assert "token" not in rendered
 
 
+#: OAuth connectors deliberately exempt from the headless CLI stop gate. Each one
+#: must front a remote endpoint rather than a binary, which the test below
+#: re-verifies — the list alone is not enough to earn the exemption.
+_GATE_EXEMPT_OAUTH_CONNECTORS = {"figma"}
+
+
 def test_oauth_connector_inventory_is_complete():
+    """Every OAuth connector is either CLI-gated or an explicitly listed remote.
+
+    Stronger than the original equality: a new OAuth connector that fronts a CLI
+    still fails here, and an exemption has to be both named in
+    ``_GATE_EXEMPT_OAUTH_CONNECTORS`` AND genuinely be an ``mcp`` invocation, so
+    it cannot be claimed by editing the list alone.
+    """
     from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
 
-    assert set(_oauth_connector_ids()) == {
+    oauth_ids = {
         connector_id
         for connector_id, definition in BUILTIN_CONNECTORS.items()
         if definition.ui.action in {"oauth_url", "feishu_device_flow"}
     }
+    gated = set(_oauth_connector_ids())
+    assert gated <= oauth_ids
+    assert oauth_ids - gated == _GATE_EXEMPT_OAUTH_CONNECTORS
+    for connector_id in _GATE_EXEMPT_OAUTH_CONNECTORS:
+        definition = BUILTIN_CONNECTORS[connector_id]
+        assert definition.invocation.type == "mcp", connector_id
+        assert str(definition.invocation.detail or "").startswith("https://"), connector_id
 
 
 def test_unknown_registered_oauth_cli_detail_fails_closed_at_runtime(

@@ -89,11 +89,14 @@ def _register(ctx) -> None:
     mt = _mt()
     from . import webui_broker_server
     from .agent_real import real_run_agent
-    from .credential_tool import register_credential_status_tool
-    from .lark_cli_tool import (
+    from .credential_tool import register_credential_status_tool  # noqa: F401
+    from .lark_cli_tool import (  # noqa: F401
         post_lark_cli_operation,
         transform_lark_cli_operation_result,
     )
+    # Import for its side effect: the module registers `request_authorization`
+    # on the host tool registry at import time, exactly like lark_cli_tool.
+    from . import request_authorization_tool  # noqa: F401
     from .router import override_pool
     from .runtime import ProfileRuntime
 
@@ -102,8 +105,7 @@ def _register(ctx) -> None:
 
     override_pool(_build_runtime_pool(_real_factory))
     mt.install_gateway_ownership_guard()
-    from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
-    install_trusted_feishu_ingress_admission()
+    _install_trusted_feishu_ingress()
     # Make core skill resolution honor the CURRENT HERMES_HOME (not the frozen
     # import-time value). Unconditional: in the router gateway it fixes
     # cross-profile "skill not found" for cron jobs; in profile-native runtimes
@@ -121,8 +123,10 @@ def _register(ctx) -> None:
         install_feishu_bot_added_hook()
         from .feishu_media_retry import install_feishu_media_retry_patch
         install_feishu_media_retry_patch()
-        # ONE card-action dispatcher owns the live callback; the feature
-        # installers below only register/reuse their business handlers.
+        # ONE card-action dispatcher owns the live callback, installed BENEATH
+        # the trusted ingress installed above (the dispatcher slots itself under
+        # it), so every card callback is admitted before any handler runs. The
+        # feature installers below only register/reuse their business handlers.
         from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
         install_feishu_card_action_dispatcher()
         from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
@@ -170,6 +174,17 @@ def _register(ctx) -> None:
         webui_broker_server.ensure_run_broker_server_started()
         mt._start_credential_renewal_subsystem()
 
+    _register_ctx_surface(ctx)
+
+
+def _register_ctx_surface(ctx) -> None:
+    """What MT puts on one PluginManager: tools and hooks, no global patches."""
+    from .credential_tool import register_credential_status_tool
+    from .lark_cli_tool import (
+        post_lark_cli_operation,
+        transform_lark_cli_operation_result,
+    )
+
     register_credential_status_tool(ctx)
     _register_optional_vod_image_gen_provider(ctx)
     ctx.register_hook("post_tool_call", post_lark_cli_operation)
@@ -208,17 +223,23 @@ def _start_credential_renewal_subsystem() -> None:
         logger.exception("[credential_renewal] failed to resolve shared_home; subsystem disabled")
         return
 
-    try:
-        from .router import repair_group_profile_feishu_platforms
+    # Single-ingress invariant: a group profile that keeps its own Feishu
+    # listener opens a duplicate WebSocket for the shared bot. If the repair
+    # cannot guarantee that, refuse to start rather than run with two ingresses.
+    from .router import repair_group_profile_feishu_platforms
 
-        repair = repair_group_profile_feishu_platforms(shared_home=shared_home)
-        if repair["updated"]:
-            logger.info(
-                "[multitenancy] disabled duplicate Feishu listeners for %d group profile(s)",
-                repair["updated"],
-            )
-    except Exception:
-        logger.exception("[multitenancy] group Feishu listener repair failed")
+    repair = repair_group_profile_feishu_platforms(shared_home=shared_home)
+    if repair.get("errors"):
+        logger.critical(
+            "[multitenancy] group Feishu listener repair failed for %d group profile(s); refusing to start",
+            repair["errors"],
+        )
+        raise RuntimeError("group Feishu listener repair failed")
+    if repair.get("updated"):
+        logger.info(
+            "[multitenancy] disabled duplicate Feishu listeners for %d group profile(s)",
+            repair["updated"],
+        )
 
     try:
         mt.run_startup_audit(shared_home)
@@ -231,13 +252,22 @@ def _start_credential_renewal_subsystem() -> None:
         logger.exception("[credential_renewal] L2 renewal worker failed to start")
 
 
+def _install_trusted_feishu_ingress() -> None:
+    """Refuse startup when trusted Feishu admission cannot be installed."""
+    from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
+
+    install_trusted_feishu_ingress_admission()
+
+
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
     mt = _mt()
     try:
         from . import webui_broker_server
         from .trusted_feishu_ingress import validate_admitted_feishu_event
-        if not validate_admitted_feishu_event(kwargs.get("event"), kwargs.get("gateway")):
+        if not validate_admitted_feishu_event(
+            kwargs.get("event"), kwargs.get("gateway")
+        ):
             logger.warning("[multitenancy] trusted Feishu ingress denied before dispatch")
             return {"action": "skip", "reason": "trusted Feishu ingress denied"}
         if mt.is_router_profile_runtime():

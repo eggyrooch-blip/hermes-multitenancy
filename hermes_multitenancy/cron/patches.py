@@ -215,13 +215,26 @@ def install_gateway_startup_watcher() -> None:
     async watcher on the same event loop. Once the gateway's adapter map is
     populated, the normal worker start path receives the live gateway object.
     """
-    global _gateway_watcher_installed
     if _gateway_watcher_installed:
         return
+    # Deferred until gateway.run finishes loading: importing it here, inside
+    # core's plugin discovery, deadlocks startup (see gateway_run_ready).
+    from ..gateway_run_ready import when_gateway_run_loaded
+
     try:
-        from gateway.run import GatewayRunner
+        when_gateway_run_loaded("gateway_cron_startup_watcher", _install_gateway_startup_watcher_on)
     except Exception:
         logger.exception("[multitenancy] failed to install gateway cron startup watcher")
+
+
+def _install_gateway_startup_watcher_on(gateway_run: Any) -> None:
+    # No early return on _gateway_watcher_installed: after a failed deferred
+    # batch the retried import brings a fresh GatewayRunner, and only the
+    # per-method marker below tells whether THAT class is wrapped.
+    global _gateway_watcher_installed
+    GatewayRunner = getattr(gateway_run, "GatewayRunner", None)
+    if GatewayRunner is None:
+        logger.error("[multitenancy] failed to install gateway cron startup watcher: no GatewayRunner")
         return
 
     original = getattr(GatewayRunner, "_create_adapter", None)

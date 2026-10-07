@@ -115,6 +115,7 @@ def test_register_adds_tencent_vod_image_provider_when_supported():
             image_providers.append(provider)
 
     register(FakeCtx())
+
     assert [name for name, _cb in hook_calls] == [
         "post_tool_call",
         "transform_tool_result",
@@ -172,6 +173,41 @@ def test_router_startup_repairs_group_feishu_listeners_before_credential_workers
     plugin_entry._start_credential_renewal_subsystem()
 
     assert calls == [("repair", tmp_path), ("audit", tmp_path), ("worker", tmp_path)]
+
+
+def test_router_startup_refuses_when_group_feishu_repair_cannot_write(monkeypatch, tmp_path):
+    # Review P1 (repair-fails-open): a stale group profile that cannot be
+    # rewritten must stop router startup instead of keeping a duplicate
+    # Feishu listener enabled.
+    import pytest
+
+    import hermes_multitenancy
+    from hermes_multitenancy import feishu_uat_auth, plugin_entry
+    from hermes_multitenancy.router import provisioning
+
+    group = tmp_path / "profiles" / "feishu_group_locked"
+    group.mkdir(parents=True)
+    (group / "config.yaml").write_text(
+        "platforms:\n  feishu:\n    enabled: true\n", encoding="utf-8"
+    )
+
+    def replace_denied(_src, _dst):
+        raise PermissionError("read-only profile directory")
+
+    monkeypatch.setattr(provisioning.os, "replace", replace_denied)
+    calls: list[str] = []
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(hermes_multitenancy, "run_startup_audit", lambda home: calls.append("audit"))
+    monkeypatch.setattr(
+        hermes_multitenancy, "ensure_renewal_worker_started", lambda home: calls.append("worker")
+    )
+
+    with pytest.raises(RuntimeError, match="group Feishu listener repair failed"):
+        plugin_entry._start_credential_renewal_subsystem()
+
+    assert calls == []
+    assert "enabled: true" in (group / "config.yaml").read_text(encoding="utf-8")
+    assert not list(group.glob(".config.yaml.tmp.*"))
 
 
 def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_media_retry(monkeypatch):
@@ -391,3 +427,58 @@ def test_attribute_probing_never_imports_an_unaudited_submodule():
         pkg.__getattr__("tencent_vod_image_gen")
 
     assert pkg.__getattr__("webui_broker_server").__name__.endswith("webui_broker_server")
+
+
+class _ManagerCtx:
+    """PluginContext shape: hooks land on the owning manager (``ctx._manager``)."""
+
+    def __init__(self, manager):
+        self._manager = manager
+        self.hooks = []
+
+    def register_hook(self, name, callback):
+        self.hooks.append((name, callback))
+
+
+def test_same_module_on_another_plugin_manager_only_shares_hooks(monkeypatch):
+    """Entry-point-only topology: a tenant home's manager re-imports the SAME
+    module name; it must get MT's hooks without re-running the full register."""
+    import hermes_multitenancy
+    from hermes_multitenancy import plugin_entry
+
+    full_runs = []
+    monkeypatch.setattr(hermes_multitenancy, "_register", lambda ctx: full_runs.append(ctx))
+    router_manager, tenant_manager = object(), object()
+
+    hermes_multitenancy.register(_ManagerCtx(router_manager))
+    tenant_ctx = _ManagerCtx(tenant_manager)
+    hermes_multitenancy.register(tenant_ctx)
+
+    assert len(full_runs) == 1
+    assert [name for name, _ in tenant_ctx.hooks] == [
+        "post_tool_call", "transform_tool_result", "pre_gateway_dispatch",
+    ]
+    assert dict(tenant_ctx.hooks)["pre_gateway_dispatch"] is plugin_entry._dispatch_with_worker_init
+    assert sys._hermes_multitenancy_registered_manager is router_manager
+    # A force re-discover on the owner's own manager keeps the full registration.
+    hermes_multitenancy.register(_ManagerCtx(router_manager))
+    assert len(full_runs) == 2
+
+
+def test_failed_registration_clears_owner_markers(monkeypatch):
+    import hermes_multitenancy
+
+    def boom(ctx):
+        raise RuntimeError("install failed")
+
+    monkeypatch.setattr(hermes_multitenancy, "_register", boom)
+    with pytest.raises(SystemExit):
+        hermes_multitenancy.register(_ManagerCtx(object()))
+    assert not hasattr(sys, "_hermes_multitenancy_registered_module")
+    assert not hasattr(sys, "_hermes_multitenancy_registered_manager")
+
+    # Nothing is left claiming ownership: the next manager gets a full register.
+    full_runs = []
+    monkeypatch.setattr(hermes_multitenancy, "_register", lambda ctx: full_runs.append(ctx))
+    hermes_multitenancy.register(_ManagerCtx(object()))
+    assert len(full_runs) == 1

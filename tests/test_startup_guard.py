@@ -76,6 +76,59 @@ def test_authenticated_broker_health_is_required(monkeypatch):
     startup_guard.wait_run_broker(env={"HERMES_MULTITENANCY_RUN_BROKER_KEY": "present"})
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 20.0), ("", 20.0), ("300", 300.0), (" 45.5 ", 45.5)],
+)
+def test_wait_broker_deadline_comes_from_unit_environment(monkeypatch, raw, expected):
+    env = {"HERMES_MULTITENANCY_RUN_BROKER_KEY": "present"}
+    if raw is not None:
+        env["HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS"] = raw
+    clock = {"now": 1000.0}
+    deadlines = []
+
+    def urlopen(request, timeout):
+        deadlines.append(clock["now"])
+        raise OSError("broker not up yet")
+
+    def sleep(seconds):
+        clock["now"] += 50.0
+
+    monkeypatch.setattr(startup_guard, "urlopen", urlopen)
+    monkeypatch.setattr(startup_guard.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(startup_guard.time, "sleep", sleep)
+    assert startup_guard.run_broker_wait_seconds(env) == expected
+    with pytest.raises(startup_guard.StartupGuardError, match="run_broker_unhealthy"):
+        startup_guard.wait_run_broker(env=env)
+    # Probes stop at the first attempt at/after start + configured wait.
+    assert deadlines[-1] - 1000.0 >= expected
+    assert deadlines[-1] - 1000.0 < expected + 50.0
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-5", "nan", "inf", "3601"])
+def test_wait_broker_rejects_invalid_wait_seconds(raw):
+    env = {
+        "HERMES_MULTITENANCY_RUN_BROKER_KEY": "present",
+        "HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS": raw,
+    }
+    with pytest.raises(startup_guard.StartupGuardError, match="run_broker_wait_invalid"):
+        startup_guard.wait_run_broker(env=env)
+
+
+def test_required_dropin_waits_for_slow_production_broker():
+    """05-multitenancy-required.conf replaces the temporary 99-tmp-wait-broker drop-in."""
+    template = Path(__file__).resolve().parents[1] / "deploy" / "hermes-gateway-multitenancy-required.conf"
+    rendered = template.read_text().replace("@PYTHON@", "/venv/bin/python")
+    lines = [line.strip() for line in rendered.splitlines() if line.strip() and not line.startswith("#")]
+    assert lines[0] == "[Service]"
+    assert "Environment=HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS=300" in lines
+    assert "TimeoutStartSec=400" in lines
+    assert "ExecStartPost=/venv/bin/python -m hermes_multitenancy.startup_guard wait-broker" in lines
+    wait = float(next(l for l in lines if l.startswith("Environment=HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS=")).split("=")[-1])
+    assert startup_guard.run_broker_wait_seconds({"HERMES_MULTITENANCY_RUN_BROKER_WAIT_SECONDS": str(int(wait))}) == 300.0
+    assert wait < 400
+
+
 @pytest.mark.parametrize("cohort", ["", "*", "employee_a,*"])
 def test_preflight_rejects_enabled_billing_without_finite_canary(
     monkeypatch, tmp_path, cohort

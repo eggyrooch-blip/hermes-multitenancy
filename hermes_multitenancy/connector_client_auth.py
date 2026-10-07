@@ -20,6 +20,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
+from .shared_db import connect_shared
 from .trusted_runtime_principal import TrustedRuntimePrincipal
 
 
@@ -37,9 +38,8 @@ class ClientTokenStore:
         self.issuer = _http_url(issuer, "issuer")
         self.resource = _http_url(resource, "resource")
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn = connect_shared(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS multitenancy_mcp_client_tokens (

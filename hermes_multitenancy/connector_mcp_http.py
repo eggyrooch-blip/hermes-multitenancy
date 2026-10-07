@@ -1,6 +1,8 @@
 """Standard Streamable HTTP surface for owner-scoped Hermes connectors."""
 from __future__ import annotations
 
+from .compat.mcp_server import handler
+
 import argparse
 import json
 import os
@@ -110,11 +112,11 @@ def create_connector_mcp_http_app(
         allowed_tools[principal_key(principal)] = {tool.name for tool in rows}
         return result
 
-    @server.list_tools()
+    @handler(server, "list_tools")
     async def handle_list_tools():
         return await owner_tools(_principal(issuer=issuer, resource=resource))
 
-    @server.call_tool()
+    @handler(server, "call_tool")
     async def handle_call_tool(name: str, arguments: dict[str, Any]):
         principal = _principal(issuer=issuer, resource=resource)
         key = principal_key(principal)
@@ -131,11 +133,11 @@ def create_connector_mcp_http_app(
             allowed_prompts[principal_key(principal)] = {prompt.name for prompt in rows}
             return result
 
-        @server.list_prompts()
+        @handler(server, "list_prompts")
         async def handle_list_prompts():
             return await owner_prompts(_principal(issuer=issuer, resource=resource))
 
-        @server.get_prompt()
+        @handler(server, "get_prompt")
         async def handle_get_prompt(name: str, arguments: dict[str, str] | None):
             principal = _principal(issuer=issuer, resource=resource)
             key = principal_key(principal)
@@ -152,11 +154,11 @@ def create_connector_mcp_http_app(
             allowed_resources[principal_key(principal)] = {str(item.uri) for item in rows}
             return result
 
-        @server.list_resources()
+        @handler(server, "list_resources")
         async def handle_list_resources():
             return await owner_resources(_principal(issuer=issuer, resource=resource))
 
-        @server.read_resource()
+        @handler(server, "read_resource")
         async def handle_read_resource(uri: AnyUrl):
             principal = _principal(issuer=issuer, resource=resource)
             key = principal_key(principal)

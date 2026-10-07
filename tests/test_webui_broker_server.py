@@ -20,6 +20,9 @@ async def _read_sse_data_line(response, *, timeout: float = 2.0):
     while True:
         line = await asyncio.wait_for(response.content.readline(), timeout=timeout)
         if line.startswith(b"data: "):
+            # The lifecycle handshake precedes content/control frames.
+            if json.loads(line[len(b"data: "):]).get("kind") == "run_started":
+                continue
             return line
 
 
@@ -914,10 +917,18 @@ def test_internal_session_search_broker_uses_parent_profile_db(monkeypatch, tmp_
         try:
             response = await client.post(
                 "/api/run-broker/internal/session-search",
-                json={"query": "HERMES_PROXY_SEARCH_MARKER", "limit": 3},
+                json={"query": "HERMES_PROXY_SEARCH_MARKER", "limit": 3, "detail": "full", "after": "2000-01-01", "before": "2100-01-01"},
                 headers={"Authorization": f"Bearer {token}"},
             )
             body = await response.json()
+            for filters in ({"exclude_session_ids": ["session-one"]}, {"before": "2000-01-01"}, {"after": "2100-01-01"}):
+                filtered = await client.post(
+                    "/api/run-broker/internal/session-search",
+                    json={"query": "HERMES_PROXY_SEARCH_MARKER", **filters},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert filtered.status == 200
+                assert json.loads((await filtered.json())["result"])["count"] == 0
         finally:
             await client.close()
             broker.unregister_session_search_broker_token(token)
@@ -927,6 +938,7 @@ def test_internal_session_search_broker_uses_parent_profile_db(monkeypatch, tmp_
         assert result["success"] is True
         assert result["count"] == 1
         assert result["results"][0]["session_id"] == "session-one"
+        assert result["detail"] == "full"
 
     asyncio.run(runner())
 
@@ -1132,6 +1144,80 @@ def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_
         assert '"kind": "done"' in body
 
     asyncio.run(runner())
+
+
+def test_webui_run_broker_forwards_reasoning_effort_metadata(monkeypatch, tmp_path: Path):
+    """WebUI 档位选择器的 `metadata.reasoning_effort` 必须原样到达 agent 事件。
+
+    broker 侧最后一跳（`agent_real/run.py::_reasoning_config_for_event` 把它翻成
+    `agent_kwargs["reasoning_config"]`）只有在这个键活着到达 `event.raw_event`
+    时才有意义；`_sanitize_ingest_metadata` 只剥 `_trusted_*` 和 ingest 保留键，
+    这条用例钉住它不会顺手把未知键也剥掉。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    seen_metadata: list[dict] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        seen_metadata.append(dict(event.raw_event.get("metadata") or {}))
+        yield "content", "ok"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("stream_run_agent should satisfy the request")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "think hard",
+                "session_id": "session-reasoning",
+                "requires_host_tools": True,
+                "metadata": {"reasoning_effort": "high", "model": "glm-5.1"},
+            })
+            body = await response.text()
+            assert response.status == 200
+            assert '"kind": "content"' in body
+
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "no slider",
+                "session_id": "session-reasoning-default",
+                "requires_host_tools": True,
+            })
+            assert response.status == 200
+            await response.text()
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+    assert len(seen_metadata) == 2
+    assert seen_metadata[0]["reasoning_effort"] == "high"
+    assert seen_metadata[0]["model"] == "glm-5.1"
+    # 没带滑杆时不得凭空造一个键 —— 下游据此保持 profile 默认。
+    assert "reasoning_effort" not in seen_metadata[1]
 
 
 def test_webui_run_broker_requests_replay_distinct_child_sessions(monkeypatch, tmp_path: Path):
@@ -2089,7 +2175,6 @@ def test_webui_streamed_remote_media_additions_runs_scoping_off_event_loop(tmp_p
 
 def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monkeypatch, tmp_path):
     import threading
-    import time
 
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -2107,9 +2192,9 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
     seeded.close()
     router_mod.override_routing_table(db_path)
 
-    def acquire_cron_patch_lock():
-        with cron_worker._cron_module_patch_lock:
-            return "released"
+    release_lock = threading.Event()
+    list_started = threading.Event()
+    lock_timed_out = threading.Event()
 
     def start_lock_holder():
         held = threading.Event()
@@ -2117,49 +2202,21 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
         def holder():
             with cron_worker._cron_module_patch_lock:
                 held.set()
-                # 2s(不是 0.4s):给 10ms 采样 sentinel 留 ~200 次机会。满载 CI
-                # runner 上 0.4s 只让它跑了 2 tick,route_ticks >= 5 假红。
-                time.sleep(2.0)
+                if not release_lock.wait(timeout=SYNC_TIMEOUT):
+                    lock_timed_out.set()
 
         thread = threading.Thread(target=holder, daemon=True)
         thread.start()
         assert held.wait(timeout=SYNC_TIMEOUT)
         return thread
 
-    async def measure_ticks(awaitable_factory):
-        done = asyncio.Event()
-        ticks = 0
-
-        async def sentinel():
-            nonlocal ticks
-            while not done.is_set():
-                ticks += 1
-                await asyncio.sleep(0.01)
-
-        sentinel_task = asyncio.create_task(sentinel())
-        await asyncio.sleep(0)
-        try:
-            result = await awaitable_factory()
-        finally:
-            done.set()
-            await sentinel_task
-        return result, ticks
-
-    async def call_directly():
-        return acquire_cron_patch_lock()
-
     async def runner():
-        direct_holder = start_lock_holder()
-        try:
-            _result, direct_ticks = await measure_ticks(call_directly)
-        finally:
-            direct_holder.join(timeout=SYNC_TIMEOUT)
-
         list_jobs_calls: list[tuple[str, bool, int]] = []
         loop_thread = threading.get_ident()
 
         def blocking_list_jobs(profile_name, include_disabled=False):
             list_jobs_calls.append((profile_name, include_disabled, threading.get_ident()))
+            list_started.set()
             with cron_worker._cron_module_patch_lock:
                 return [{"id": "abc123abc123"}]
 
@@ -2176,26 +2233,35 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
         try:
             route_holder = start_lock_holder()
             try:
-                response, route_ticks = await measure_ticks(
-                    lambda: client.get(
-                        "/api/run-broker/jobs?include_disabled=true",
-                        headers={
-                            "Authorization": "Bearer broker-secret",
-                            "X-Hermes-Profile": "owner",
-                            "X-Hermes-User-Key": "ou_owner",
-                        },
-                    )
+                async def sentinel():
+                    while not list_started.is_set():
+                        await asyncio.sleep(0.01)
+                    # The route is inside list_jobs and the lock is still held.
+                    # Only a live event loop can make these five turns and release it.
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    release_lock.set()
+
+                sentinel_task = asyncio.create_task(sentinel())
+                response = await client.get(
+                    "/api/run-broker/jobs?include_disabled=true",
+                    headers={
+                        "Authorization": "Bearer broker-secret",
+                        "X-Hermes-Profile": "owner",
+                        "X-Hermes-User-Key": "ou_owner",
+                    },
                 )
+                await asyncio.wait_for(sentinel_task, timeout=SYNC_TIMEOUT)
                 body = await response.json()
             finally:
+                release_lock.set()
                 route_holder.join(timeout=SYNC_TIMEOUT)
         finally:
             await client.close()
 
         # Regression for the 2026-06-16 gateway deadlock: waiting on the cron
         # patch lock must happen off the aiohttp event loop.
-        assert direct_ticks <= 1
-        assert route_ticks >= 5
+        assert not lock_timed_out.is_set()
         assert response.status == 200
         assert body == {"jobs": [{"id": "abc123abc123"}]}
         assert list_jobs_calls == [("owner", True, list_jobs_calls[0][2])]
@@ -2248,6 +2314,9 @@ def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_
                 "requires_host_tools": True,
             }))
             response = await asyncio.wait_for(post_task, timeout=SYNC_TIMEOUT)
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=SYNC_TIMEOUT)
+            assert b'"kind": "run_started"' in first_line
+            assert await response.content.readline() == b"\n"
             first_line = await asyncio.wait_for(response.content.readline(), timeout=SYNC_TIMEOUT)
             assert b'"kind": "thinking"' in first_line
             assert "正在连接模型".encode("utf-8") in first_line
@@ -3690,7 +3759,8 @@ def test_shared_agent_credential_lease_uses_actor_feishu_uat(monkeypatch, tmp_pa
     assert calls == [(tmp_path, "owned_agent_profile", "ou_viewer")]
 
 
-def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("share_role", ["viewer", "editor"])
+def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path, share_role):
     from aiohttp.test_utils import TestClient, TestServer
     from hermes_state import SessionDB
     from tools import session_search_tool
@@ -3703,6 +3773,7 @@ def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path
     db = SessionDB(db_path=profile_home / "state.db")
     try:
         db.create_session("owner-session", source="api_server", user_id="ou_owner")
+        db.set_session_title("owner-session", "OWNER_PRIVATE_TITLE")
         db.append_message(
             session_id="owner-session",
             role="user",
@@ -3730,7 +3801,7 @@ def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path
         open_id="ou_viewer",
         run_id="run-search",
         agent_id="agent-shared",
-        share_role="viewer",
+        share_role=share_role,
     )
 
     async def runner():
@@ -3744,6 +3815,20 @@ def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path
                 headers={"Authorization": f"Bearer {token}"},
             )
             body = await response.json()
+            for query in ("", "OWNER_PRIVATE_TITLE"):
+                scoped = await client.post(
+                    "/api/run-broker/internal/session-search",
+                    json={"query": query, "limit": 5},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert scoped.status == 200
+                scoped_result = json.loads((await scoped.json())["result"])
+                assert scoped_result["success"] is True
+                assert "owner-session" not in json.dumps(scoped_result)
+                assert "owner-only context" not in json.dumps(scoped_result)
+                assert all(row.get("title") != "OWNER_PRIVATE_TITLE" for row in scoped_result["results"])
+                if not query:
+                    assert [row["session_id"] for row in scoped_result["results"]] == ["viewer-session"]
         finally:
             await client.close()
             broker.unregister_session_search_broker_token(token)

@@ -17,10 +17,20 @@ Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin
 # 版本升级导致这个数字合理变化时，要连同代码评审一起改。
 Environment=PATCH_MIN=16
 Environment=KEEP_RELEASES=3
+# 发布前回滚包默认不裁（「不删备份」红线，2026-09-24）。要设上限须 sunke 批准后
+# 显式加 Environment=KEEP_PRERELEASE_BACKUPS=<正整数>（一份 ~170MB，盘压见 DEBT D8）。
 # 关键：跑「稳定路径」上的那份，不是 code 软链下面的那份。
 # 执行器不能住在它自己要改写的那棵树里 —— 否则发一个坏版本就把下次部署
 # 和回滚工具一起弄坏，连退路都没有。这份只在发布成功之后才被同步更新。
 Environment=STABLE_BIN=/home/hermes/.local/lib/hermes-release
+# webui 产物下载用的 GitLab deploy token。`-` 前缀 = 文件不存在也照常启动
+# （没有 token 就退回原地构建，慢但不会发不出版本）。
+# 怎么造这个文件：GitLab 项目 2829（hermes-web-ui）→ Settings → Repository →
+# Deploy tokens，scope 只勾 read_package_registry，然后在生产上：
+#   install -m 600 /dev/null ~/.hermes/release.env
+#   printf 'HERMES_RELEASE_PKG_TOKEN=%s\n' '<token>' > ~/.hermes/release.env
+# 权限必须是 600 且属主是 hermes —— 发布器会自己复查，松了就拒用产物。
+EnvironmentFile=-%h/.hermes/release.env
 ExecStart=/home/hermes/.local/lib/hermes-release/hermes-release.sh
 # 构建 webui 要几分钟，别抢生产 IO；但不能用 idle 类（会被饿死，2026-08-01 实测）
 Nice=10

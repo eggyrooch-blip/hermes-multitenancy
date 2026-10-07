@@ -613,7 +613,9 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
             # The rejection stays visible to operators in the log line.
             logger.info("[card_action] kind=business outcome=rejected")
             return unsupported_response()
-        return _run_once(cb, entry.namespace, lambda: entry.handler(adapter, cb))
+        return _run_once(
+            cb, entry.namespace, lambda: entry.handler(adapter, cb), dispatched_kind="business"
+        )
 
     logger.info("[card_action] kind=unknown outcome=unsupported")
     return unsupported_response()
@@ -668,13 +670,30 @@ def _business_admission_is_valid(adapter: Any, cb: CardCallback) -> bool:
         return False
 
 
-def _run_once(cb: CardCallback, name: str, run: Callable[[], Any]) -> Any:
+def _run_once(
+    cb: CardCallback,
+    name: str,
+    run: Callable[[], Any],
+    *,
+    dispatched_kind: Optional[str] = None,
+) -> Any:
     """Run a RECOGNIZED handler at most once per callback, and consume its
     failure. Core delegation is excluded on purpose: core owns its own
-    ``_is_card_action_duplicate`` token guard and approval state."""
+    ``_is_card_action_duplicate`` token guard and approval state.
+
+    ``dispatched_kind`` logs one ``outcome=dispatched`` line once the claim is
+    won, before the handler runs. It only says the click was handed to the
+    handler — not that the handler saved anything. On core 0.21.4 plugin
+    registration (and so the install log) happens before gateway logging is
+    configured, so this per-click line is the observable proof the dispatcher
+    is live beneath ingress."""
     if not _claim_once(callback_identity(cb)):
         logger.info("[card_action] kind=%s outcome=duplicate", name)
         return unsupported_response()
+    if dispatched_kind:
+        logger.info(
+            "[card_action] kind=%s namespace=%s outcome=dispatched", dispatched_kind, name
+        )
     try:
         return run()
     except Exception:
@@ -718,9 +737,18 @@ def install_feishu_card_action_dispatcher(FeishuAdapter: Any = None) -> bool:
                 logger.debug("[card_action] dispatcher install deferred", exc_info=True)
             return False
 
-    original = getattr(FeishuAdapter, "_on_card_action_trigger", None)
-    if original is None:
+    from .feishu_ingress_compat import INGRESS_CALLBACK_FLAG, INGRESS_INNER_ATTR
+
+    current = getattr(FeishuAdapter, "_on_card_action_trigger", None)
+    if current is None:
         return False
+    # Trusted ingress must stay the OUTERMOST layer: it signs the ticket and
+    # admits the actor that business handlers then check, and built-ins must
+    # never run on a callback it has not admitted. When ingress is already
+    # installed (plugin_entry installs it first; deferred / re-arm installs come
+    # later still), slot the dispatcher in beneath it.
+    beneath_ingress = bool(getattr(current, INGRESS_CALLBACK_FLAG, False))
+    original = getattr(current, INGRESS_INNER_ATTR) if beneath_ingress else current
     if getattr(original, _DISPATCHER_FLAG, False):
         return True
 
@@ -728,12 +756,18 @@ def install_feishu_card_action_dispatcher(FeishuAdapter: Any = None) -> bool:
     def wrapped(self: Any, data: Any) -> Any:
         return dispatch_card_action(self, data, original)
 
-    setattr(wrapped, _DISPATCHER_FLAG, True)
-    for flag in _LEGACY_FLAGS:
+    flags = (_DISPATCHER_FLAG, *_LEGACY_FLAGS)
+    for flag in flags:
         setattr(wrapped, flag, True)
-    FeishuAdapter._on_card_action_trigger = wrapped
+    if beneath_ingress:
+        setattr(current, INGRESS_INNER_ATTR, wrapped)
+        for flag in flags:
+            setattr(current, flag, True)
+    else:
+        FeishuAdapter._on_card_action_trigger = wrapped
     logger.info(
-        "[card_action] installed the card-action dispatcher on %s.FeishuAdapter",
+        "[card_action] installed the card-action dispatcher on %s.FeishuAdapter (%s)",
         getattr(FeishuAdapter, "__module__", "?"),
+        "beneath trusted ingress" if beneath_ingress else "no trusted ingress yet",
     )
     return True

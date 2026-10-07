@@ -32,6 +32,7 @@ _AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
     # credential decision input, so it must be per-run only.
     "HERMES_FEISHU_USER_OPEN_ID",
     "HERMES_MULTITENANCY_APPROVAL_DIR",
+    "HERMES_MULTITENANCY_AUTHORIZATION_DIR",
     "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
     "HERMES_MULTITENANCY_CRED_LEASE",
     "HERMES_MULTITENANCY_RUN_ID",
@@ -47,6 +48,39 @@ _AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
 
 def _aiagent_warm_worker_enabled() -> bool:
     return os.getenv("HERMES_AIAGENT_WARM_WORKER") == "1"
+
+
+_AIAGENT_WARM_SLOT_WAIT_TIMEOUT_DEFAULT_S = 120.0
+
+
+def _aiagent_warm_slot_wait_timeout_s() -> float:
+    """Bounded wait for the per-profile slot before the one-shot fallback runs.
+
+    Unbounded was the 2026-09-11 incident: a queued run waited forever behind a
+    leaked lock with no log line and no error. 120s comfortably covers the
+    normal "previous turn still finishing" case without parking a user's
+    message for the whole of a multi-minute tool run.
+    """
+    raw = os.getenv("HERMES_AIAGENT_WARM_SLOT_WAIT_TIMEOUT", "")
+    try:
+        value = float(raw) if raw.strip() else _AIAGENT_WARM_SLOT_WAIT_TIMEOUT_DEFAULT_S
+    except ValueError:
+        value = _AIAGENT_WARM_SLOT_WAIT_TIMEOUT_DEFAULT_S
+    return _clamp_slot_wait_timeout(value)
+
+
+def _clamp_slot_wait_timeout(value: float) -> float:
+    """Finite, positive, and no larger than the platform lock timeout ceiling."""
+    import math
+
+    if not math.isfinite(value) or value <= 0:
+        return _AIAGENT_WARM_SLOT_WAIT_TIMEOUT_DEFAULT_S
+    return min(value, float(threading.TIMEOUT_MAX))
+
+
+# How often a parked run re-checks the slot. The run is idle while parked, so
+# this is pure latency (≤ one interval after release), not CPU.
+_AIAGENT_WARM_SLOT_POLL_S = 0.05
 
 
 def _aiagent_warm_profile_key(profile_home: Path) -> str:
@@ -139,12 +173,77 @@ class _AiagentWarmWorker:
         self.profile_home = profile_home
         self.proc: Any = None
         self._lock = profile_lock or threading.Lock()
+        self._slot_waiters_count = 0
+        self._slot_waiters_guard = threading.Lock()
 
-    async def acquire_run(self) -> _AiagentWarmRun:
+    def _slot_waiters(self) -> int:
+        """Runs currently parked in ``acquire_run`` (diagnostics/tests)."""
+        with self._slot_waiters_guard:
+            return self._slot_waiters_count
+
+    async def acquire_run(self, wait_timeout_s: float | None = None) -> _AiagentWarmRun:
+        """Take the per-profile slot; cancel-safe and time-bounded.
+
+        The slot is a ``threading.Lock`` shared across event loops (see
+        ``test_aiagent_warm_worker_slot_serializes_across_event_loops``), so it
+        cannot simply become an ``asyncio.Lock``. The previous implementation
+        parked a worker thread in ``lock.acquire()`` with no timeout; when the
+        awaiting coroutine was cancelled (the router aborts the previous
+        dispatch when the user's next message arrives) the thread still took
+        the lock later and nothing released it — the profile was wedged until
+        the gateway restarted, silently, right after the ``turn_tool_context``
+        log line (incident 2026-09-11..15, profile ``zhengshi``).
+
+        Now the wait is a non-blocking ``acquire(False)`` poll from the event
+        loop itself:
+
+        * no thread ever holds the lock on our behalf, so a cancel (which can
+          only land at the ``await asyncio.sleep``) has nothing to compensate;
+        * the deadline is monotonic and covers the whole wait — there is no
+          executor queue that could stretch it (review B1);
+        * on timeout we raise so the caller's existing
+          "slot unavailable → one-shot subprocess" fallback runs instead of an
+          unbounded silent park.
+        """
         import asyncio
 
-        await asyncio.to_thread(self._lock.acquire)
-        return _AiagentWarmRun(self, self._lock)
+        timeout_s = (
+            _aiagent_warm_slot_wait_timeout_s()
+            if wait_timeout_s is None
+            else _clamp_slot_wait_timeout(float(wait_timeout_s))
+        )
+        lock = self._lock
+        if lock.acquire(False):
+            return _AiagentWarmRun(self, lock)
+
+        logger.info(
+            "[multitenancy] AIAgent warm worker slot busy; waiting profile_home=%s timeout=%.0fs",
+            self.profile_home,
+            timeout_s,
+        )
+        started = time.monotonic()
+        deadline = started + timeout_s
+        with self._slot_waiters_guard:
+            self._slot_waiters_count += 1
+        try:
+            while True:
+                # Cancellation lands here. We hold nothing, so nothing leaks.
+                await asyncio.sleep(_AIAGENT_WARM_SLOT_POLL_S)
+                if lock.acquire(False):
+                    logger.info(
+                        "[multitenancy] AIAgent warm worker slot acquired after wait profile_home=%s waited=%.1fs",
+                        self.profile_home,
+                        time.monotonic() - started,
+                    )
+                    return _AiagentWarmRun(self, lock)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"AIAgent warm worker slot still busy after {timeout_s:.0f}s "
+                        f"profile_home={self.profile_home}"
+                    )
+        finally:
+            with self._slot_waiters_guard:
+                self._slot_waiters_count -= 1
 
     async def _ensure_started(self, timeout_s: float) -> None:
         import asyncio

@@ -589,7 +589,9 @@ def test_codex_thread_resume_scope_preserves_turn_error_when_close_fails():
     assert agent._codex_session is None
 
 
-def test_pinned_real_codex_session_close_is_sync_and_waits_for_process():
+def test_pinned_real_codex_session_close_is_sync_and_waits_for_process(monkeypatch):
+    import threading
+    from agent.transports import codex_app_server
     from agent.transports.codex_app_server import CodexAppServerClient
     from agent.transports.codex_app_server_session import CodexAppServerSession
 
@@ -600,6 +602,7 @@ def test_pinned_real_codex_session_close_is_sync_and_waits_for_process():
             self.closed = True
 
     class FakeProcess:
+        pid = 123456789
         stdin = FakeStdin()
         terminated = False
         killed = False
@@ -619,7 +622,11 @@ def test_pinned_real_codex_session_close_is_sync_and_waits_for_process():
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
     client._closed = False
+    client._pending_lock = threading.Lock()
+    client._pending = {}
     client._proc = FakeProcess()
+    monkeypatch.setattr(codex_app_server, "_snapshot_descendants", lambda _pid: [])
+    monkeypatch.setattr(codex_app_server, "kill_process_tree", lambda pid: client._proc.kill())
     session = CodexAppServerSession()
     session._client = client
     session._thread_id = "thread_bound"

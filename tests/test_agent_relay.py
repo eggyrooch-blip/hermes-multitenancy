@@ -1591,10 +1591,64 @@ def test_update_card_ships_the_composed_card_not_the_raw_argument():
         "Status: actioned (approve)"
     )
 
-    # caller content → verbatim, not re-wrapped
+    # caller content → verbatim, not re-wrapped; only config.update_multi is filled in
     caller = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "done"}]}}
     client._update_card(message_id="om_x", content=caller)
-    assert json.loads(sent[-1]["body"]["content"]) == caller
+    assert json.loads(sent[-1]["body"]["content"]) == {**caller, "config": {"update_multi": True}}
+    assert "config" not in caller, "调用方的字典不能被就地改写"
+
+
+def test_cards_go_out_as_shared_cards():
+    """卡片出站必须带 config.update_multi —— 独享卡片被 PATCH 更新后不保证持久化，
+    客户端冷启动重新拉取会渲染回原始内容（飞书官方 2026-09-15 定论，2026-09-10 的
+    受控实验里 5 张单点卡回退了 3 张）。官方明确必须**首次发送**就声明，PATCH 时补
+    无效，所以发送那条路是治本；更新那条路也补，是因为 PATCH 是整体替换语义，
+    调用方给的新内容漏掉这个字段就有把共享卡打回独享的风险。
+    """
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    client = FeishuRelayClient.__new__(FeishuRelayClient)
+    sent: list[dict] = []
+    client._tenant_access = lambda: "t-token"
+    client._request_json = lambda url, **kw: sent.append({"url": url, **kw}) or {}
+
+    def out():
+        return json.loads(sent[-1]["body"]["content"])
+
+    # 1) 已有 config → 只补字段，其余键不动
+    client._send_message(actor_id="ou_a", msg_type="card", uuid="u1",
+                         content={"config": {"wide_screen_mode": True}, "elements": []})
+    assert out()["config"] == {"wide_screen_mode": True, "update_multi": True}
+
+    # 2) 压根没有 config → 建一个
+    client._send_message(actor_id="ou_a", msg_type="card", uuid="u2",
+                         content={"elements": []})
+    assert out()["config"] == {"update_multi": True}
+
+    # 3) 调用方显式写 false → 它自己要独享卡（逐人回调返回不同卡片），不替它改主意
+    client._send_message(actor_id="ou_a", msg_type="card", uuid="u3",
+                         content={"config": {"update_multi": False}, "elements": []})
+    assert out()["config"] == {"update_multi": False}
+
+    # 4) 纯文本消息不是卡片，不该长出 config
+    client._send_message(actor_id="ou_a", msg_type="text", uuid="u4",
+                         content={"text": "hi"})
+    assert out() == {"text": "hi"}
+
+    # 5) schema 2.0 的卡，config 同样在顶层
+    client._send_message(actor_id="ou_a", msg_type="card", uuid="u5",
+                         content={"schema": "2.0", "body": {"elements": []}})
+    assert out()["config"] == {"update_multi": True}
+    assert out()["body"] == {"elements": []}
+
+    # 6) 带按钮那条路（/v1/cards）最终也走 _send_message，一并盯住
+    caller = {"config": {"wide_screen_mode": True}, "elements": []}
+    client._send_card(actor_id="ou_a", content=caller,
+                      actions=[{"id": "allow", "label": "ok"}],
+                      card_id="card_x", nonce="n", uuid="u6")
+    assert out()["config"] == {"wide_screen_mode": True, "update_multi": True}
+    assert out()["elements"][-1]["tag"] == "action"
+    assert caller["config"] == {"wide_screen_mode": True}, "调用方的字典不能被就地改写"
 
 
 ADMIN_TOKEN = "admin-token-canary"

@@ -51,6 +51,7 @@ from ..credential_broker import lease_signing_secret, mint_lease
 from ..lark_cli_guard import (
     HERMES_LARK_CLI_REAL_BIN,
     HERMES_LARK_CLI_RUN_TOKEN,
+    HERMES_LARK_CLI_SELF_SERVE,
     generate_lark_cli_run_token,
     install_lark_cli_shim,
 )
@@ -177,6 +178,12 @@ _PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "moonshot": ("MOONSHOT_API_KEY",),
     "deepseek": ("DEEPSEEK_API_KEY",),
 }
+
+# Names a custom provider's ``key_env`` may resolve from the gateway process
+# environment. Everything else must come from the profile's own .env.
+_AMBIENT_PROVIDER_KEY_ENV_NAMES = frozenset(
+    name for names in _PROVIDER_ENV_KEYS.values() for name in names
+)
 
 
 # Each provider's API base URL when the model spec has no explicit override.
@@ -737,9 +744,7 @@ async def _legacy_real_run_agent(
             logger.debug("real_run_agent: bad model spec %r: %s", model_spec, exc)
             continue
 
-        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
-            config, provider, env_overrides
-        )
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider, env_overrides)
         if not api_key:
             logger.debug("real_run_agent: no API key for provider %s", provider)
             continue
@@ -1099,13 +1104,13 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
 # ``ephemeral_system_prompt`` and is re-paid every turn.
 _TODO_PROGRESS_RULES = "\n".join(
     [
-        "任务进度规则（todo 工具，硬性要求）:",
-        "- 任何需要 ≥3 个不同步骤的任务，动手前先用 todo 工具写出完整步骤清单。",
+        "任务进度规则（任务清单工具，硬性要求）:",
+        "- 任何需要 ≥3 个不同步骤的任务，动手前先用任务清单工具写出完整步骤清单。",
         "- 开始做某一步之前，先把该步标为 in_progress；同一时刻恰好一条 in_progress。",
         "- 每完成一步立即标 completed，禁止攒到最后一起标。",
         "- 测试未过、实现不完整、或有未解决错误时，绝不把该步标 completed。",
-        "- 每次调用 todo 都重写全量清单（不用 merge），执行中发现的新步骤随时补进清单。",
-        "- 少于 3 步的琐碎任务或纯问答不要用 todo 工具。",
+        "- 每次调用任务清单工具都重写全量清单（不用 merge），执行中发现的新步骤随时补进清单。",
+        "- 少于 3 步的琐碎任务或纯问答不要用任务清单工具。",
     ]
 )
 
@@ -1316,8 +1321,8 @@ def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
             shared_home=_resolve_shared_hermes_home(profile_home),
         )
         if status_line:
-            return f"{status_line}\n\n{block}\n\n---\n\n{soul_text}"
-    return f"{block}\n\n---\n\n{soul_text}"
+            return f"{status_line}\n\n{block}" + (f"\n\n---\n\n{soul_text}" if soul_text else "")
+    return block + (f"\n\n---\n\n{soul_text}" if soul_text else "")
 
 
 def _model_spec_for_event(
@@ -1439,11 +1444,33 @@ def _resolve_custom_provider_api_key(
             key = str(entry.get("api_key") or "").strip()
             if key:
                 return key
-            key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+            # A custom provider may NAME its secret rather than inline it
+            # (``key_env: ZAI_API_KEY``, secret in the profile's .env). Reading
+            # only the inline field made every such profile raise "no API key
+            # for primary provider" on every single turn — and ``fallback_providers``
+            # are all key_env-shaped, so the fallbacks died with it. Lookup
+            # order: profile .env overrides, then process env — but the process
+            # env only for registered provider credential names (the same names
+            # _resolve_api_key already reads from it). Any other name, e.g.
+            # ``key_env: FEISHU_APP_SECRET``, would ship a gateway secret to
+            # whatever base_url the profile config names (GitHub #15).
+            key_env = next(
+                (
+                    value
+                    for value in (
+                        str(entry.get("key_env") or "").strip(),
+                        str(entry.get("api_key_env") or "").strip(),
+                    )
+                    if value
+                ),
+                "",
+            )
             if key_env:
-                key = str((env_overrides or {}).get(key_env) or "").strip()
-                if key:
-                    return key
+                env_key = str((env_overrides or {}).get(key_env) or "").strip()
+                if not env_key and key_env in _AMBIENT_PROVIDER_KEY_ENV_NAMES:
+                    env_key = str(os.environ.get(key_env) or "").strip()
+                if env_key:
+                    return env_key
     return None
 
 
@@ -2447,6 +2474,10 @@ _CODEX_RUNTIME_ENV_NAMES: tuple[str, ...] = (
 # filtering before executing model-generated commands.
 #
 _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    # Operator kill switch for profile MCP-server registration
+    # (agent_real/mcp_servers.py). The gate is evaluated INSIDE the child, so it
+    # is inert unless the name carries across this allowlist.
+    "HERMES_MULTITENANCY_DISABLE_PROFILE_MCP",
     # POSIX basics
     "PATH", "USER", "LOGNAME", "SHELL", "TERM",
     "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -3626,6 +3657,7 @@ async def _verified_codex_stream(
                 "gate_required", "gate_resolved",
                 "workflow_stage", "auth_required", "auth_resolved",
                 "clarify_required", "clarify_resolved",
+                "authorization_required", "authorization_resolved",
             }
             # A run whose budget dies BEFORE it emits any text reaches us as a
             # terminal exception (the child's 409 becomes done.error, which
@@ -3892,6 +3924,21 @@ def _aiagent_subprocess_env_scope(
         sender_open_id = local_harness_admission.actor_subject
     merged_extra["TERMINAL_CWD"] = str(run_cwd)
     merged_extra["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
+    # Inline-authorization rendezvous: a directory this PARENT owns and creates,
+    # named from the run id alone, so the broker can derive the same path
+    # server-side and never has to trust a path the child sends up. Absent when
+    # the run has no authorization run id (Feishu / cron / untrusted), and the
+    # child then gets no bridge at all.
+    _authorization_run_id = str(
+        getattr(event, "trusted_authorization_run_id", "") or ""
+    ).strip()
+    if _authorization_run_id:
+        from ..webui_broker.periphery import _authorization_response_dir
+
+        _rendezvous = _authorization_response_dir(_authorization_run_id)
+        _rendezvous.mkdir(parents=True, exist_ok=True)
+        os.chmod(_rendezvous, 0o700)
+        merged_extra["HERMES_MULTITENANCY_AUTHORIZATION_DIR"] = str(_rendezvous)
     merged_extra.update(_ingest_secret_env_from_event(event))
     # Credential delegation, per run (NOT gated on strict context — the marker
     # collision and the once-lease binding it fixes exist in every mode):
@@ -4385,6 +4432,8 @@ def _install_execute_code_profile_child_env_patch(profile_home: Path):
 
         try:
             from tools import code_execution_tool
+            if not hasattr(code_execution_tool, "_scrub_child_env"):
+                from tools import code_execution_env as code_execution_tool
 
             if not hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
                 original_scrub = code_execution_tool._scrub_child_env
@@ -4447,10 +4496,11 @@ def _release_execute_code_profile_child_env_patch() -> None:
         if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS > 0:
             return
 
-        code_execution_tool = sys.modules.get("tools.code_execution_tool")
-        if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
-            code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
-            delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
+        for module_name in ("tools.code_execution_tool", "tools.code_execution_env"):
+            code_execution_tool = sys.modules.get(module_name)
+            if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+                code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
+                delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
 
         hermes_constants_mod = sys.modules.get("hermes_constants")
         if hermes_constants_mod is not None and hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
@@ -4607,10 +4657,7 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
     if not env_names:
         return
     try:
-        from tools import env_passthrough as env_passthrough_mod
-
-        env_passthrough_mod.register_env_passthrough(env_names)
-        _merge_process_wide_env_passthrough(env_passthrough_mod, env_names)
+        _register_env_passthrough_process_wide(env_names)
         logger.info(
             "[multitenancy] registered credential env passthrough profile=%s count=%d",
             profile_home.name,
@@ -4630,6 +4677,32 @@ def _register_env_passthrough_process_wide(env_names: list[str]) -> None:
     _merge_process_wide_env_passthrough(env_passthrough_mod, env_names)
 
 
+def _passthrough_names_accepted_by_core(
+    env_passthrough_mod: Any, env_names: list[str]
+) -> set[str]:
+    """Names core's ``register_env_passthrough`` accepted; fails closed.
+
+    The process-wide cache must never be wider than the per-context registry,
+    which rejects Hermes provider credentials. Prefer core's own predicate,
+    then the post-registration context set; with neither, still drop every
+    model provider key/base-url name we know of.
+    """
+    is_provider_credential = getattr(
+        env_passthrough_mod, "_is_hermes_provider_credential", None
+    )
+    if callable(is_provider_credential):
+        return {name for name in env_names if not is_provider_credential(name)}
+    candidates = {name for name in env_names if name not in _MODEL_ENV_ALLOWLIST}
+    get_allowed = getattr(env_passthrough_mod, "_get_allowed", None)
+    if callable(get_allowed):
+        try:
+            allowed = set(get_allowed())
+        except Exception:
+            return set()
+        candidates &= allowed
+    return candidates
+
+
 def _merge_process_wide_env_passthrough(env_passthrough_mod: Any, env_names: list[str]) -> None:
     """Extend Hermes' worker-thread fallback without changing its cache shape.
 
@@ -4642,13 +4715,14 @@ def _merge_process_wide_env_passthrough(env_passthrough_mod: Any, env_names: lis
     # broker-managed handle env vars also need a process-level allowlist entry.
     config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
     if isinstance(config_passthrough, dict):
+        # Official 0.21.3+ scopes this cache by Hermes home, including worker
+        # threads. Transitional builds (GitHub #19) may have the dict without
+        # hermes_home_key() or the config/credential helpers.
         try:
             from hermes_constants import hermes_home_key
 
             home_key = hermes_home_key()
         except ImportError:
-            # Transitional Hermes builds gained the home-keyed dict before
-            # exporting hermes_home_key(). Match its normalized path key.
             from hermes_constants import get_hermes_home
 
             home_key = os.path.normcase(
@@ -4656,8 +4730,12 @@ def _merge_process_wide_env_passthrough(env_passthrough_mod: Any, env_names: lis
             )
         except (RuntimeError, OSError):
             home_key = ""
-        merged = set(config_passthrough.get(home_key) or ())
-        merged.update(env_names)
+        load_config = getattr(env_passthrough_mod, "_load_config_passthrough", None)
+        if callable(load_config):
+            merged = set(load_config())
+        else:
+            merged = set(config_passthrough.get(home_key) or ())
+        merged.update(_passthrough_names_accepted_by_core(env_passthrough_mod, env_names))
         config_passthrough[home_key] = frozenset(merged)
         return
     merged = set(config_passthrough or ())
@@ -5078,10 +5156,8 @@ def _wrap_macos_sandbox(
 ) -> list[str]:
     """macOS backend: wrap with /usr/bin/sandbox-exec + profile-default.sb.
 
-    Behaviour identical to the pre-2026-05-11 monolithic implementation —
-    same preflight checks, same WARNING+fallback when policy/binary missing,
-    same -D parameter set, same wrapped argv order. Existing tests in
-    tests/test_aiagent_subprocess.py:1099-1222 assert this exact shape.
+    Installed shared skill targets append read-only grants to the base policy;
+    profiles without such targets retain the file-based policy invocation.
     """
     if not _SANDBOX_POLICY_FILE.is_file():
         if require_sandbox_enabled():
@@ -5144,9 +5220,24 @@ def _wrap_macos_sandbox(
     profile_home_resolved = profile_home.expanduser().resolve()
     hidden = profile_home_resolved if local_harness else Path("/private/tmp/hermes-harness-no-secret")
 
+    # Reuse the Linux admission checks; only this profile's installed, non-secret
+    # shared skill targets become readable. Ancestors allow metadata, not listing.
+    skill_args = _shared_skill_symlink_bwrap_args(profile_home, shared_home)
+    skill_rules: list[str] = []
+    for index, arg in enumerate(skill_args):
+        if arg == "--dir":
+            skill_rules.append(f"(allow file-read-metadata (literal {json.dumps(skill_args[index + 1], ensure_ascii=False)}))")
+        elif arg == "--ro-bind":
+            target = Path(skill_args[index + 1])
+            selector = "subpath" if target.is_dir() else "literal"
+            skill_rules.append(f"(allow file-read* ({selector} {json.dumps(str(target), ensure_ascii=False)}))")
+    policy_args = (
+        ["-p", _SANDBOX_POLICY_FILE.read_text(encoding="utf-8") + "\n" + "\n".join(skill_rules)]
+        if skill_rules else ["-f", str(_SANDBOX_POLICY_FILE)]
+    )
     wrapped = [
         _SANDBOX_EXEC,
-        "-f", str(_SANDBOX_POLICY_FILE),
+        *policy_args,
         "-D", f"PROFILE_HOME={profile_home_resolved}",
         "-D", f"SHARED_HOME={shared_home}",
         "-D", f"USER_HOME={user_home}",
@@ -5235,6 +5326,14 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
             mount_path = _shared_skill_symlink_mount_path(item, allowed_roots)
             if mount_path is None:
                 continue
+            # Both the installed path and its final source must remain inside
+            # a real trusted root; a shared symlink cannot grant peer access.
+            if not any(
+                root.resolve(strict=False) == root
+                and (resolved == root or root in resolved.parents)
+                for root in allowed_roots
+            ):
+                continue
             if resolved.is_dir() and not (resolved / "SKILL.md").is_file():
                 continue
             if resolved.is_dir() and _sandbox_skill_tree_has_secret_files(resolved):
@@ -5320,7 +5419,6 @@ def _sandbox_skill_tree_has_secret_files(src: Path) -> bool:
             dirname
             for dirname in dirs
             if not (root_path / dirname).is_symlink()
-            and dirname not in _SANDBOX_SKILL_IGNORED_DIRS
         ]
         for filename in files:
             item = root_path / filename
@@ -5511,6 +5609,10 @@ def _install_session_search_proxy_for_aiagent() -> None:
             window: int = 5,
             sort: str = None,
             profile: str = None,
+            detail: str = "adaptive",
+            after: str = None,
+            before: str = None,
+            exclude_session_ids: list[str] = None,
         ) -> str:
             payload = {
                 "query": query,
@@ -5522,6 +5624,10 @@ def _install_session_search_proxy_for_aiagent() -> None:
                 "window": window,
                 "sort": sort,
                 "profile": profile,
+                "detail": detail,
+                "after": after,
+                "before": before,
+                "exclude_session_ids": exclude_session_ids,
             }
             current_base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
             current_token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
@@ -6166,6 +6272,141 @@ def _configure_webui_clarify_bridge(event_sink, session_key: str):
     return _clarify_callback
 
 
+def _authorization_bridge_dir() -> Optional[Path]:
+    """The per-run rendezvous directory the PARENT pinned, or None.
+
+    No fallback and no ``mkdir``. The old fallback was a shared
+    ``$TMPDIR/hermes-multitenancy-authorization`` that this child could create
+    and write, which made "write my own success file" a one-write
+    self-authorization; the child now only ever READS a directory the parent
+    created for this run (and that the Linux/macOS sandbox mounts read-only).
+    Missing pin ⇒ no bridge ⇒ the tool fails closed and tells the user to use
+    the credential hub.
+    """
+    raw = str(os.getenv("HERMES_MULTITENANCY_AUTHORIZATION_DIR") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _authorization_bridge_timeout() -> float:
+    """How long the tool call may block. 600s = the inline-authorization window."""
+    raw = os.getenv("HERMES_MULTITENANCY_AUTHORIZATION_TIMEOUT", "600")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 600.0
+
+
+_AUTHORIZATION_TERMINAL_STATES = frozenset({"success", "cancelled", "expired", "failed"})
+
+
+def _read_authorization_response(path: Path) -> Optional[dict[str, str]]:
+    """None = still waiting. Anything unreadable/unknown is a terminal failure."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] authorization response read failed: %s", exc)
+        return {"state": "failed", "reason": "the authorization response was unreadable"}
+    if not isinstance(data, dict):
+        return {"state": "failed", "reason": "the authorization response was malformed"}
+    state = str(data.get("state") or "").strip().lower()
+    if state not in _AUTHORIZATION_TERMINAL_STATES:
+        return {"state": "failed", "reason": "the authorization response had no usable state"}
+    return {"state": state, "reason": str(data.get("reason") or "").strip()}
+
+
+def _configure_webui_authorization_bridge(event_sink, session_key: str):
+    """Return ``(callback, cleanup)`` for the inline ``request_authorization`` tool.
+
+    Same shape as ``_configure_webui_clarify_bridge``: the callback emits a
+    child-local ``pending_ref`` plus the response path it will poll, then BLOCKS
+    inside the tool call until the parent writes a terminal state or the window
+    closes. The child never learns the server-issued ``authorization_id``, the
+    owner, or the authorization URL — it only ever sees a state.
+    """
+    if event_sink is None:
+        return None, (lambda: None)
+
+    authorization_dir = _authorization_bridge_dir()
+    if authorization_dir is None:
+        return None, (lambda: None)
+    response_paths: list[Path] = []
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] authorization bridge event emit failed", exc_info=True)
+
+    def _authorization_callback(
+        *, service: str, scopes: Any = None, tool_call_id: str = ""
+    ) -> dict[str, str]:
+        # The ONLY thing this side decides about the rendezvous. The parent
+        # derives the very same path from (run_id, pending_ref) and ignores
+        # anything we might claim about it, so the shape here must stay exactly
+        # `authreq_<32 lowercase hex>`.
+        pending_ref = f"authreq_{uuid.uuid4().hex}"
+        response_path = authorization_dir / f"{pending_ref}.json"
+        response_paths.append(response_path)
+        normalized_scopes = [
+            str(scope).strip() for scope in (scopes or []) if str(scope).strip()
+        ]
+        _emit_bridge_event(
+            "authorization_required",
+            pending_ref=pending_ref,
+            session_key=session_key,
+            service=str(service or "").strip(),
+            scopes=normalized_scopes,
+            # Binds the request to THIS tool call. ``pending_ref`` is already
+            # per-call (minted fresh on every invocation), so it is the
+            # fallback when core does not expose a tool-call id.
+            tool_call_id=str(tool_call_id or "").strip() or pending_ref,
+        )
+
+        timeout_s = _authorization_bridge_timeout()
+        deadline = time.monotonic() + timeout_s
+        outcome: Optional[dict[str, str]] = None
+        while True:
+            outcome = _read_authorization_response(response_path)
+            if outcome is not None:
+                break
+            if time.monotonic() >= deadline:
+                outcome = {
+                    "state": "expired",
+                    "reason": f"no authorization within {timeout_s:g}s",
+                }
+                break
+            time.sleep(0.1)
+
+        _emit_bridge_event(
+            "authorization_resolved",
+            pending_ref=pending_ref,
+            session_key=session_key,
+            state=outcome["state"],
+            reason=outcome.get("reason", ""),
+        )
+        return dict(outcome)
+
+    def _cleanup() -> None:
+        # Best-effort only: the rendezvous directory is read-only to this
+        # process under the sandbox, and the PARENT removes the whole per-run
+        # directory in its run-teardown finally-block. This just keeps the
+        # unsandboxed local-dev case tidy.
+        for path in response_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except Exception:
+                logger.debug("[multitenancy] authorization response cleanup failed", exc_info=True)
+        response_paths.clear()
+
+    return _authorization_callback, _cleanup
+
+
 def _harness_run_broker_action(action: str, **payload: Any) -> dict[str, Any]:
     """Call the owner-bound workflow seam; no identity comes from the child."""
     base = os.environ.get("HERMES_RUN_BROKER_URL", "").strip().rstrip("/")
@@ -6199,22 +6440,21 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
             unregister_gateway_notify,
         )
         try:
-            from tools.approval_context import (
-                reset_current_session_key,
-                set_current_session_key,
-            )
-        except (ImportError, AttributeError):
+            approval_context = importlib.import_module("tools.approval_context")
+        except ModuleNotFoundError as exc:
+            if exc.name != "tools.approval_context":
+                raise
+            approval_context = None
+        if approval_context is None or not (
+            hasattr(approval_context, "set_current_session_key")
+            and hasattr(approval_context, "reset_current_session_key")
+        ):
             # Hermes 0.14 kept the session context helpers on the approval
-            # facade. Build their names so the post-decomposition static
-            # compatibility scanner does not mistake this runtime fallback for
-            # a deprecated import.
-            approval_module = importlib.import_module("tools.approval")
-            set_current_session_key = getattr(
-                approval_module, "set_" + "current_session_key"
-            )
-            reset_current_session_key = getattr(
-                approval_module, "reset_" + "current_session_key"
-            )
+            # facade (GitHub #16): fall back when the split module is absent
+            # or does not carry them.
+            approval_context = importlib.import_module("tools.approval")
+        set_current_session_key = approval_context.set_current_session_key
+        reset_current_session_key = approval_context.reset_current_session_key
     except Exception as exc:
         if os.environ.get("HERMES_LOCAL_HARNESS") == "1":
             raise RuntimeError("Harness approval bridge unavailable") from exc

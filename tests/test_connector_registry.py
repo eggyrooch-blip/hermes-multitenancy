@@ -36,7 +36,7 @@ def test_list_definitions_returns_builtins_in_credential_order():
     from hermes_multitenancy.connectors import registry
 
     defs = registry.list_definitions()
-    assert [d.id for d in defs] == [*credential_hub.CREDENTIAL_ORDER, "github-mcp"]
+    assert [d.id for d in defs] == [*credential_hub.CREDENTIAL_ORDER, "github-mcp", "figma"]
 
 
 def test_lark_cli_is_high_risk_authsidecar_broker_owned():
@@ -69,8 +69,9 @@ def test_collect_returns_statuses_with_scope_fields(monkeypatch, tmp_path):
         profile_name="owner", open_id="ou_owner", shared_home=shared
     )
     # lark-cli / feishu-project / keep-record / kep-cli-online / kep-cli-pre /
-    # gitlab（全局）/ gitlab-personal（员工自己绑的）
-    assert len(statuses) == 8
+    # gitlab（全局）/ gitlab-personal（员工自己绑的）/ github-mcp / figma
+    assert len(statuses) == 9
+    assert [s.id for s in statuses[-2:]] == ["github-mcp", "figma"]
     for status in statuses:
         assert status.profile == "owner"
         assert status.scope  # non-empty
@@ -101,9 +102,46 @@ def test_github_status_failure_preserves_all_legacy_connector_rows(monkeypatch, 
         profile_name="owner", open_id="ou_owner", shared_home=shared
     )
 
-    assert [row.id for row in statuses[:-1]] == list(credential_hub.CREDENTIAL_ORDER)
-    assert statuses[-1].id == "github-mcp"
+    assert [row.id for row in statuses[:-2]] == list(credential_hub.CREDENTIAL_ORDER)
+    assert statuses[-2].id == "github-mcp"
+    assert statuses[-2].status == "error"
+    # One connector's reader blowing up must not take its neighbour with it.
+    assert statuses[-1].id == "figma"
+
+
+def test_figma_status_failure_preserves_all_other_connector_rows(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, figma_connector
+    from hermes_multitenancy.connectors import registry
+
+    shared, _ = _mk_profile_home(tmp_path, "owner")
+    _patch_no_binaries(monkeypatch, lark_status={"status": "missing"})
+    monkeypatch.setattr(
+        figma_connector,
+        "status",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("core unreadable")),
+    )
+
+    statuses = registry.collect_connector_statuses(
+        profile_name="owner", open_id="ou_owner", shared_home=shared
+    )
+
+    assert [row.id for row in statuses[:-2]] == list(credential_hub.CREDENTIAL_ORDER)
+    assert statuses[-2].id == "github-mcp"
+    assert statuses[-1].id == "figma"
     assert statuses[-1].status == "error"
+    assert statuses[-1].action is not None and statuses[-1].action.kind == "manual"
+
+
+def test_figma_definition_is_profile_scoped_and_external():
+    from hermes_multitenancy.connectors import registry
+
+    figma = registry.get_connector("figma")
+    assert figma is not None
+    assert figma.kind == "external"
+    assert figma.scope == "profile"
+    assert figma.policy.secrets_owner == "profile_home"
+    assert figma.auth_flow.type == "mcp_oauth"
+    assert figma.ui.group == "other-credentials"
 
 
 def test_registry_lark_cli_uses_profile_json_when_status_reader_keyless_error(monkeypatch, tmp_path):

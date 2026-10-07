@@ -15,6 +15,11 @@ import pytest
 from tests._sync import SYNC_TIMEOUT
 
 from hermes_multitenancy import router as router_mod
+from hermes_multitenancy.plugin_script_policy import (
+    PLUGIN_SCRIPT_RUNTIME_GUIDANCE,
+    PLUGIN_SCRIPT_SOUL_RULE,
+    RETIRED_PLUGIN_SCRIPT_SOUL_RULES,
+)
 
 
 def test_file_generation_guidance_uses_profile_downloads_not_tmp():
@@ -22,6 +27,51 @@ def test_file_generation_guidance_uses_profile_downloads_not_tmp():
     assert "execute_code" in guidance
     assert "/workspace/Downloads" in guidance
     assert "/tmp" in guidance
+
+
+# Only AiDock-distributed skills are bound to lark_cli mode=script; other
+# installed skills run per SKILL.md via terminal (sunke 2026-10-06).
+def test_runtime_guidance_limits_script_mode_to_aidock_and_allows_terminal():
+    assert PLUGIN_SCRIPT_RUNTIME_GUIDANCE.startswith("Installed Plugin/Skill script execution:")
+    assert 'lark_cli` tool with `mode="script"' in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    assert "AiDock-installed Plugin/Skill" in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    # Codex materializes AiDock Plugins under codex-home; that copy is still AiDock.
+    assert "materialized copy of an AiDock Plugin under codex-home" in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    assert "Any other installed Skill" in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    assert "via terminal instead" in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    assert "Never run a distributed file" not in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+    assert "do not fall back" not in PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+
+
+def test_soul_rule_limits_script_mode_to_aidock_and_allows_terminal():
+    assert "AiDock 分发安装的 Skill/Plugin" in PLUGIN_SCRIPT_SOUL_RULE
+    assert "codex-home 下物化的 AiDock Plugin 副本" in PLUGIN_SCRIPT_SOUL_RULE
+    assert '`mode="script"`' in PLUGIN_SCRIPT_SOUL_RULE
+    assert "可以使用 terminal/execute_code" in PLUGIN_SCRIPT_SOUL_RULE
+    assert "不得改用" not in PLUGIN_SCRIPT_SOUL_RULE
+    assert PLUGIN_SCRIPT_SOUL_RULE in router_mod._LARK_CLI_SOUL_GUIDANCE
+    for retired in RETIRED_PLUGIN_SCRIPT_SOUL_RULES:
+        assert retired not in router_mod._LARK_CLI_SOUL_GUIDANCE
+
+
+def test_ensure_soul_guidance_removes_retired_ban_and_adds_new_rule(tmp_path):
+    soul = tmp_path / "SOUL.md"
+    guidance = router_mod._LARK_CLI_SOUL_GUIDANCE
+    retired = RETIRED_PLUGIN_SCRIPT_SOUL_RULES[0]
+    old_guidance = guidance.replace(PLUGIN_SCRIPT_SOUL_RULE, retired)
+    soul.write_text(f"# Hermes Profile p\n\n{old_guidance}\n\nkeep me\n", encoding="utf-8")
+
+    router_mod._ensure_soul_guidance(soul, guidance)
+
+    text = soul.read_text(encoding="utf-8")
+    assert retired not in text
+    assert "不得改用 terminal/execute_code" not in text
+    assert PLUGIN_SCRIPT_SOUL_RULE in text
+    assert "keep me" in text
+    assert text.count("Feishu/Lark capability rules:") == 1
+
+    router_mod._ensure_soul_guidance(soul, guidance)
+    assert soul.read_text(encoding="utf-8") == text
 
 
 def _build_event(

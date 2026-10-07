@@ -47,11 +47,20 @@ def test_install_function_exists_and_is_wired() -> None:
 
 
 def test_install_is_idempotent() -> None:
-    install_feishu_inbound_richtext_patch()
-    wrapped = feishu_core.normalize_feishu_message
-    install_feishu_inbound_richtext_patch()
-    assert feishu_core.normalize_feishu_message is wrapped
-    assert getattr(wrapped, "_hermes_multitenancy_inbound_patched", False) is True
+    # Resolve the module the patch targets NOW, not at collection time: with core
+    # 0.21.4 an earlier test on the same xdist worker may have materialized the
+    # plugin loader's synthetic feishu module, which then wins over `feishu_core`.
+    module = load_feishu_module()
+    before = module.normalize_feishu_message
+    original = getattr(before, "_hermes_multitenancy_original", before)
+    try:
+        install_feishu_inbound_richtext_patch()
+        wrapped = module.normalize_feishu_message
+        install_feishu_inbound_richtext_patch()
+        assert module.normalize_feishu_message is wrapped
+        assert getattr(wrapped, "_hermes_multitenancy_inbound_patched", False) is True
+    finally:
+        module.normalize_feishu_message = original
 
 
 def test_enrichment_fail_open_returns_original_result(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,11 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .shared_db import connect_shared
 from .credentials import _open_json, _seal_json
 
 _SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS relay_enrollments (
     enroll_hash TEXT PRIMARY KEY,
     state_hash TEXT NOT NULL UNIQUE,
@@ -147,7 +146,7 @@ class RelayStore:
             raise RuntimeError("agent relay encryption key is required")
         raw_key = encryption_key.encode("utf-8") if isinstance(encryption_key, str) else encryption_key
         self._key = hashlib.sha256(raw_key).digest()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = connect_shared(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         with self._lock:

@@ -93,6 +93,10 @@ def test_compose_system_text_prepends_kep_status_for_pre_overlay(tmp_path, monke
     assert out.endswith(soul)
 
 
+    # The real AIAgent path supplies only the ephemeral overlay, not a SOUL copy.
+    ephemeral = agent_real._compose_system_text(_event("expert"), tmp_path, "")
+    assert ephemeral == status_line + "\n\n**Role Override**"
+
 def test_compose_system_text_prepends_kep_403_receipt_guidance(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda *_args, **_kwargs: "**Role Override**")
     monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _profile: [])

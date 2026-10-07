@@ -31,6 +31,11 @@ def test_bump_never_raises_on_broken_db(tmp_path):
 def test_concurrent_bumps_all_land(tmp_path):
     db = tmp_path / "mt.db"
     n_threads, per_thread = 8, 5
+    # Create the file (and switch it to WAL) once before the threads start: the
+    # production DB always exists already. On a brand-new file, concurrent
+    # `PRAGMA journal_mode=WAL` can fail with "database is locked" despite
+    # busy_timeout (shared_db race, tracked as debt; core 0.21.4 CI timing hits it).
+    assert eu.counts(db) == {}
 
     def worker():
         for _ in range(per_thread):

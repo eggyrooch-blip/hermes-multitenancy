@@ -115,6 +115,10 @@ def _install_fake_feishu_module(monkeypatch) -> types.ModuleType:
         raise ModuleNotFoundError(f"No module named '{name}'", name=name)
 
     monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+    # Deleting the synthetic entry is not enough with core 0.21.4 installed: the
+    # deferred feishu platform loader (registered by an earlier test on this
+    # worker) would re-materialize the real plugin module, which then wins.
+    monkeypatch.setattr(feishu_adapter_compat, "_materialize_deferred_feishu_platform", lambda: None)
     return module
 
 

@@ -163,15 +163,30 @@ def _patch_gateway_create_adapter(GatewayRunner: Any) -> bool:
 def install_gateway_push_card_adapter_capture() -> None:
     """Eagerly capture the live Feishu adapter at gateway startup (cold-start
     proactive push). Router-runtime only; fail-open like its sibling installs."""
-    global _gateway_adapter_capture_installed
     if _gateway_adapter_capture_installed:
         return
+    # Deferred until gateway.run finishes loading: importing it here, inside
+    # core's plugin discovery, deadlocks startup (see gateway_run_ready).
+    from .gateway_run_ready import when_gateway_run_loaded
+
     try:
-        from gateway.run import GatewayRunner
+        when_gateway_run_loaded("push_card_adapter_capture", _install_gateway_push_card_adapter_capture_on)
+    except Exception:
+        logger.exception("[push_card] gateway adapter capture install failed")
+
+
+def _install_gateway_push_card_adapter_capture_on(gateway_run: Any) -> None:
+    # No early return on the global flag: a retried gateway.run import brings a
+    # fresh GatewayRunner; _patch_gateway_create_adapter's per-method marker is
+    # the idempotency check for that class.
+    global _gateway_adapter_capture_installed
+    try:
+        GatewayRunner = gateway_run.GatewayRunner
+        patched = _patch_gateway_create_adapter(GatewayRunner)
     except Exception:
         logger.exception("[push_card] gateway adapter capture install failed")
         return
-    if _patch_gateway_create_adapter(GatewayRunner):
+    if patched:
         _gateway_adapter_capture_installed = True
         logger.info("[push_card] installed gateway Feishu adapter capture")
 
