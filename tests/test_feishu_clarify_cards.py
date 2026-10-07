@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from tests.conftest import card_toast
 
 
@@ -127,12 +129,16 @@ def test_dispatcher_routing_is_identical_in_both_install_orders(monkeypatch):
         assert getattr(Adapter._on_card_action_trigger, "_hermes_multitenancy_cred_auth_card_action_patched")
 
 
-def test_clarify_install_uses_synthetic_adapter_module(monkeypatch):
+@pytest.mark.parametrize(
+    "synthetic_name",
+    ["hermes_plugins.platforms__feishu.adapter", "hermes_plugins.feishu_platform.adapter"],
+)
+def test_clarify_install_uses_synthetic_adapter_module(monkeypatch, synthetic_name):
     from hermes_multitenancy import feishu_clarify_cards
 
-    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    synthetic = types.ModuleType(synthetic_name)
     synthetic.FeishuAdapter = type("SyntheticAdapter", (_CardAdapter,), {})
-    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    monkeypatch.setitem(sys.modules, synthetic_name, synthetic)
     monkeypatch.setattr(feishu_clarify_cards, "_HOOK_INSTALLED", False)
 
     feishu_clarify_cards.install_feishu_clarify_card_action_patch()
@@ -234,16 +240,20 @@ def test_stringified_action_value_is_accepted(monkeypatch, tmp_path):
     assert _read_clarify_response(_clarify_bridge_dir() / f"{clarify_id}.json") == "answer"
 
 
-def test_install_retries_after_adapter_method_appears(monkeypatch):
+@pytest.mark.parametrize(
+    "synthetic_name",
+    ["hermes_plugins.platforms__feishu.adapter", "hermes_plugins.feishu_platform.adapter"],
+)
+def test_install_retries_after_adapter_method_appears(monkeypatch, synthetic_name):
     from hermes_multitenancy import feishu_clarify_cards
 
-    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    synthetic = types.ModuleType(synthetic_name)
 
     class LateAdapter:
         pass
 
     synthetic.FeishuAdapter = LateAdapter
-    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    monkeypatch.setitem(sys.modules, synthetic_name, synthetic)
     monkeypatch.setattr(feishu_clarify_cards, "_HOOK_INSTALLED", False)
     feishu_clarify_cards.install_feishu_clarify_card_action_patch()
     assert feishu_clarify_cards._HOOK_INSTALLED is False

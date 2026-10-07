@@ -3,7 +3,8 @@
 prod 2026-07-25 → 07-30 (5 days, silent): v0190 made bundled ``kind: platform``
 plugins LAZY (``hermes_cli/plugins.py`` → ``_register_deferred_platform``), so at
 multitenancy ``register()`` time the synthetic module
-``hermes_plugins.feishu_platform.adapter`` does not exist yet.
+(``hermes_plugins.feishu_platform.adapter``; ``hermes_plugins.platforms__feishu.adapter``
+since core 0.21.5) does not exist yet.
 ``load_feishu_module()``'s sys.modules lookup missed, the legacy fallback
 imported the SAME source file a second time as ``plugins.platforms.feishu.adapter``,
 and all 15 class-level patches landed on that clone. The gateway then
@@ -36,7 +37,10 @@ import pytest
 
 from hermes_multitenancy import feishu_adapter_compat as compat
 
-SYNTHETIC = "hermes_plugins.feishu_platform.adapter"
+# Rebound per test by ``_synthetic_name`` below: every test here runs once per
+# synthetic name the core has used (0.21.5 first, then <= 0.21.4).
+SYNTHETIC_NAMES = compat._PLUGIN_LOADER_MODULE_NAMES
+SYNTHETIC = SYNTHETIC_NAMES[0]
 CLONE = "plugins.platforms.feishu.adapter"
 LEGACY = "gateway.platforms.feishu"
 
@@ -78,10 +82,16 @@ def _synthetic_module() -> types.ModuleType:
     return module
 
 
+@pytest.fixture(autouse=True, params=SYNTHETIC_NAMES)
+def _synthetic_name(request, monkeypatch) -> str:
+    monkeypatch.setattr(sys.modules[__name__], "SYNTHETIC", request.param)
+    return request.param
+
+
 @pytest.fixture(autouse=True)
-def _clean_feishu_modules():
+def _clean_feishu_modules(_synthetic_name):
     """Snapshot/restore every module name this file plants into sys.modules."""
-    names = (SYNTHETIC, CLONE, LEGACY, "gateway", "gateway.platform_registry")
+    names = (*SYNTHETIC_NAMES, CLONE, LEGACY, "gateway", "gateway.platform_registry")
     saved = {name: sys.modules.get(name) for name in names}
     for name in names:
         sys.modules.pop(name, None)
@@ -134,14 +144,17 @@ def test_registry_materializes_deferred_synthetic_module(monkeypatch, fake_regis
     assert compat.load_feishu_adapter() is synthetic.FeishuAdapter
 
 
-def test_already_loaded_synthetic_never_touches_registry(monkeypatch, fake_registry) -> None:
-    """Synthetic already in sys.modules → return it, no registry call at all."""
+def test_already_loaded_synthetic_without_registry_entry_is_reused(monkeypatch, fake_registry) -> None:
+    """Synthetic already in sys.modules and no registry entry → the registry is
+    asked first (its entry would be authoritative per HERMES_HOME scope), has
+    nothing, and the loaded synthetic is returned — no re-exec, no fallback."""
     synthetic = _synthetic_module()
     sys.modules[SYNTHETIC] = synthetic
     _forbid_fallback(monkeypatch)
 
     assert compat.load_feishu_module() is synthetic
-    assert fake_registry.get_calls == []  # sentinel: registry untouched
+    assert fake_registry.get_calls == ["feishu"]
+    assert CLONE not in sys.modules
 
 
 def test_fail_open_when_registry_module_is_unimportable(monkeypatch) -> None:

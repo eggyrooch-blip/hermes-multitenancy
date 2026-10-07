@@ -60,7 +60,12 @@ def _configure_xdist_workers() -> None:
 _configure_xdist_workers()
 
 _CARD_MESSAGES = itertools.count()
-_SYNTHETIC_FEISHU_ADAPTER = "hermes_plugins.feishu_platform.adapter"
+# Synthetic plugin-loader names of the feishu adapter (core 0.21.5, core <= 0.21.4);
+# mirrors feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES without importing MT here.
+_SYNTHETIC_FEISHU_ADAPTERS = (
+    "hermes_plugins.platforms__feishu.adapter",
+    "hermes_plugins.feishu_platform.adapter",
+)
 
 
 class _CardTicket:
@@ -174,7 +179,8 @@ def _isolate_loaded_feishu_plugin(monkeypatch):
     under xdist.  Hide all three pieces for each test; tests of deferred loading
     install their own isolated registry and synthetic module explicitly.
     """
-    monkeypatch.delitem(sys.modules, _SYNTHETIC_FEISHU_ADAPTER, raising=False)
+    for name in _SYNTHETIC_FEISHU_ADAPTERS:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     registry_module = sys.modules.get("gateway.platform_registry")
     registry = getattr(registry_module, "platform_registry", None)
     entries = getattr(registry, "_entries", None)

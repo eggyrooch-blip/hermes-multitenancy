@@ -6,14 +6,23 @@ from types import ModuleType
 from typing import Any
 
 # Newer cores load the bundled feishu platform plugin through
-# ``hermes_cli/plugins.py``, which imports the plugin directory under this
+# ``hermes_cli/plugins.py``, which imports the plugin directory under a
 # SYNTHETIC package name via ``spec_from_file_location`` — producing a module
 # object DISTINCT from ``plugins.platforms.feishu.adapter`` even though both
 # come from the same source file. The synthetic module exists only in
 # ``sys.modules`` (it cannot be imported by name), and it is the one the
 # gateway actually instantiates — class patches must land on it, else they
 # silently no-op (root cause of bot-added inviter capture never firing).
-_PLUGIN_LOADER_MODULE_NAME = "hermes_plugins.feishu_platform.adapter"
+#
+# The ONE list of synthetic names, newest core first. Core 0.21.5 derives the
+# name from ``manifest.key`` (``platforms/feishu`` → ``platforms__feishu``);
+# core <= 0.21.4 used ``feishu_platform``. Missing the new name made
+# ``load_live_feishu_module`` fail closed and the router exit at startup
+# (local UAT 2026-10-07).
+_PLUGIN_LOADER_MODULE_NAMES = (
+    "hermes_plugins.platforms__feishu.adapter",
+    "hermes_plugins.feishu_platform.adapter",
+)
 
 _FEISHU_MODULE_NAMES = (
     "gateway.platforms.feishu",
@@ -65,16 +74,47 @@ def is_executor_shutdown_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "cannot schedule new futures" in str(exc)
 
 
-def _loaded_synthetic_module() -> ModuleType | None:
+def _complete_adapter_module(module: Any) -> ModuleType | None:
     # Guarded on the ``FeishuAdapter`` attr so a half-initialized module never wins.
-    module = sys.modules.get(_PLUGIN_LOADER_MODULE_NAME)
     if module is not None and getattr(module, "FeishuAdapter", None) is not None:
         return module
     return None
 
 
-def _materialize_deferred_feishu_platform() -> None:
-    """Force the lazily-registered feishu platform plugin to actually load.
+def _module_of_registry_entry(entry: Any) -> ModuleType | None:
+    """The module behind a registered feishu platform entry.
+
+    ``adapter_factory`` is the very class the gateway instantiates, so its
+    module is authoritative whatever name the core gave it. Core 0.21.5 scopes
+    entries per HERMES_HOME and gives every scope after the first a
+    ``__home_<digest>`` suffixed module, so a bare candidate name already in
+    ``sys.modules`` may belong to ANOTHER home — the current scope's entry must
+    win over it.
+    """
+    factory = getattr(entry, "adapter_factory", None)
+    module_name = getattr(factory, "__module__", None)
+    if not isinstance(module_name, str):
+        return None
+    module = _complete_adapter_module(sys.modules.get(module_name))
+    # A class factory must BE the module's ``FeishuAdapter``; anything else
+    # means this module is not the one the entry instantiates.
+    if module is not None and isinstance(factory, type) and module.FeishuAdapter is not factory:
+        return None
+    return module
+
+
+def _loaded_synthetic_module() -> ModuleType | None:
+    """The plugin loader's synthetic feishu adapter module, once it exists
+    under any known name (newest core first)."""
+    for module_name in _PLUGIN_LOADER_MODULE_NAMES:
+        module = _complete_adapter_module(sys.modules.get(module_name))
+        if module is not None:
+            return module
+    return None
+
+
+def _materialize_deferred_feishu_platform() -> ModuleType | None:
+    """Resolve the current scope's feishu registry entry (loading it if deferred).
 
     Since core v0190 bundled ``kind: platform`` plugins are DEFERRED
     (``hermes_cli/plugins.py`` → ``_register_deferred_platform``): discovery only
@@ -89,25 +129,26 @@ def _materialize_deferred_feishu_platform() -> None:
     ``create_adapter`` alone), so a non-gateway context with no ``FEISHU_*`` env
     is safe. Fail-open: nothing here is worth breaking a patch install over —
     on any failure we are exactly where we were before, at the old fallback.
+
+    Returns the module behind the current scope's registered entry, else None
+    (no registry, no entry, or an entry without a resolvable adapter module —
+    callers then probe the known synthetic names).
     """
     try:
         from gateway.platform_registry import platform_registry
 
-        platform_registry.get("feishu")
+        return _module_of_registry_entry(platform_registry.get("feishu"))
     except Exception:
-        pass
+        return None
 
 
 def load_feishu_module() -> ModuleType:
-    # The plugin-loader's synthetic module wins when present: it is the
-    # adapter the gateway actually runs. (For the legacy names below a plain
+    # The current scope's registry entry wins: its adapter class is the one the
+    # gateway runs. Without a registry answer the plugin-loader's synthetic
+    # module wins when present. (For the legacy names below a plain
     # ``import_module`` already returns the cached ``sys.modules`` entry, so
-    # only the synthetic name needs an explicit lookup.)
-    module = _loaded_synthetic_module()
-    if module is not None:
-        return module
-    _materialize_deferred_feishu_platform()
-    module = _loaded_synthetic_module()
+    # only the synthetic names need an explicit lookup.)
+    module = _materialize_deferred_feishu_platform() or _loaded_synthetic_module()
     if module is not None:
         return module
     last_error: Exception | None = None
@@ -124,19 +165,19 @@ def load_feishu_module() -> ModuleType:
 
 
 def load_live_feishu_module() -> ModuleType:
-    """Resolve the adapter class the gateway will instantiate, or fail closed."""
-    module = _loaded_synthetic_module()
-    if module is not None:
-        return module
+    """Resolve the adapter class the gateway will instantiate, or fail closed.
+
+    Current-scope registry entry first (see ``_module_of_registry_entry``);
+    known synthetic names only when the registry has no usable entry.
+    """
     try:
         from gateway.platform_registry import platform_registry
     except ModuleNotFoundError as exc:
         if not _is_missing_candidate_module(exc, "gateway.platform_registry"):
             raise
-        return load_feishu_module()
+        return _loaded_synthetic_module() or load_feishu_module()
 
-    platform_registry.get("feishu")
-    module = _loaded_synthetic_module()
+    module = _module_of_registry_entry(platform_registry.get("feishu")) or _loaded_synthetic_module()
     if module is None:
         raise RuntimeError("live Feishu adapter module did not materialize")
     return module

@@ -19,6 +19,8 @@ _MODULE_NAMES = (
     "hermes_plugins",
     "hermes_plugins.feishu_platform",
     "hermes_plugins.feishu_platform.adapter",
+    "hermes_plugins.platforms__feishu",
+    "hermes_plugins.platforms__feishu.adapter",
 )
 
 
@@ -289,7 +291,11 @@ def test_download_remote_document_not_patched() -> None:
         assert getattr(adapter_cls._download_feishu_image, "_media_retry_patched", False) is True
 
 
-def test_patch_lands_on_synthetic_production_module() -> None:
+@pytest.mark.parametrize(
+    "synthetic_name",
+    ["hermes_plugins.platforms__feishu.adapter", "hermes_plugins.feishu_platform.adapter"],
+)
+def test_patch_lands_on_synthetic_production_module(synthetic_name) -> None:
     def behavior() -> tuple[str, str]:
         return ("/cache/ok.jpg", "image/jpeg")
 
@@ -298,7 +304,7 @@ def test_patch_lands_on_synthetic_production_module() -> None:
 
     with _installed(
         {
-            "hermes_plugins.feishu_platform.adapter": synthetic_adapter,
+            synthetic_name: synthetic_adapter,
             "gateway.platforms.feishu": legacy_adapter,
         }
     ):

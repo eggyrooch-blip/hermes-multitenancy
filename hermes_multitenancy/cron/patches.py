@@ -87,14 +87,16 @@ def _note_live_gateway(gateway: Any) -> None:
 
     register()-time class patching lands on the WRONG class object. The core
     plugin loader (``hermes_cli/plugins.py:_load_directory_module``) re-execs the
-    feishu platform source under the synthetic name
-    ``hermes_plugins.feishu_platform.adapter``, producing a class distinct from
+    feishu platform source under a synthetic name (core <= 0.21.4
+    ``hermes_plugins.feishu_platform.adapter``, core 0.21.5
+    ``hermes_plugins.platforms__feishu.adapter``; the list lives in
+    ``feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES``), producing a class distinct from
     ``plugins.platforms.feishu.adapter.FeishuAdapter`` — and at register() time
     the synthetic module does not exist yet, so ``load_feishu_module()`` can only
     return the fallback clone. prod v0190 boot 2026-07-30 18:04:19 shows exactly
     that split: register-time hooks logged against
     ``plugins.platforms.feishu.adapter.FeishuAdapter`` while the running adapter
-    logs under ``hermes_plugins.feishu_platform.adapter``.
+    logs under the synthetic name.
 
     A gateway instance only exists after the platforms are built, so re-running
     the installer here re-resolves through ``load_feishu_module()`` — which now

@@ -13,6 +13,9 @@ from hermes_multitenancy.feishu_inbound_richtext import install_feishu_inbound_r
 import pytest
 
 
+_REAL_MATERIALIZE = feishu_adapter_compat._materialize_deferred_feishu_platform
+
+
 @pytest.fixture(autouse=True)
 def _isolate_real_feishu_plugin(monkeypatch) -> None:
     """Keep the real core feishu plugin out of these layout tests.
@@ -22,7 +25,8 @@ def _isolate_real_feishu_plugin(monkeypatch) -> None:
     would materialize it on demand), so it would win over every fake layout
     below. Each test that needs a synthetic module installs its own.
     """
-    monkeypatch.delitem(sys.modules, feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAME, raising=False)
+    for name in feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(feishu_adapter_compat, "_materialize_deferred_feishu_platform", lambda: None)
 
 
@@ -179,22 +183,24 @@ def test_feishu_module_falls_back_on_bare_candidate_module_errors(monkeypatch) -
     assert seen == ["gateway.platforms.feishu", "plugins.platforms.feishu.adapter"]
 
 
-def test_feishu_module_prefers_already_loaded_synthetic_plugin_module(monkeypatch) -> None:
+@pytest.mark.parametrize("synthetic_name", feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES)
+def test_feishu_module_prefers_already_loaded_synthetic_plugin_module(monkeypatch, synthetic_name) -> None:
     """Regression for the double-import trap behind 0/49 inviter captures.
 
     ``hermes_cli/plugins.py`` loads the bundled feishu platform plugin under
-    the synthetic ``hermes_plugins.feishu_platform.adapter`` name via
+    a synthetic ``hermes_plugins.<slug>.adapter`` name (``feishu_platform`` on
+    core <= 0.21.4, ``platforms__feishu`` on 0.21.5) via
     ``spec_from_file_location`` — a module object DISTINCT from what a fresh
     ``import plugins.platforms.feishu.adapter`` would create from the same
     source file. Class patches (group_inviter_hook, cron delivery patches,
     reply-quote, …) must land on the module the gateway actually runs, so an
     already-loaded candidate must win over a fresh import."""
-    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    synthetic = types.ModuleType(synthetic_name)
     synthetic.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
     clone = types.ModuleType("plugins.platforms.feishu.adapter")
     clone.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
 
-    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    monkeypatch.setitem(sys.modules, synthetic_name, synthetic)
 
     def import_module(name: str) -> types.ModuleType:
         if name == "plugins.platforms.feishu.adapter":
@@ -207,11 +213,12 @@ def test_feishu_module_prefers_already_loaded_synthetic_plugin_module(monkeypatc
     assert feishu_adapter_compat.load_feishu_adapter() is synthetic.FeishuAdapter
 
 
-def test_feishu_module_skips_loaded_module_without_adapter_class(monkeypatch) -> None:
+@pytest.mark.parametrize("synthetic_name", feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES)
+def test_feishu_module_skips_loaded_module_without_adapter_class(monkeypatch, synthetic_name) -> None:
     """A half-initialized (or unrelated) module under a candidate name must
     not win the sys.modules preference; resolution falls through to import."""
-    partial = types.ModuleType("hermes_plugins.feishu_platform.adapter")
-    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", partial)
+    partial = types.ModuleType(synthetic_name)
+    monkeypatch.setitem(sys.modules, synthetic_name, partial)
     legacy = types.ModuleType("gateway.platforms.feishu")
     legacy.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
 
@@ -223,6 +230,129 @@ def test_feishu_module_skips_loaded_module_without_adapter_class(monkeypatch) ->
     monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
 
     assert feishu_adapter_compat.load_feishu_module() is legacy
+
+
+def _install_fake_platform_registry(monkeypatch, entry_factory):
+    """A ``gateway.platform_registry`` whose ``get('feishu')`` runs *entry_factory*."""
+    calls: list[str] = []
+
+    class _Registry:
+        def get(self, name: str):
+            calls.append(name)
+            return entry_factory()
+
+    gateway = types.ModuleType("gateway")
+    registry_module = types.ModuleType("gateway.platform_registry")
+    registry_module.platform_registry = _Registry()  # type: ignore[attr-defined]
+    gateway.platform_registry = registry_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry_module)
+    return calls
+
+
+@pytest.mark.parametrize("synthetic_name", feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES)
+def test_live_feishu_module_materializes_under_either_core_name(monkeypatch, synthetic_name) -> None:
+    """core 0.21.5 renamed the synthetic module (``feishu_platform`` →
+    ``platforms__feishu``); a miss made ``load_live_feishu_module`` fail closed
+    and the router exit at startup (local UAT 2026-10-07)."""
+    synthetic = types.ModuleType(synthetic_name)
+    synthetic.FeishuAdapter = type("FeishuAdapter", (), {"__module__": synthetic_name})  # type: ignore[attr-defined]
+
+    def materialize():
+        monkeypatch.setitem(sys.modules, synthetic_name, synthetic)
+        return types.SimpleNamespace(adapter_factory=synthetic.FeishuAdapter)
+
+    calls = _install_fake_platform_registry(monkeypatch, materialize)
+
+    assert feishu_adapter_compat.load_live_feishu_module() is synthetic
+    assert calls == ["feishu"]
+
+
+def test_live_feishu_module_follows_registry_entry_for_unlisted_synthetic_name(monkeypatch) -> None:
+    """A per-home scope suffix (``platforms__feishu__home_<digest>``) is not in
+    the name list; the registered entry's adapter class still names the live
+    module, so resolution follows it instead of failing closed."""
+    name = "hermes_plugins.platforms__feishu__home_0123456789ab.adapter"
+    synthetic = types.ModuleType(name)
+    synthetic.FeishuAdapter = type("FeishuAdapter", (), {"__module__": name})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, name, synthetic)
+    _install_fake_platform_registry(
+        monkeypatch, lambda: types.SimpleNamespace(adapter_factory=synthetic.FeishuAdapter)
+    )
+
+    assert feishu_adapter_compat.load_live_feishu_module() is synthetic
+
+
+@pytest.mark.parametrize("bare_name", feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES)
+def test_scoped_registry_entry_beats_bare_module_from_another_home(monkeypatch, bare_name) -> None:
+    """Review P1 (loaded-name-preempts-scoped-registry): core 0.21.5 scopes
+    platform entries per HERMES_HOME; the first home's plugin keeps the bare
+    module name, later homes get ``__home_<digest>``. With a tenant home's bare
+    module already loaded, the router home's registry entry (suffixed module)
+    must win — else every class patch lands on the tenant class."""
+    tenant = types.ModuleType(bare_name)
+    tenant.FeishuAdapter = type("FeishuAdapter", (), {"__module__": bare_name})  # type: ignore[attr-defined]
+    router_name = bare_name.replace(".adapter", "__home_x.adapter")
+    router = types.ModuleType(router_name)
+    router.FeishuAdapter = type("FeishuAdapter", (), {"__module__": router_name})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, bare_name, tenant)
+    monkeypatch.setitem(sys.modules, router_name, router)
+    _install_fake_platform_registry(
+        monkeypatch, lambda: types.SimpleNamespace(adapter_factory=router.FeishuAdapter)
+    )
+    monkeypatch.setattr(
+        feishu_adapter_compat,
+        "_materialize_deferred_feishu_platform",
+        _REAL_MATERIALIZE,
+    )
+
+    assert feishu_adapter_compat.load_live_feishu_module() is router
+    assert feishu_adapter_compat.load_feishu_module() is router
+    assert feishu_adapter_compat.load_feishu_adapter() is router.FeishuAdapter
+
+
+def test_registry_entry_class_must_be_the_modules_feishu_adapter(monkeypatch) -> None:
+    """Entry class claims a module whose ``FeishuAdapter`` is a different class →
+    that module is not trusted; resolution falls back to the known names."""
+    name = "hermes_plugins.platforms__feishu__home_y.adapter"
+    other = types.ModuleType(name)
+    other.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, name, other)
+    stray = type("FeishuAdapter", (), {"__module__": name})
+    bare_name = feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES[0]
+    bare = types.ModuleType(bare_name)
+    bare.FeishuAdapter = type("FeishuAdapter", (), {"__module__": bare_name})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, bare_name, bare)
+    _install_fake_platform_registry(monkeypatch, lambda: types.SimpleNamespace(adapter_factory=stray))
+
+    assert feishu_adapter_compat.load_live_feishu_module() is bare
+
+
+def test_unscoped_registry_entry_on_bare_name_still_resolves(monkeypatch) -> None:
+    """core <= 0.21.4 shape: one unscoped registry whose entry sits on the bare
+    ``feishu_platform`` module — registry-first must land on that same module."""
+    name = "hermes_plugins.feishu_platform.adapter"
+    synthetic = types.ModuleType(name)
+    synthetic.FeishuAdapter = type("FeishuAdapter", (), {"__module__": name})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, name, synthetic)
+    _install_fake_platform_registry(
+        monkeypatch, lambda: types.SimpleNamespace(adapter_factory=synthetic.FeishuAdapter)
+    )
+    monkeypatch.setattr(
+        feishu_adapter_compat,
+        "_materialize_deferred_feishu_platform",
+        _REAL_MATERIALIZE,
+    )
+
+    assert feishu_adapter_compat.load_live_feishu_module() is synthetic
+    assert feishu_adapter_compat.load_feishu_module() is synthetic
+
+
+def test_live_feishu_module_still_fails_closed_when_nothing_materializes(monkeypatch) -> None:
+    _install_fake_platform_registry(monkeypatch, lambda: None)
+
+    with pytest.raises(RuntimeError, match="did not materialize"):
+        feishu_adapter_compat.load_live_feishu_module()
 
 
 def test_feishu_adapter_load_error_logger_distinguishes_expected_missing_modules() -> None:

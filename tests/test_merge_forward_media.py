@@ -21,7 +21,8 @@ def _isolate_real_feishu_plugin(monkeypatch) -> None:
     """
     from hermes_multitenancy import feishu_adapter_compat
 
-    monkeypatch.delitem(sys.modules, feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAME, raising=False)
+    for name in feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(feishu_adapter_compat, "_materialize_deferred_feishu_platform", lambda: None)
 
 

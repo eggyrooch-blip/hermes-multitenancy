@@ -102,7 +102,7 @@ def _install_fake_feishu_module(monkeypatch) -> types.ModuleType:
     module.FeishuAdapter = type("FeishuAdapter", (_FakeFeishuAdapter,), {})  # type: ignore[attr-defined]
 
     for name in (
-        "hermes_plugins.feishu_platform.adapter",
+        *feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES,
         "gateway.platforms.feishu",
         "plugins.platforms.feishu.adapter",
     ):
@@ -320,9 +320,11 @@ class _FakeGateway:
 _MARKER = "_hermes_multitenancy_send_retry_fatal_patched"
 
 
-def test_reinstall_at_gateway_startup_lands_on_synthetic_plugin_class(monkeypatch) -> None:
+@pytest.mark.parametrize("synthetic_name", feishu_adapter_compat._PLUGIN_LOADER_MODULE_NAMES)
+def test_reinstall_at_gateway_startup_lands_on_synthetic_plugin_class(monkeypatch, synthetic_name) -> None:
     """prod v0190 boot: at register() time the plugin loader has not yet re-exec'd
-    the feishu source under ``hermes_plugins.feishu_platform.adapter``, so the
+    the feishu source under its synthetic name (``hermes_plugins.feishu_platform.adapter``
+    on core <= 0.21.4, ``hermes_plugins.platforms__feishu.adapter`` on 0.21.5), so the
     patch can only land on the ``plugins.platforms.feishu.adapter`` clone — a
     DIFFERENT class object from the one the gateway runs. The startup pass, which
     happens after the platforms are built, must re-resolve and land it on the
@@ -332,11 +334,11 @@ def test_reinstall_at_gateway_startup_lands_on_synthetic_plugin_class(monkeypatc
 
     # The loader now re-execs the same source under the synthetic name: a
     # distinct class object carrying the pristine core method.
-    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    synthetic = types.ModuleType(synthetic_name)
     for attr in ("_FEISHU_SEND_ATTEMPTS", "_FEISHU_REPLY_FALLBACK_CODES", "_POST_CONTENT_INVALID_RE"):
         setattr(synthetic, attr, getattr(fallback, attr))
     synthetic.FeishuAdapter = type("FeishuAdapter", (_FakeFeishuAdapter,), {})  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    monkeypatch.setitem(sys.modules, synthetic_name, synthetic)
     assert synthetic.FeishuAdapter is not fallback.FeishuAdapter
     assert not getattr(synthetic.FeishuAdapter._feishu_send_with_retry, _MARKER, False)
 
