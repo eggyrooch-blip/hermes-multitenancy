@@ -103,6 +103,21 @@ _REGISTERED_MODULE_ATTR = "_hermes_multitenancy_registered_module"
 _REGISTERED_MANAGER_ATTR = "_hermes_multitenancy_registered_manager"
 
 
+class RequiredRegistrationFailed(BaseException):
+    """A required multitenancy step failed during ``register()``: stop the process.
+
+    core 0.21.5's plugin loader catches ``Exception`` and ``SystemExit`` from
+    import + register() in both its inline and its deadline-worker mode
+    (``plugins.load_timeout_seconds``) and only logs them, so the gateway would
+    keep running without the tenant boundary.  Deriving from neither lets the
+    failure cross that loader (the deadline worker re-raises it on the loading
+    thread) and end the process with exit status 1, as SystemExit(1) did on
+    0.21.4.
+    """
+
+    code = 1
+
+
 def register(ctx) -> None:
     """Register the production isolation boundary or terminate startup."""
     owner = getattr(sys, _REGISTERED_MODULE_ATTR, None)
@@ -119,16 +134,37 @@ def register(ctx) -> None:
     setattr(sys, _REGISTERED_MANAGER_ATTR, manager)
     try:
         _self()._register(ctx)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
+        # SystemExit too: core 0.21.5 swallows it like any Exception, so a step
+        # that exits must be escalated as well.  KeyboardInterrupt and other
+        # BaseExceptions keep propagating unchanged.
         if getattr(sys, _REGISTERED_MODULE_ATTR, None) == __name__:
             delattr(sys, _REGISTERED_MODULE_ATTR)
             if hasattr(sys, _REGISTERED_MANAGER_ATTR):
                 delattr(sys, _REGISTERED_MANAGER_ATTR)
-        # The host treats plugin registration errors as optional.  Converting a
-        # multitenancy failure to SystemExit keeps production fail-closed
-        # without changing hermes-agent.
-        logger.critical("[multitenancy] required plugin registration failed: %s", type(exc).__name__)
-        raise SystemExit(1) from None
+        # The host treats plugin registration errors (SystemExit included since
+        # core 0.21.5) as optional.  Escalating past its handler keeps
+        # production fail-closed without changing hermes-agent.
+        failure = f"{_failed_step(exc)}: {type(exc).__name__}"
+        logger.critical("multitenancy required registration failed (%s): stopping gateway", failure)
+        raise RequiredRegistrationFailed(failure) from None
+
+
+def _failed_step(exc: BaseException) -> str:
+    """Name the ``_register`` step that raised, without the exception message.
+
+    The traceback starts at ``register``; the next frame is ``_register`` and the
+    one after it is the step it was running.  Messages stay out of the log: they
+    can carry paths or credentials.
+    """
+    names = []
+    tb = exc.__traceback__
+    while tb is not None:
+        names.append(tb.tb_frame.f_code.co_name)
+        tb = tb.tb_next
+    if len(names) > 2:
+        return names[2]
+    return names[-1] if names else "unknown"
 
 
 def _register_duplicate_copy(ctx, owner: str) -> None:

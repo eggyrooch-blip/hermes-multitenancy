@@ -85,19 +85,36 @@ def test_register_calls_required_hooks():
     assert all(callable(cb) for _name, cb in calls)
 
 
-def test_register_terminates_when_required_boundary_fails(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [lambda: PermissionError("unreadable plugin file"), lambda: SystemExit(7)],
+    ids=["exception", "systemexit"],
+)
+def test_register_terminates_when_required_boundary_fails(monkeypatch, error):
     import hermes_multitenancy
 
     monkeypatch.setattr(
         hermes_multitenancy,
         "_register",
-        lambda _ctx: (_ for _ in ()).throw(PermissionError("unreadable plugin file")),
+        lambda _ctx: (_ for _ in ()).throw(error()),
     )
 
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(hermes_multitenancy.RequiredRegistrationFailed) as exc:
         hermes_multitenancy.register(object())
 
     assert exc.value.code == 1
+
+
+def test_register_lets_keyboard_interrupt_through(monkeypatch):
+    import hermes_multitenancy
+
+    def interrupted(_ctx):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hermes_multitenancy, "_register", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        hermes_multitenancy.register(object())
 
 
 def test_register_adds_tencent_vod_image_provider_when_supported():
@@ -472,7 +489,7 @@ def test_failed_registration_clears_owner_markers(monkeypatch):
         raise RuntimeError("install failed")
 
     monkeypatch.setattr(hermes_multitenancy, "_register", boom)
-    with pytest.raises(SystemExit):
+    with pytest.raises(hermes_multitenancy.RequiredRegistrationFailed):
         hermes_multitenancy.register(_ManagerCtx(object()))
     assert not hasattr(sys, "_hermes_multitenancy_registered_module")
     assert not hasattr(sys, "_hermes_multitenancy_registered_manager")
