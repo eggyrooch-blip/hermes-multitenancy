@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [manifest]
-constraints = [{ name = "hermes-agent", specifier = "==0.21.4", index = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/simple" }]
+constraints = [{ name = "hermes-agent", specifier = "==0.21.5", index = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/simple" }]
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -628,7 +628,7 @@ wheels = [
 
 [[package]]
 name = "hermes-agent"
-version = "0.21.4"
+version = "0.21.5"
 source = { registry = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/simple" }
 dependencies = [
     { name = "certifi" },
@@ -670,7 +670,7 @@ dependencies = [
     { name = "websockets" },
 ]
 wheels = [
-    { url = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/files/d76c90ca409d1b7a8eb7ce6c37b39f6c79c9188aeb4a068c9f15fc17cfc96f13/hermes_agent-0.21.4-py3-none-any.whl", hash = "sha256:d76c90ca409d1b7a8eb7ce6c37b39f6c79c9188aeb4a068c9f15fc17cfc96f13" },
+    { url = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/files/d0dde1182245c2dce1ed97bdf31266c0f70b3f85c35afb2fd9278b66ccd5ff46/hermes_agent-0.21.5-py3-none-any.whl", hash = "sha256:d0dde1182245c2dce1ed97bdf31266c0f70b3f85c35afb2fd9278b66ccd5ff46" },
 ]
 
 [[package]]

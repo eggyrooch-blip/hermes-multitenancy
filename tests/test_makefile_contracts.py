@@ -83,9 +83,9 @@ def test_core_source_probe_pins_the_production_core_line():
     source = PROBE.read_text(encoding="utf-8")
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
-    assert 'CORE_COMMIT = "2082ff0c1717b3ed2dc534a8eb54e00e7e657d1e"' in source
-    assert 'CORE_VERSION = "0.21.4"' in source
-    assert 'WHEEL_SHA256 = "d76c90ca409d1b7a8eb7ce6c37b39f6c79c9188aeb4a068c9f15fc17cfc96f13"' in source
+    assert 'CORE_COMMIT = "d4c7a42567b861aa69d3d698dc9c5480a5185ca5"' in source
+    assert 'CORE_VERSION = "0.21.5"' in source
+    assert 'WHEEL_SHA256 = "d0dde1182245c2dce1ed97bdf31266c0f70b3f85c35afb2fd9278b66ccd5ff46"' in source
     assert 'PROJECT_ID = "2765"' in source
     assert "ci-core-source-probe:\n\tpython3 scripts/ci_core_source_probe.py" in makefile
 
@@ -142,6 +142,6 @@ def test_core_source_probe_installs_production_core_from_registry():
     log = (result.stdout + result.stderr).strip()
 
     assert result.returncode == 0, log
-    assert "core-source: OK hermes-agent 0.21.4" in result.stdout, log
-    assert "sha256=d76c90ca409d1b7a8eb7ce6c37b39f6c79c9188aeb4a068c9f15fc17cfc96f13" in result.stdout, log
+    assert "core-source: OK hermes-agent 0.21.5" in result.stdout, log
+    assert "sha256=d0dde1182245c2dce1ed97bdf31266c0f70b3f85c35afb2fd9278b66ccd5ff46" in result.stdout, log
     warnings.warn(CoreSourceProbeLog(log))

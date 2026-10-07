@@ -25,11 +25,11 @@ import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
-# Production core line: tag prod-core-v0214-2082ff0c17 of the private hermes-agent fork.
-CORE_COMMIT = "2082ff0c1717b3ed2dc534a8eb54e00e7e657d1e"
-CORE_VERSION = "0.21.4"
+# Production core line: tag prod-core-v0215-d4c7a42567 of the private hermes-agent fork.
+CORE_COMMIT = "d4c7a42567b861aa69d3d698dc9c5480a5185ca5"
+CORE_VERSION = "0.21.5"
 WHEEL = f"hermes_agent-{CORE_VERSION}-py3-none-any.whl"
-WHEEL_SHA256 = "d76c90ca409d1b7a8eb7ce6c37b39f6c79c9188aeb4a068c9f15fc17cfc96f13"
+WHEEL_SHA256 = "d0dde1182245c2dce1ed97bdf31266c0f70b3f85c35afb2fd9278b66ccd5ff46"
 PACKAGE = "hermes-core"
 PROJECT_ID = "2765"  # sunke/hermes-multitenancy
 DEFAULT_API = "https://gitlab.example.com/api/v4"
