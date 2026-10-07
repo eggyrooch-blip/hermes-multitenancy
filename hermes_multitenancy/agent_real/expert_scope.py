@@ -103,13 +103,24 @@ def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
         if skills_tool is not None and hasattr(skills_tool, "_is_skill_disabled"):
             _orig_is_disabled = skills_tool._is_skill_disabled
 
-            def _with_expert_is_disabled(name, platform=None, *, _orig=_orig_is_disabled, _extra=_hide):
-                if name in _extra:
+            def _with_expert_is_disabled(*names, platform=None, _orig=_orig_is_disabled, _extra=_hide):
+                # Upstream main (post-0.21.5) hands skill_view's aliases over in ONE
+                # call — _is_skill_disabled(resolved_name, rel): any expert-hidden
+                # alias must hide the skill. Older cores take one name per call, so a
+                # multi-name delegation TypeErrors and falls back to per-name probes.
+                if any(name in _extra for name in names):
                     return True
                 try:
-                    return bool(_orig(name, platform))
+                    return bool(_orig(*names, platform=platform))
                 except TypeError:
-                    return bool(_orig(name))
+                    for name in names:
+                        try:
+                            if bool(_orig(name, platform)):
+                                return True
+                        except TypeError:
+                            if bool(_orig(name)):  # core predates the platform arg
+                                return True
+                    return False
 
             patched_module_attrs.append((skills_tool, "_is_skill_disabled", _orig_is_disabled))
             skills_tool._is_skill_disabled = _with_expert_is_disabled

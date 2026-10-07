@@ -149,7 +149,14 @@ def _allowed_server_names(
     is None`` means "core decides" (no profile list, no resolver), which for MCP
     means every server this profile itself DECLARED and left enabled.
     """
-    from tools.mcp_tool_discovery import _enabled as _server_enabled
+    # Core v0.21.5 moved the single reader of ``mcp_servers.<name>.enabled`` to
+    # ``tools.mcp_tool_common.mcp_server_enabled`` and deleted ``discovery._enabled``;
+    # on v0.21.4 the common module exists but lacks the function, and a from-import
+    # of a missing attribute raises ImportError too — one except covers both cores.
+    try:
+        from tools.mcp_tool_common import mcp_server_enabled as _server_enabled
+    except ImportError:
+        from tools.mcp_tool_discovery import _enabled as _server_enabled
 
     available = {
         name for name, cfg in configured.items()
