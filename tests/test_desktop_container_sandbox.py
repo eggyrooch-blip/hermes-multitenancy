@@ -71,10 +71,15 @@ class _FakePodman:
         self.probe_count = 0
         self.inspect_error: str | None = None
         self.on_run = None
+        self.info_returncode = 0
+        self.info_stdout = "true\n"
 
     def __call__(self, podman_bin: str, args: list[str], *, timeout=None, check=False):
         self.calls.append([podman_bin, *args])
         verb = args[0]
+        if verb == "info":
+            return _completed(args, returncode=self.info_returncode, stdout=self.info_stdout,
+                              stderr="" if self.info_returncode == 0 else "cannot set up namespace")
         if verb == "inspect":
             if self.inspect_error is not None:
                 return _completed(args, returncode=125, stderr=self.inspect_error)
@@ -148,6 +153,12 @@ def _make_socket(path: Path) -> None:
     sock.close()
     os.replace(short, path)
     os.rmdir(short_dir)
+
+
+@pytest.fixture(autouse=True)
+def rootful_gateway(monkeypatch):
+    """Every test runs as a root gateway (rootful podman) unless it says otherwise."""
+    monkeypatch.setattr(ds, "_effective_uid", lambda: 0)
 
 
 @pytest.fixture
@@ -244,6 +255,7 @@ def test_desktop_decision_reads_every_host_knob_from_shared_config(profile: Path
     "container_path": "/evil",
     "ensure_timeout_s": 1,
     "screen_timeout_s": 1,
+    "rootless": "false",
 }.items()))
 def test_profile_config_host_only_keys_are_ignored_with_warning(profile: Path, caplog, key, value):
     """P0: a tenant-writable profile config must never control the host runtime."""
@@ -652,11 +664,17 @@ def test_every_async_caller_wraps_off_the_event_loop_and_holds_a_turn_lease():
     streaming = (base / "streaming.py").read_text(encoding="utf-8")
     warm = (base / "warm_worker.py").read_text(encoding="utf-8")
     for source, name in ((core, "_core"), (streaming, "streaming"), (warm, "warm_worker")):
-        assert "asyncio.to_thread(\n        _wrap_with_sandbox" in source or "asyncio.to_thread(\n            _wrap_with_sandbox" in source, name
-    # No remaining synchronous call from the async callers.
-    assert core.count("cmd = _wrap_with_sandbox(") == 0
-    assert streaming.count("cmd = _wrap_with_sandbox(") == 0
-    assert warm.count("cmd = _wrap_with_sandbox(") == 0
+        assert "cmd, spawn_env = await asyncio.to_thread(\n        _sandbox_spawn" in source or (
+            "cmd, spawn_env = await asyncio.to_thread(\n            _sandbox_spawn" in source
+        ), name
+        # The wrapped command is spawned with the spawn env, never the worker env.
+        spawn = source[source.index("create_subprocess_exec(", source.index("_sandbox_spawn,")):]
+        spawn = spawn[: spawn.index(")")]
+        assert "env=spawn_env," in spawn and "env=env," not in spawn, name
+    # No production spawn goes through the argv-only wrapper.
+    for source in (streaming, warm):
+        assert "_wrap_with_sandbox" not in source
+    assert core.count("_wrap_with_sandbox(") == 2  # definition + _sandbox_spawn's non-desktop branch
     assert "_desktop_turn_scope(profile_home)" in core
     assert "_pkg._desktop_turn_scope(profile_home)" in streaming
 
@@ -1243,3 +1261,428 @@ def test_profile_model_capability_declarations_are_not_desktop_host_keys(profile
     assert decision.enabled is True
     assert decision.ignored_profile_keys == ()
     assert not [rec for rec in caplog.records if "host-only" in rec.message]
+
+
+# --- rootless podman (gateway is not root) --------------------------------------
+
+
+def _rootless(monkeypatch, profile: Path) -> None:
+    """Gateway runs as the profile owner, not root: ``auto`` resolves to rootless."""
+    uid = profile.stat().st_uid
+    monkeypatch.setattr(ds, "_effective_uid", lambda: uid if uid != 0 else 1000)
+
+
+def _rootful_snapshot_layout(tmp_path: Path) -> tuple[Path, Path]:
+    shared = tmp_path / ".hermes"
+    profile = (shared / "profiles" / "desktop_smoke")
+    (profile / "workspace").mkdir(parents=True)
+    (shared / "config.yaml").write_text("model: {}\n")
+    (shared / ".env").write_text("SHARED=1\n")
+    (shared / "bin").mkdir()
+    (shared / "skills").mkdir()
+    (shared / "cron").mkdir()
+    return shared.resolve(), profile.resolve()
+
+
+def test_rootful_run_args_snapshot_is_byte_identical_to_pre_rootless(monkeypatch, tmp_path: Path):
+    """Regression guard: a root gateway builds exactly the pre-rootless argv.
+
+    The expected list is the argv origin/main (86ac04d5) produced for this
+    layout, written out literally; the spec digest is recomputed with the
+    pre-rootless spec dict so an added key would show up as drift here. The
+    only intended changes since: every tmpfs carries ``notmpcopyup`` and the
+    spec records it.
+    """
+    shared, profile = _rootful_snapshot_layout(tmp_path)
+    monkeypatch.setattr(ds, "_selinux_enforcing", lambda: True)
+    decision = ds.desktop_decision(DESKTOP_ON, profile)
+    owner = profile.stat()
+    cfg = (shared / "config.yaml").stat()
+    mt_repo = Path(ds.__file__).resolve().parent.parent
+    spec = {
+        "image": ds.DEFAULT_IMAGE, "network": "hermes-desktop", "subid_base": 300000,
+        "owner": [owner.st_uid, owner.st_gid], "memory": "3g", "cpus": "2", "shm_size": "1g",
+        "container_python": ds.DEFAULT_CONTAINER_PYTHON, "container_hermes": ds.DEFAULT_CONTAINER_HERMES,
+        "container_path": ds.DEFAULT_CONTAINER_PATH,
+        "exec_env": [["XDG_RUNTIME_DIR", "/tmp/hermes-runtime"]],
+        "tmpfs": ["feishu_uat", "tokens", "workspace/credentials", "home"],
+        "tmpfs_opts": "notmpcopyup",
+    }
+    spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    p, s = str(profile), str(shared)
+    expected = [
+        "run", "-d", "--name", decision.container_name, "--init", "--entrypoint", "/bin/sleep",
+        "--user", "10000:10000",
+        "--uidmap", "0:300000:10000", "--uidmap", f"10000:{owner.st_uid}:1", "--uidmap", "10001:310001:55535",
+        "--gidmap", "0:300000:10000", "--gidmap", f"10000:{owner.st_gid}:1", "--gidmap", "10001:310001:55535",
+        "--label", "io.hermes.mt.role=desktop",
+        "--label", "io.hermes.mt.profile=desktop_smoke",
+        "--label", f"io.hermes.mt.profile_home={p}",
+        "--label", f"io.hermes.mt.spec={spec_hash}",
+        "--label", "io.hermes.mt.image_id=sha256:img",
+        "--label", f"io.hermes.mt.shared_config={cfg.st_dev}:{cfg.st_ino}",
+        "--memory", "3g", "--cpus", "2", "--shm-size", "1g", "--network", "hermes-desktop",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+        "-e", "HERMES_UID=10000", "-e", "HERMES_GID=10000", "-e", f"HERMES_HOME={p}",
+        "-v", f"{p}:{p}:rw,Z",
+        "-v", f"{p}/workspace:/workspace:rw,Z",
+        "-v", f"{mt_repo}:{mt_repo}:ro,z",
+        "--mount", f"type=bind,src=/dev/null,dst={p}/.env,ro",
+        "--mount", f"type=bind,src={mt_repo}/hermes_multitenancy/sandbox/empty-auth.json,dst={p}/auth.json,ro,relabel=shared",
+        "--tmpfs", "/tmp/hermes-runtime:notmpcopyup",
+        "--tmpfs", f"{p}/feishu_uat:notmpcopyup", "--tmpfs", f"{p}/tokens:notmpcopyup",
+        "--tmpfs", f"{p}/workspace/credentials:notmpcopyup", "--tmpfs", f"{p}/home:notmpcopyup",
+        "--mount", f"type=bind,src={s}/config.yaml,dst={s}/config.yaml,ro,relabel=shared",
+        "--mount", f"type=bind,src=/dev/null,dst={s}/.env,ro",
+        "-v", f"{s}/bin:{s}/bin:ro,z",
+        "-v", f"{s}/skills:{s}/skills:ro,z",
+        "-v", f"{s}/cron:{s}/cron:rw,z",
+        ds.DEFAULT_IMAGE, "infinity",
+    ]
+
+    assert ds.run_args(decision, image_id="sha256:img") == expected
+    # Forcing rootful while not root gives the same bytes (only the mode decides).
+    monkeypatch.setattr(ds, "_effective_uid", lambda: 4242)
+    forced = ds.desktop_decision(_shared_on("podman", rootless="false"), profile)
+    assert ds.run_args(forced, image_id="sha256:img") == expected
+    assert decision.spec_hash(owner.st_uid, owner.st_gid) == spec_hash
+
+
+@pytest.mark.parametrize("rootless", [False, True])
+def test_exec_spawn_env_never_carries_tenant_loader_or_engine_controls(
+    monkeypatch, tmp_path: Path, podman_ok, profile: Path, rootless: bool,
+):
+    """P0 (review 2026-10-08): the host podman process must never see the worker env.
+
+    The worker env carries the tenant's profile .env; LD_PRELOAD/LD_AUDIT there
+    would load tenant code into the HOST podman (root for rootful) before any
+    sandbox exists, and CONTAINERS_*/PODMAN_* would redirect podman itself.
+    """
+    if rootless:
+        _rootless(monkeypatch, profile)
+    for name in list(os.environ):
+        if name.startswith(("LD_", "CONTAINERS_", "_CONTAINERS_", "CONTAINER_", "PODMAN_", "BUILDAH_", "XDG_")) or name in ds.PODMAN_HOST_ENV:
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("HOME", "/home/gateway")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/gateway/lib")
+    monkeypatch.setenv("CONTAINERS_STORAGE_CONF", "/etc/gateway-storage.conf")
+    monkeypatch.setenv("GATEWAY_ONLY_SECRET", "gw-secret")
+    decision = _decision(profile, podman_ok)
+    fake = _FakePodman(state=None, screen_sock=decision.rfb_socket)
+    monkeypatch.setattr(ds, "_run_podman", fake)
+    handle = ds.ensure(decision)
+    worker_env = {
+        "LD_PRELOAD": f"{profile}/evil.so",
+        "LD_AUDIT": f"{profile}/audit.so",
+        "LD_LIBRARY_PATH": f"{profile}/lib",
+        "DYLD_INSERT_LIBRARIES": f"{profile}/evil.dylib",
+        "GCONV_PATH": f"{profile}/gconv",
+        "GLIBC_TUNABLES": "glibc.malloc.check=3",
+        "PYTHONPATH": "/opt/hermes-agent",
+        "CONTAINERS_CONF": f"{profile}/containers.conf",
+        "CONTAINERS_STORAGE_CONF": f"{profile}/storage.conf",
+        "_CONTAINERS_ROOTLESS_UID": "0",
+        "PODMAN_USERNS": "host",
+        "BUILDAH_ISOLATION": "chroot",
+        "CONTAINER_HOST": "unix:///tenant.sock",
+        "STORAGE_DRIVER": "vfs",
+        "GODEBUG": "x=1",
+        "HOME": f"{profile}/home",
+        "XDG_CONFIG_HOME": f"{profile}/config",
+        "TMPDIR": f"{profile}/tmp",
+        "OPENAI_API_KEY": "sk-secret-value",
+        "HERMES_HOME": str(profile),
+        "PATH": "/host/bin",
+    }
+
+    argv, spawn_env = ds.exec_args(decision, handle, ["/py", "x.py"], worker_env, workdir=profile / "workspace")
+
+    assert argv[:3] == [podman_ok, "exec", "-i"]
+    # Host spawn env: gateway podman paths + gateway engine config + by-name worker keys. Nothing else.
+    assert spawn_env == {
+        "HOME": "/home/gateway",
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        "CONTAINERS_STORAGE_CONF": "/etc/gateway-storage.conf",
+        "OPENAI_API_KEY": "sk-secret-value",
+        "HERMES_HOME": str(profile),
+    }
+    # Secrets cross by name only.
+    assert "sk-secret-value" not in " ".join(argv)
+    assert argv[argv.index("OPENAI_API_KEY") - 1] == "-e"
+    # Tenant paths and loader/interpreter values reach the CONTAINER inline only.
+    for key in ("HOME", "XDG_CONFIG_HOME", "TMPDIR", "LD_PRELOAD", "LD_AUDIT", "PYTHONPATH", "GCONV_PATH"):
+        assert f"{key}={worker_env[key]}" in argv
+        assert key not in argv  # never a bare by-name -e KEY
+    # Container-engine controls go nowhere.
+    joined = " ".join(argv)
+    for key in ("CONTAINERS_CONF", "_CONTAINERS_ROOTLESS_UID", "PODMAN_USERNS", "BUILDAH_ISOLATION",
+                "CONTAINER_HOST", "STORAGE_DRIVER", "GODEBUG"):
+        assert key not in joined
+    assert f"{profile}/storage.conf" not in joined
+
+
+def test_sandbox_spawn_desktop_profile_spawns_with_spawn_env_not_worker_env(
+    monkeypatch, tmp_path: Path, podman_ok,
+):
+    agent_real = _linux(monkeypatch, tmp_path)
+    profile = _desktop_profile(tmp_path, podman_ok)
+    decision = agent_real._desktop_decision_for_profile(profile)
+    fake = _FakePodman(state=None, screen_sock=decision.rfb_socket)
+    monkeypatch.setattr(ds, "_run_podman", fake)
+    worker_env = {"LD_PRELOAD": f"{profile}/evil.so", "OPENAI_API_KEY": "sk-x"}
+
+    argv, spawn_env = agent_real._sandbox_spawn([sys.executable, "child.py"], profile, env=worker_env)
+
+    assert spawn_env is not worker_env
+    assert "LD_PRELOAD" not in spawn_env and spawn_env["OPENAI_API_KEY"] == "sk-x"
+    assert f"LD_PRELOAD={profile}/evil.so" in argv
+    # The argv-only view is the same argv.
+    assert agent_real._wrap_with_sandbox([sys.executable, "child.py"], profile, env=worker_env) == argv
+
+
+def test_sandbox_spawn_non_desktop_profile_keeps_worker_env_and_bwrap_argv(monkeypatch, tmp_path: Path):
+    agent_real = _linux(monkeypatch, tmp_path)
+    profile = tmp_path / ".hermes" / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    env = {"A": "1"}
+
+    argv, spawn_env = agent_real._sandbox_spawn(["/usr/bin/python3", "c.py"], profile, env=env)
+
+    assert spawn_env is env
+    assert argv == agent_real._wrap_linux_bwrap(["/usr/bin/python3", "c.py"], profile)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, "auto"), ("auto", "auto"), (True, "true"), ("true", "true"), ("on", "true"),
+     (False, "false"), ("false", "false"), ("off", "false"), ("bogus", "auto")],
+)
+def test_rootless_mode_parsing(profile: Path, value, expected):
+    extra = {} if value is None else {"rootless": value}
+    assert ds.desktop_decision(_shared_on("podman", **extra), profile).rootless == expected
+
+
+@pytest.mark.parametrize(("mode", "euid", "expected"), [
+    ("auto", 0, False), ("auto", 1000, True), ("true", 0, True), ("false", 1000, False),
+])
+def test_is_rootless_follows_mode_then_euid(monkeypatch, profile: Path, mode, euid, expected):
+    monkeypatch.setattr(ds, "_effective_uid", lambda: euid)
+    decision = ds.desktop_decision(_shared_on("podman", rootless=mode), profile)
+    assert ds.is_rootless(decision) is expected
+
+
+def test_rootless_run_args_use_keep_id_and_keep_every_hardening_flag(monkeypatch, tmp_path: Path):
+    shared, profile = _rootful_snapshot_layout(tmp_path)
+    monkeypatch.setattr(ds, "_selinux_enforcing", lambda: True)
+    rootful = ds.run_args(ds.desktop_decision(DESKTOP_ON, profile), image_id="sha256:img")
+    _rootless(monkeypatch, profile)
+    decision = ds.desktop_decision(DESKTOP_ON, profile)
+
+    args = ds.run_args(decision, image_id="sha256:img")
+
+    assert "--uidmap" not in args and "--gidmap" not in args
+    assert "--userns=keep-id:uid=10000,gid=10000" in args
+    assert args[args.index("--userns=keep-id:uid=10000,gid=10000") - 1] == "10000:10000"
+    # Every tmpfs is owned by uid 10000 (keep-id leaves it to container root otherwise).
+    tmpfs = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--tmpfs"]
+    assert len(tmpfs) == 1 + len(ds.TMPFS_PROFILE_SUBDIRS)
+    assert all(t.endswith(":rw,mode=0700,U,notmpcopyup") for t in tmpfs)
+    assert f"{ds.CONTAINER_RUNTIME_DIR}:rw,mode=0700,U,notmpcopyup" in tmpfs
+    # Everything but the id maps and the spec digest is byte-identical to rootful.
+    def strip(argv: list[str]) -> list[str]:
+        out, skip = [], 0
+        for i, arg in enumerate(argv):
+            if skip:
+                skip -= 1
+                continue
+            if arg in {"--uidmap", "--gidmap"}:
+                skip = 1
+                continue
+            if arg.startswith("--userns=") or arg.startswith(f"{ds.LABEL_SPEC}="):
+                continue
+            out.append(arg.removesuffix(":rw,mode=0700,U,notmpcopyup").removesuffix(":notmpcopyup"))
+        return out
+    assert strip(args) == strip(rootful)
+    joined = " ".join(args)
+    for flag in ("--cap-drop ALL", "--security-opt no-new-privileges", "--user 10000:10000",
+                 f"type=bind,src=/dev/null,dst={profile}/.env,ro", f"--tmpfs {profile}/tokens:"):
+        assert flag in joined
+    owner = profile.stat()
+    labels = _labels_from_run_args(args)
+    assert labels[ds.LABEL_SPEC] == decision.spec_hash(owner.st_uid, owner.st_gid, rootless=True)
+    assert labels[ds.LABEL_SPEC] != decision.spec_hash(owner.st_uid, owner.st_gid)
+
+
+def test_rootless_run_args_refuse_profile_not_owned_by_gateway(monkeypatch, profile: Path):
+    monkeypatch.setattr(ds, "_selinux_enforcing", lambda: False)
+    monkeypatch.setattr(ds, "_effective_uid", lambda: profile.stat().st_uid + 1)
+    decision = ds.desktop_decision(_shared_on("podman", rootless="true"), profile)
+
+    with pytest.raises(ds.DesktopSandboxError) as excinfo:
+        ds.run_args(decision)
+    assert excinfo.value.reason == "desktop_container_unavailable"
+    assert "keep-id can only map the gateway user" in str(excinfo.value)
+
+
+def test_rootless_ensure_probes_podman_info_first_and_pins_gateway_env_for_exec(
+    monkeypatch, tmp_path: Path, podman_ok, profile: Path,
+):
+    _rootless(monkeypatch, profile)
+    monkeypatch.setenv("HOME", "/home/gateway")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    decision = _decision(profile, podman_ok)
+    fake = _FakePodman(state=None, screen_sock=decision.rfb_socket)
+    monkeypatch.setattr(ds, "_run_podman", fake)
+
+    handle = ds.ensure(decision)
+
+    assert fake.calls[0][1:] == ["info", "--format", "{{.Host.Security.Rootless}}"]
+    run = next(call for call in fake.calls if call[1] == "run")
+    assert "--userns=keep-id:uid=10000,gid=10000" in run and "--uidmap" not in run
+
+    worker_env = {
+        "HOME": f"{profile}/home",
+        "XDG_CONFIG_HOME": f"{profile}/config",
+        "XDG_RUNTIME_DIR": "/should-not-cross",
+        "OPENAI_API_KEY": "sk-secret-value",
+        "PATH": "/host/bin",
+    }
+    argv, spawn_env = ds.exec_args(decision, handle, ["/py", "x.py"], worker_env, workdir=profile / "workspace")
+
+    # The host podman finds its storage through the gateway's HOME/XDG, not the tenant's.
+    assert spawn_env["HOME"] == "/home/gateway" and spawn_env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    assert "XDG_CONFIG_HOME" not in spawn_env and "XDG_DATA_HOME" not in spawn_env
+    assert argv[:3] == [podman_ok, "exec", "-i"]
+    assert f"HOME={profile}/home" in argv and f"XDG_CONFIG_HOME={profile}/config" in argv
+    assert f"XDG_RUNTIME_DIR={ds.CONTAINER_RUNTIME_DIR}" in argv and "XDG_RUNTIME_DIR=/should-not-cross" not in argv
+    assert argv[argv.index("OPENAI_API_KEY") - 1] == "-e"
+    assert "sk-secret-value" not in " ".join(argv)
+
+
+@pytest.mark.parametrize(("returncode", "stdout"), [(125, ""), (0, "false\n")])
+def test_rootless_ensure_fails_closed_when_podman_info_fails_or_is_rootful(
+    monkeypatch, tmp_path: Path, podman_ok, profile: Path, returncode: int, stdout: str,
+):
+    _rootless(monkeypatch, profile)
+    decision = _decision(profile, podman_ok)
+    fake = _FakePodman(state=None, screen_sock=decision.rfb_socket)
+    fake.info_returncode, fake.info_stdout = returncode, stdout
+    monkeypatch.setattr(ds, "_run_podman", fake)
+
+    with pytest.raises(ds.DesktopSandboxError) as excinfo:
+        ds.ensure(decision)
+    assert excinfo.value.reason == "desktop_podman_unavailable"
+    assert [call[1] for call in fake.calls] == ["info"]
+
+
+def test_wrap_rootless_podman_info_failure_emits_security_event(monkeypatch, tmp_path: Path):
+    """Acceptance: podman info fails (PATH points at a broken podman) → fail-closed + event."""
+    agent_real = _linux(monkeypatch, tmp_path)
+    audit = _audit(monkeypatch, tmp_path)
+    broken = tmp_path / "empty-bin" / "podman"
+    broken.parent.mkdir()
+    broken.write_text("#!/bin/sh\necho 'cannot find newuidmap' >&2\nexit 125\n")
+    broken.chmod(0o755)
+    profile = _desktop_profile(tmp_path, str(broken))
+    _rootless(monkeypatch, profile)
+
+    with pytest.raises(RuntimeError, match="desktop_podman_unavailable"):
+        agent_real._wrap_with_sandbox([sys.executable, "child.py"], profile, env={"A": "b"})
+
+    events = _audit_events(audit)
+    assert events[-1]["event_type"] == "sandbox.denied"
+    assert events[-1]["reason"] == "desktop_podman_unavailable"
+
+
+@pytest.mark.parametrize("rootless", [True, False])
+def test_podman_run_timeout_reason_is_neutral_and_rootless_only(
+    monkeypatch, tmp_path: Path, podman_ok, profile: Path, rootless: bool,
+):
+    if rootless:
+        _rootless(monkeypatch, profile)
+    decision = _decision(profile, podman_ok)
+    fake = _FakePodman(state=None, screen_sock=decision.rfb_socket)
+
+    def slow_run(podman_bin, args, *, timeout=None, check=False):
+        if args[0] == "run":
+            raise subprocess.TimeoutExpired(args, timeout)
+        return fake(podman_bin, args, timeout=timeout, check=check)
+
+    monkeypatch.setattr(ds, "_run_podman", slow_run)
+
+    with pytest.raises(ds.DesktopSandboxError) as excinfo:
+        ds.ensure(decision)
+    if rootless:
+        # The timeout does not say why; the message must not pin it on prewarm.
+        assert excinfo.value.reason == "desktop_podman_run_timeout"
+        message = str(excinfo.value)
+        assert "crun create" in message and "Possible causes" in message
+        assert "Possible causes: tmpfs copy-up of a large masked directory" in message
+        assert "SELinux relabel" in message
+        assert "podman run --rm --userns=keep-id:uid=10000,gid=10000 --entrypoint /bin/true" in message
+        assert "prewarm_required" not in message
+    else:
+        assert excinfo.value.reason == "desktop_container_unavailable"
+        assert "prewarm" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("rootless", [True, False])
+def test_every_tmpfs_is_created_without_copyup(monkeypatch, tmp_path: Path, rootless: bool):
+    """podman's default tmpcopyup would copy each masked directory into its tmpfs."""
+    shared, profile = _rootful_snapshot_layout(tmp_path)
+    if rootless:
+        _rootless(monkeypatch, profile)
+    args = ds.run_args(ds.desktop_decision(DESKTOP_ON, profile), image_id="sha256:img")
+
+    tmpfs = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--tmpfs"]
+    assert len(tmpfs) == 1 + len(ds.TMPFS_PROFILE_SUBDIRS)
+    for spec in tmpfs:
+        _, _, opts = spec.partition(":")
+        assert "notmpcopyup" in opts.split(","), spec
+        assert "tmpcopyup" not in opts.split(","), spec
+    # No other mount type re-introduces a tmpfs with copy-up.
+    assert not any("type=tmpfs" in arg for arg in args)
+
+
+@pytest.mark.parametrize("rootless", [True, False])
+def test_secret_dirs_are_masked_by_empty_tmpfs(monkeypatch, tmp_path: Path, rootless: bool):
+    """The UAT token, tokens and credentials on the host never reach the container.
+
+    Each secret directory must be the target of a copy-up-free tmpfs, and no
+    bind mount may expose it (or a file in it) at another path.
+    """
+    shared, profile = _rootful_snapshot_layout(tmp_path)
+    for rel in ds.TMPFS_PROFILE_SUBDIRS:
+        (profile / rel).mkdir(parents=True, exist_ok=True)
+    (profile / "feishu_uat" / "ou_secret.json").write_text('{"access_token": "u-secret"}')
+    (profile / "tokens" / "gitlab.json").write_text("glpat-secret")
+    (profile / "workspace" / "credentials" / "key.json").write_text("cred-secret")
+    if rootless:
+        _rootless(monkeypatch, profile)
+    args = ds.run_args(ds.desktop_decision(DESKTOP_ON, profile), image_id="sha256:img")
+
+    masks = {}
+    for i, arg in enumerate(args[:-1]):
+        if arg == "--tmpfs":
+            path, _, opts = args[i + 1].partition(":")
+            masks[path] = opts.split(",")
+    for rel in ("feishu_uat", "tokens", "workspace/credentials"):
+        target = str(profile / rel)
+        assert "notmpcopyup" in masks[target], rel
+    sources = []
+    for i, arg in enumerate(args[:-1]):
+        if arg == "-v":
+            sources.append(args[i + 1].split(":")[0])
+        elif arg == "--mount":
+            fields = dict(f.split("=", 1) for f in args[i + 1].split(",") if "=" in f)
+            sources.append(fields.get("src", ""))
+    for src in sources:
+        for rel in ("feishu_uat", "tokens", "workspace/credentials"):
+            secret = profile / rel
+            # A bind of the directory itself or anything below it would bypass the mask.
+            assert not Path(src).is_relative_to(secret), (src, rel)

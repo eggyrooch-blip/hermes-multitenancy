@@ -736,8 +736,8 @@ async def _stream_aiagent_subprocess(
     child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
     # Off the event loop: the desktop backend may create/start a container.
     try:
-        cmd = await asyncio.to_thread(
-            _wrap_with_sandbox, [sys.executable, str(child_script)], profile_home, env=env
+        cmd, spawn_env = await asyncio.to_thread(
+            _sandbox_spawn, [sys.executable, str(child_script)], profile_home, env=env
         )
     except BaseException:
         if warm_run is not None:
@@ -773,7 +773,7 @@ async def _stream_aiagent_subprocess(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=spawn_env,
             cwd=_aiagent_subprocess_cwd(profile_home),
             limit=_AIAGENT_STREAM_LIMIT,
         )

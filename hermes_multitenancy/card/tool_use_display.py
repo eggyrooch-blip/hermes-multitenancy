@@ -14,6 +14,7 @@ from typing import Any
 from .secret_redaction import redact_inline_secrets
 from .tool_use_config import (
     DEFAULT_SUMMARY_PREFERENCE,
+    DESKTOP_TOOL_DESCRIPTORS,
     TOOL_DESCRIPTORS,
     ToolDescriptor,
     _HIDDEN_TOOL_NAMES,
@@ -66,6 +67,69 @@ def _render_tool_calls_section(tools: list[Any]) -> str:
     return "\n".join(lines)
 
 
+_DESKTOP_SCREEN_TOOL_NAMES = frozenset({"computer_use", "computer-use"})
+DESKTOP_SCREEN_LINK_LABEL = "打开屏幕"
+
+
+def is_desktop_screen_tool(tool_name: Any) -> bool:
+    """True for tools that act on the profile's Bot Screen (computer_use, browser_*)."""
+    name = _normalize_tool_name(tool_name if isinstance(tool_name, str) else None)
+    return name in _DESKTOP_SCREEN_TOOL_NAMES or name.startswith("browser_")
+
+
+def _uses_desktop_screen(tools: list[Any]) -> bool:
+    return any(isinstance(tool, dict) and is_desktop_screen_tool(tool.get("name")) for tool in tools)
+
+
+def build_desktop_screen_button(tools: list[Any], screen_url: str | None) -> dict[str, Any] | None:
+    """Right-aligned 「打开屏幕」 URL button, or ``None`` when it does not apply.
+
+    ``screen_url`` is only set for profiles with desktop enabled and a public
+    origin configured (see ``card/desktop_screen_link.py``); the button also
+    needs a Bot Screen tool in this card's rows. It carries no token: the Web
+    UI page authenticates the viewer itself.
+    """
+    if not screen_url or not _uses_desktop_screen(tools):
+        return None
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_align": "right",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": DESKTOP_SCREEN_LINK_LABEL},
+                        "type": "primary",
+                        "size": "small",
+                        "multi_url": {
+                            "url": screen_url,
+                            "pc_url": screen_url,
+                            "android_url": screen_url,
+                            "ios_url": screen_url,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _render_live_tool_section(tools: list[Any], screen_url: str | None) -> str:
+    """Streaming tool-rows markdown plus a 「打开屏幕」 link while the bot uses the screen.
+
+    CardKit streams the tool element as markdown, so the final card's button
+    cannot appear mid-turn; the markdown link is the live equivalent.
+    """
+    section = _render_tool_calls_section(tools)
+    if section and screen_url and _uses_desktop_screen(tools):
+        section += f"\n[{DESKTOP_SCREEN_LINK_LABEL}]({screen_url})"
+    return section
+
+
 _LIVE_STATUS_TO_TRACE_STATUS = {
     "running": "running",
     "done": "success",
@@ -110,7 +174,7 @@ def _live_tools_to_trace_steps(tools: list[Any]) -> list[dict[str, Any]]:
     return steps
 
 
-def build_live_tool_use_panel(tools: list[Any]) -> dict[str, Any] | None:
+def build_live_tool_use_panel(tools: list[Any], *, desktop_enabled: bool = False) -> dict[str, Any] | None:
     """Rich ``collapsible_panel`` for the final card, built from live tool rows.
 
     Returns ``None`` when there are no visible tool rows so callers can omit the
@@ -120,7 +184,7 @@ def build_live_tool_use_panel(tools: list[Any]) -> dict[str, Any] | None:
     steps = _live_tools_to_trace_steps(tools)
     if not steps:
         return None
-    return build_tool_use_panel(steps)
+    return build_tool_use_panel(steps, desktop_enabled=desktop_enabled)
 
 
 def _render_tool_calls_panel(tool_section: str) -> dict[str, Any]:
@@ -298,8 +362,13 @@ def normalize_tool_use_display(
     *,
     show_full_paths: bool = False,
     show_result_details: bool = False,
+    desktop_enabled: bool = False,
 ) -> dict[str, Any]:
-    """Map trace steps to rich display steps (openclaw ``normalizeToolUseDisplay``)."""
+    """Map trace steps to rich display steps (openclaw ``normalizeToolUseDisplay``).
+
+    ``desktop_enabled`` (the card's profile runs a desktop) turns on the
+    desktop-only descriptors such as 「操作电脑」 for ``computer_use``.
+    """
     steps: list[dict[str, Any]] = []
     for source in trace_steps or []:
         if not isinstance(source, dict):
@@ -308,6 +377,7 @@ def normalize_tool_use_display(
             source,
             show_full_paths=show_full_paths,
             show_result_details=show_result_details,
+            desktop_enabled=desktop_enabled,
         )
         if step is not None:
             steps.append(step)
@@ -330,12 +400,14 @@ def build_tool_use_panel(
     elapsed_ms: int | float | None = None,
     show_full_paths: bool = False,
     show_result_details: bool = False,
+    desktop_enabled: bool = False,
 ) -> dict[str, Any]:
     """Build the rich tool-use ``collapsible_panel`` (openclaw ``buildToolUsePanel``)."""
     display = normalize_tool_use_display(
         trace_steps,
         show_full_paths=show_full_paths,
         show_result_details=show_result_details,
+        desktop_enabled=desktop_enabled,
     )
     steps = display["steps"]
 
@@ -373,11 +445,12 @@ def build_tool_use_panel(
     }
 
 
-def resolve_tool_descriptor(tool_name: str | None) -> ToolDescriptor | None:
+def resolve_tool_descriptor(tool_name: str | None, *, desktop_enabled: bool = False) -> ToolDescriptor | None:
     normalized = _normalize_tool_name(tool_name)
     if not normalized:
         return None
-    for descriptor in TOOL_DESCRIPTORS:
+    candidates = DESKTOP_TOOL_DESCRIPTORS + TOOL_DESCRIPTORS if desktop_enabled else TOOL_DESCRIPTORS
+    for descriptor in candidates:
         for alias in descriptor.aliases:
             if (
                 normalized == alias
@@ -393,9 +466,10 @@ def _format_tool_step(
     *,
     show_full_paths: bool,
     show_result_details: bool,
+    desktop_enabled: bool = False,
 ) -> dict[str, Any] | None:
     tool_name = str(source.get("tool_name") or "")
-    descriptor = resolve_tool_descriptor(tool_name)
+    descriptor = resolve_tool_descriptor(tool_name, desktop_enabled=desktop_enabled)
     params = source.get("params") if isinstance(source.get("params"), dict) else None
     summary = source.get("summary")
 

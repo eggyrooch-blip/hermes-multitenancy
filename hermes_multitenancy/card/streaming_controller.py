@@ -67,7 +67,7 @@ from .tool_use_display import (
     _extract_raw_tool_call_intents,
     _format_todo_progress,
     _merge_raw_tool_intents,
-    _render_tool_calls_section,
+    _render_live_tool_section,
 )
 from .unavailable_guard import UnavailableGuard
 
@@ -573,7 +573,7 @@ async def _update_streaming_card_tool_started(
                 self,
                 card_id,
                 _TOOLS_ELEMENT_ID,
-                _render_tool_calls_section(list(state.get("tools") or [])) or " ",
+                _render_live_tool_section(list(state.get("tools") or []), state.get("desktop_screen_url")) or " ",
                 sequence,
             ),
         )
@@ -628,7 +628,7 @@ async def _update_streaming_card_tool_completed(
                 self,
                 card_id,
                 _TOOLS_ELEMENT_ID,
-                _render_tool_calls_section(list(state.get("tools") or [])) or " ",
+                _render_live_tool_section(list(state.get("tools") or []), state.get("desktop_screen_url")) or " ",
                 sequence,
             ),
         )

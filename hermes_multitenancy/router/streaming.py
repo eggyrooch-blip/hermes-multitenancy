@@ -54,6 +54,7 @@ from ..billing_notices import (
     BUDGET_EXCEEDED_NOTICE as _BUDGET_EXCEEDED_NOTICE,
     RATE_LIMIT_NOTICE as _RATE_LIMIT_NOTICE,
 )
+from ..card.desktop_screen_link import mark_card_desktop_screen
 
 
 def _billing_failure_stream_notice(exc: BaseException | None) -> Optional[str]:
@@ -543,6 +544,7 @@ async def _update_feishu_stream_tool_event(
     payload = _m._sanitize_tool_event_payload(payload, profile_home)
     tool_name = str(payload.get("name") or payload.get("tool_name") or "tool")
     if mode == "card":
+        mark_card_desktop_screen(adapter, message_id, profile_home)
         method_name = (
             "update_streaming_card_tool_completed"
             if completed
@@ -777,6 +779,7 @@ async def _stream_into_feishu_shared_consumer(
             "multitenancy: shared stream card ready elapsed=%.3fs",
             time.monotonic() - stream_started_at,
         )
+        mark_card_desktop_screen(adapter, getattr(consumer, "message_id", None), profile_home)
         consumer_task = asyncio.create_task(consumer.run())
 
         prime_task = asyncio.create_task(
@@ -839,6 +842,7 @@ async def _stream_into_feishu_shared_consumer(
                     if kind == "tool_started":
                         payload = _m._sanitize_tool_event_payload(delta, profile_home)
                         tool_name = str(payload.get("name") or payload.get("tool_name") or "tool")
+                        mark_card_desktop_screen(adapter, getattr(consumer, "message_id", None), profile_home)
                         await consumer.update_streaming_card_tool_started(
                             tool_name,
                             preview=payload.get("preview"),
@@ -848,6 +852,7 @@ async def _stream_into_feishu_shared_consumer(
 
                     if kind == "tool_completed":
                         payload = _m._sanitize_tool_event_payload(delta, profile_home)
+                        mark_card_desktop_screen(adapter, getattr(consumer, "message_id", None), profile_home)
                         await consumer.update_streaming_card_tool_completed(
                             str(payload.get("name") or payload.get("tool_name") or "tool"),
                             duration=payload.get("duration"),
@@ -1134,6 +1139,7 @@ async def _stream_into_feishu(
         if placeholder_id is None:
             return
         if stream_mode == "card":
+            mark_card_desktop_screen(adapter, placeholder_id, profile_home)
             try:
                 await _update_feishu_stream_status(
                     adapter,
@@ -1173,6 +1179,8 @@ async def _stream_into_feishu(
             raise
 
         target_ready_at = time.monotonic()
+        if stream_mode == "card":
+            mark_card_desktop_screen(adapter, placeholder_id, profile_home)
         _m.logger.info(
             "multitenancy: stream target ready mode=%s message_id=%s elapsed=%.3fs",
             stream_mode,

@@ -324,6 +324,36 @@ def test_unreadable_profile_directory_blocks_with_safe_error(env):
         victim.chmod(0o755)
 
 
+def test_unreadable_scan_does_not_spawn_a_process_per_file(env, tmp_path):
+    """逐文件 `-exec test` 在 hermes-1 的 execve 审计下每天刷 6-7G 日志（2026-09-29 写满根盘）。"""
+    profiles = Path(env["HERMES_HOME_DIR"]) / "profiles"
+    for i in range(40):
+        (profiles / "u1" / f"many-{i}.txt").write_text("x\n")
+    bin_dir = tmp_path / "test-stub-bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "test-calls.log"
+    real = shutil.which("test")
+    assert real, "测试机上找不到 test"
+    stub = bin_dir / "test"
+    stub.write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\nexec "{real}" "$@"\n')
+    stub.chmod(0o755)
+
+    victim = profiles / "u1" / "secret.txt"
+    victim.write_text("x\n")
+    victim.chmod(0o000)
+    try:
+        result = _run(BACKUP_SH, env, PATH=f"{bin_dir}:{env['PATH']}")
+        assert result.returncode != 0
+        assert "静默漏数据" in result.stderr
+        assert not calls.exists(), calls.read_text()
+    finally:
+        victim.chmod(0o644)
+
+    result = _run(BACKUP_SH, env, PATH=f"{bin_dir}:{env['PATH']}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not calls.exists(), calls.read_text()
+
+
 def test_drill_rejects_symlink_into_production(env, tmp_path):
     """字符串前缀挡不住软链：一条指向 ~/.hermes 的链接能骗过前缀比较，
     然后把生产覆盖掉。守卫必须比真实路径。"""

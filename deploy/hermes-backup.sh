@@ -268,13 +268,21 @@ else
   # 备份进程读不到的文件会被 rsync 悄悄跳过 —— 这是备份系统最阴险的漏数据方式。
   # 这台机器上历史反复出现 root 跑出来的文件落在 profiles 里（2026-08-01 修过 276 个），
   # 所以每次都先数一遍，有就大声报出来，绝不让它静默通过。
-  # `test -r` 由 POSIX find 的 -exec 调用，Linux/macOS 行为一致；不能在开发机
-  # 因 BSD find 缺少 GNU 的 -readable 就跳过这条数据完整性门禁。
+  # 权限判断用 POSIX `-exec sh -c ... {} +` 批量交给 shell 内建 test，Linux/macOS
+  # 行为一致；不能在开发机因 BSD find 缺少 GNU 的 -readable 就跳过这条门禁。
+  # 不能写成 `-exec test -r {} \;`：那会每个文件起一个进程，hermes-1 的 execve
+  # 全量审计因此每天多出 6-7G 日志，2026-09-29 写满根盘、auditd 停记 9 天。
   set +e
-  unreadable_items="$(find "$HERMES_HOME_DIR/profiles" \
-    \( \( -type f ! -exec test -r {} \; \) -o \
-    \( -type d \( ! -exec test -r {} \; -o ! -exec test -x {} \; \) \) \) \
-    -print 2>/dev/null)"
+  unreadable_items="$(find "$HERMES_HOME_DIR/profiles" \( -type f -o -type d \) \
+    -exec sh -c '
+      for p do
+        if [ -d "$p" ]; then
+          { [ -r "$p" ] && [ -x "$p" ]; } || printf "%s\n" "$p"
+        else
+          [ -r "$p" ] || printf "%s\n" "$p"
+        fi
+      done
+      exit 0' sh {} + 2>/dev/null)"
   scan_rc=$?
   set -e
   unreadable=0

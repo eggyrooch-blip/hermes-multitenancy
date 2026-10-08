@@ -123,3 +123,15 @@ TOOL_DESCRIPTORS: tuple[ToolDescriptor, ...] = (
         param_keys=("target", "subject", "description"),
     ),
 )
+
+# Applied only on cards of desktop-enabled profiles, ahead of TOOL_DESCRIPTORS,
+# so a desktop-off card keeps its pre-desktop rendering byte for byte.
+DESKTOP_TOOL_DESCRIPTORS: tuple[ToolDescriptor, ...] = (
+    ToolDescriptor(
+        aliases=("computer_use", "computer-use"),
+        icon_token="browser-mac_outlined",
+        title="操作电脑",
+        sanitizer="generic",
+        param_keys=("action",),
+    ),
+)

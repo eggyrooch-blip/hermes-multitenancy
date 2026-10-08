@@ -31,6 +31,8 @@ _SAFE_FIELD_NAMES = frozenset(
         "expert_id",
         "ttl_seconds",
         "point",
+        "epoch",
+        "viewer_hash",
     }
 )
 

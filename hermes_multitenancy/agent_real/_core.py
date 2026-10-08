@@ -5101,7 +5101,9 @@ def _wrap_with_sandbox(
     if sys.platform.startswith("linux"):
         desktop = _desktop_decision_for_profile(profile_home)
         if desktop.enabled:
-            return _wrap_linux_container(cmd, profile_home, desktop, env=env)
+            # argv only: a desktop profile must be SPAWNED via _sandbox_spawn,
+            # whose env is not the worker env.
+            return _wrap_linux_container(cmd, profile_home, desktop, env=env)[0]
     # Per-profile gate. If HERMES_SANDBOX_PROFILES is set, the sandbox only
     # wraps subprocesses for profiles named in that comma-separated list.
     # Unset → all profiles are sandboxed (when the master toggle is on).
@@ -5647,14 +5649,38 @@ def _desktop_turn_scope(profile_home: Path):
                 logger.exception("[multitenancy] desktop turn lease could not be released for %s", decision.profile_name)
 
 
+def _sandbox_spawn(
+    cmd: list[str],
+    profile_home: Path,
+    *,
+    local_harness: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[list[str], Optional[Mapping[str, str]]]:
+    """Wrapped argv AND the env to spawn it with. Every production spawn uses this.
+
+    For a desktop profile the env is the host-podman spawn env from
+    :func:`desktop_sandbox.exec_args` — never the worker env, which carries the
+    tenant's profile ``.env`` (``LD_PRELOAD`` there would run on the host).
+    Every other backend spawns with ``env`` unchanged, exactly as before.
+    """
+    if sys.platform.startswith("linux"):
+        desktop = _desktop_decision_for_profile(profile_home)
+        if desktop.enabled:
+            return _wrap_linux_container(cmd, profile_home, desktop, env=env)
+    return _wrap_with_sandbox(cmd, profile_home, local_harness=local_harness, env=env), env
+
+
 def _wrap_linux_container(
     cmd: list[str],
     profile_home: Path,
     decision: "desktop_sandbox.DesktopDecision",
     *,
     env: Optional[Mapping[str, str]] = None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, str]]:
     """Linux desktop backend: run ``cmd`` inside the profile's podman container.
+
+    Returns ``(argv, spawn_env)``; the caller must spawn podman with
+    ``spawn_env``, never with the worker ``env``.
 
     Fail-closed like bwrap: podman missing, the container not coming up, the
     screen not publishing, an unmappable interpreter, or a missing env all raise
@@ -5697,14 +5723,14 @@ def _wrap_linux_container(
             err = RuntimeError(f"{exc.user_message}（{exc.reason}）")
         raise err from exc
     workdir = Path(_aiagent_subprocess_cwd(profile_home))
-    wrapped = desktop_sandbox.exec_args(
+    wrapped, spawn_env = desktop_sandbox.exec_args(
         decision, handle, [mapped, *cmd[1:]], env, workdir=workdir
     )
     logger.info(
         "[multitenancy] desktop container wrap: profile=%s container=%s image=%s started=%s",
         profile_home.name, handle.name, decision.image, handle.started,
     )
-    return wrapped
+    return wrapped, spawn_env
 
 
 def _aiagent_subprocess_cwd(profile_home: Path) -> str:
@@ -5946,8 +5972,8 @@ async def _run_aiagent_subprocess(
 
     # The desktop backend may create/start a container (podman + waits): run the
     # wrapper off the event loop so a slow ensure() never stalls other profiles.
-    cmd = await asyncio.to_thread(
-        _wrap_with_sandbox,
+    cmd, spawn_env = await asyncio.to_thread(
+        _sandbox_spawn,
         [sys.executable, str(child_script)],
         profile_home,
         local_harness=require_event_admission(event, profile_home) is not None,
@@ -5963,7 +5989,7 @@ async def _run_aiagent_subprocess(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=spawn_env,
             cwd=_aiagent_subprocess_cwd(profile_home),
             limit=_AIAGENT_STREAM_LIMIT,
         )

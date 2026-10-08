@@ -26,6 +26,7 @@ from .tool_use_display import (
     _render_tool_calls_section,
     _strip_tool_call_blocks,
     _strip_tool_process_narration,
+    build_desktop_screen_button,
     build_live_tool_use_panel,
 )
 
@@ -127,9 +128,12 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     content = _strip_reasoning_tags(content).strip()
     tools = list(state.get("tools") or [])
 
-    tool_panel = _render_tool_section_panel(tools)
+    tool_panel = _render_tool_section_panel(tools, desktop_enabled=bool(state.get("desktop_enabled")))
     if tool_panel is not None:
         elements.append(tool_panel)
+    screen_button = build_desktop_screen_button(tools, state.get("desktop_screen_url"))
+    if screen_button is not None:
+        elements.append(screen_button)
     if status and not state.get("finalized"):
         elements.append({"tag": "markdown", "content": status})
     if reasoning:
@@ -182,7 +186,7 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     return card
 
 
-def _render_tool_section_panel(tools: list[Any]) -> dict[str, Any] | None:
+def _render_tool_section_panel(tools: list[Any], *, desktop_enabled: bool = False) -> dict[str, Any] | None:
     """Render the final-card tool section, preferring the rich panel.
 
     The rich ``collapsible_panel`` (icon + human title + extracted detail +
@@ -192,7 +196,7 @@ def _render_tool_section_panel(tools: list[Any]) -> dict[str, Any] | None:
     no visible tool rows so the caller omits the section entirely.
     """
     try:
-        rich_panel = build_live_tool_use_panel(tools)
+        rich_panel = build_live_tool_use_panel(tools, desktop_enabled=desktop_enabled)
         if rich_panel is not None:
             return rich_panel
     except Exception:  # noqa: BLE001 — fail-open: never block delivery on render

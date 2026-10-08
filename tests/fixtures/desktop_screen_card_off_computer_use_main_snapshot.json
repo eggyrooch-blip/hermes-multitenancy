@@ -1,0 +1,242 @@
+{
+  "cardkit2": {
+    "body": {
+      "elements": [
+        {
+          "border": {
+            "color": "grey",
+            "corner_radius": "5px"
+          },
+          "elements": [
+            {
+              "icon": {
+                "color": "grey",
+                "tag": "standard_icon",
+                "token": "browser-mac_outlined"
+              },
+              "tag": "div",
+              "text": {
+                "content": "**Browser (1.2 s)** · <font color='green'>Succeeded</font>",
+                "tag": "lark_md",
+                "text_size": "notation"
+              }
+            },
+            {
+              "margin": "0px 0px 0px 20px",
+              "tag": "div",
+              "text": {
+                "content": "https://example.com/docs",
+                "tag": "plain_text",
+                "text_color": "grey",
+                "text_size": "notation"
+              }
+            },
+            {
+              "icon": {
+                "color": "grey",
+                "tag": "standard_icon",
+                "token": "setting-inter_outlined"
+              },
+              "tag": "div",
+              "text": {
+                "content": "**Terminal (300 ms)** · <font color='green'>Succeeded</font>",
+                "tag": "lark_md",
+                "text_size": "notation"
+              }
+            },
+            {
+              "icon": {
+                "color": "grey",
+                "tag": "standard_icon",
+                "token": "file-link-text_outlined"
+              },
+              "tag": "div",
+              "text": {
+                "content": "**Read** · <font color='turquoise'>Running</font>",
+                "tag": "lark_md",
+                "text_size": "notation"
+              }
+            },
+            {
+              "margin": "0px 0px 0px 20px",
+              "tag": "div",
+              "text": {
+                "content": "report.md",
+                "tag": "plain_text",
+                "text_color": "grey",
+                "text_size": "notation"
+              }
+            },
+            {
+              "icon": {
+                "color": "grey",
+                "tag": "standard_icon",
+                "token": "setting-inter_outlined"
+              },
+              "tag": "div",
+              "text": {
+                "content": "**Computer use (800 ms)** · <font color='green'>Succeeded</font>",
+                "tag": "lark_md",
+                "text_size": "notation"
+              }
+            }
+          ],
+          "expanded": false,
+          "header": {
+            "icon": {
+              "color": "grey",
+              "size": "16px 16px",
+              "tag": "standard_icon",
+              "token": "down-small-ccm_outlined"
+            },
+            "icon_expanded_angle": -180,
+            "icon_position": "right",
+            "title": {
+              "content": "Tool calls",
+              "tag": "markdown"
+            },
+            "vertical_align": "center"
+          },
+          "padding": "8px 8px 8px 8px",
+          "tag": "collapsible_panel",
+          "vertical_spacing": "4px"
+        },
+        {
+          "content": "已打开页面并截图。",
+          "tag": "markdown"
+        }
+      ]
+    },
+    "config": {
+      "locales": [
+        "zh_cn",
+        "en_us"
+      ],
+      "summary": {
+        "content": "已打开页面并截图。"
+      },
+      "update_multi": true,
+      "wide_screen_mode": true
+    },
+    "schema": "2.0"
+  },
+  "im_card": {
+    "config": {
+      "locales": [
+        "zh_cn",
+        "en_us"
+      ],
+      "summary": {
+        "content": "已打开页面并截图。"
+      },
+      "update_multi": true,
+      "wide_screen_mode": true
+    },
+    "elements": [
+      {
+        "border": {
+          "color": "grey",
+          "corner_radius": "5px"
+        },
+        "elements": [
+          {
+            "icon": {
+              "color": "grey",
+              "tag": "standard_icon",
+              "token": "browser-mac_outlined"
+            },
+            "tag": "div",
+            "text": {
+              "content": "**Browser (1.2 s)** · <font color='green'>Succeeded</font>",
+              "tag": "lark_md",
+              "text_size": "notation"
+            }
+          },
+          {
+            "margin": "0px 0px 0px 20px",
+            "tag": "div",
+            "text": {
+              "content": "https://example.com/docs",
+              "tag": "plain_text",
+              "text_color": "grey",
+              "text_size": "notation"
+            }
+          },
+          {
+            "icon": {
+              "color": "grey",
+              "tag": "standard_icon",
+              "token": "setting-inter_outlined"
+            },
+            "tag": "div",
+            "text": {
+              "content": "**Terminal (300 ms)** · <font color='green'>Succeeded</font>",
+              "tag": "lark_md",
+              "text_size": "notation"
+            }
+          },
+          {
+            "icon": {
+              "color": "grey",
+              "tag": "standard_icon",
+              "token": "file-link-text_outlined"
+            },
+            "tag": "div",
+            "text": {
+              "content": "**Read** · <font color='turquoise'>Running</font>",
+              "tag": "lark_md",
+              "text_size": "notation"
+            }
+          },
+          {
+            "margin": "0px 0px 0px 20px",
+            "tag": "div",
+            "text": {
+              "content": "report.md",
+              "tag": "plain_text",
+              "text_color": "grey",
+              "text_size": "notation"
+            }
+          },
+          {
+            "icon": {
+              "color": "grey",
+              "tag": "standard_icon",
+              "token": "setting-inter_outlined"
+            },
+            "tag": "div",
+            "text": {
+              "content": "**Computer use (800 ms)** · <font color='green'>Succeeded</font>",
+              "tag": "lark_md",
+              "text_size": "notation"
+            }
+          }
+        ],
+        "expanded": false,
+        "header": {
+          "icon": {
+            "color": "grey",
+            "size": "16px 16px",
+            "tag": "standard_icon",
+            "token": "down-small-ccm_outlined"
+          },
+          "icon_expanded_angle": -180,
+          "icon_position": "right",
+          "title": {
+            "content": "Tool calls",
+            "tag": "markdown"
+          },
+          "vertical_align": "center"
+        },
+        "padding": "8px 8px 8px 8px",
+        "tag": "collapsible_panel",
+        "vertical_spacing": "4px"
+      },
+      {
+        "content": "已打开页面并截图。",
+        "tag": "markdown"
+      }
+    ]
+  },
+  "live_tool_element_markdown": "- `browser_navigate` (1200 ms)\n- `terminal` (300 ms)\n- `read_file` running\n- `computer_use` (800 ms)"
+}

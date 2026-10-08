@@ -13,6 +13,17 @@ Design facts this module encodes (verified on hermes-pre, rootful podman
 * ``--userns=keep-id`` is rootless-only. Ownership is bridged with an explicit
   ``--uidmap/--gidmap`` that maps container uid/gid 10000 to the owner of
   PROFILE_HOME, and container root to an unprivileged subordinate range.
+* A gateway that is not root (``desktop.rootless``, default ``auto`` =
+  ``os.geteuid() != 0``) runs rootless podman instead: the id maps are replaced
+  by ``--userns=keep-id:uid=10000,gid=10000`` (the gateway user IS container
+  uid 10000, so files and ``rfb.sock`` land owned by it), ``podman info`` must
+  confirm rootless mode before anything else.
+* The host ``podman exec`` process (rootful or rootless) is spawned with an env
+  built from the gateway's own podman environment, never the worker env: the
+  worker env carries the tenant's profile ``.env``, and a loader variable
+  (``LD_PRELOAD``/``LD_AUDIT``) or container-engine variable there would run
+  tenant code, or redirect podman, on the HOST. :func:`exec_args` returns the
+  argv together with that spawn env.
 * The upstream image's s6 entrypoint needs root + capabilities; we bypass it
   (``--init --entrypoint /bin/sleep``) so PID 1 and every exec run as uid 10000
   with ``--cap-drop ALL``.
@@ -69,6 +80,43 @@ DEFAULT_NETWORK = "hermes-desktop"
 DEFAULT_IDLE_STOP_MINUTES = 30
 DEFAULT_MAX_CONTAINERS = 60
 DEFAULT_SUBID_BASE = 300000
+#: Rootless podman: the gateway user becomes container uid/gid 10000.
+ROOTLESS_USERNS = f"keep-id:uid={CONTAINER_UID},gid={CONTAINER_GID}"
+ROOTLESS_MODES = ("auto", "true", "false")
+#: Environment podman reads to find its home, runtime dir, config and helpers.
+#: The host podman process always gets the GATEWAY's values (or none). The
+#: worker's values (tenant profile paths) reach the container inline: they are
+#: paths, not secrets.
+PODMAN_HOST_ENV = (
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_DIRS",
+    "DBUS_SESSION_BUS_ADDRESS",
+)
+#: Dynamic-loader / libc / interpreter controls. Never in the host spawn env
+#: (from either side); a worker's value reaches the container inline, where the
+#: tenant runs code anyway (PYTHONPATH is real worker plumbing).
+LOADER_ENV_PREFIXES = ("LD_", "DYLD_", "MALLOC_", "PYTHON")
+LOADER_ENV_NAMES = frozenset({
+    "GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH", "NLSPATH", "HOSTALIASES", "RES_OPTIONS", "LOCALDOMAIN",
+})
+#: Container-engine / Go-runtime / service-manager controls. The gateway's own
+#: values are kept for the host podman (the same ones ensure() ran with); a
+#: worker's value goes nowhere — not to the host, not into the container (it
+#: is meaningless there and some of these names carry credentials).
+ENGINE_ENV_PREFIXES = ("CONTAINERS_", "_CONTAINERS_", "CONTAINER_", "PODMAN_", "BUILDAH_")
+ENGINE_ENV_NAMES = frozenset({
+    "STORAGE_DRIVER", "STORAGE_OPTS", "REGISTRIES_CONFIG_PATH",
+    "GODEBUG", "GOGC", "GOMAXPROCS", "GOMEMLIMIT", "GOTRACEBACK",
+    "NOTIFY_SOCKET", "LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES",
+})
 DEFAULT_CONTAINER_PYTHON = "/opt/hermes/.venv/bin/python"
 DEFAULT_CONTAINER_HERMES = "/opt/hermes/.venv/bin/hermes"
 DEFAULT_CONTAINER_PATH = (
@@ -101,6 +149,11 @@ IMAGE_EXEC_ENV = frozenset({
 #: Profile subdirectories masked with a private tmpfs for the container's whole
 #: life (same list bwrap uses for local-harness runs).
 TMPFS_PROFILE_SUBDIRS = ("feishu_uat", "tokens", "workspace/credentials", "home")
+#: Every ``--tmpfs`` starts empty. podman's default ``tmpcopyup`` copies the
+#: masked directory into the tmpfs before start: the secrets the mask hides
+#: (feishu_uat, tokens, credentials) end up inside the container, and a GB-sized
+#: home copied at mechanical-disk speed blows the ensure budget.
+TMPFS_NO_COPYUP = "notmpcopyup"
 #: Every tenant-tree path the gateway creates before ``podman run`` (mask
 #: targets + the directories the worker and Bot Screen write into). Order
 #: matters: a parent is validated before its child.
@@ -131,6 +184,7 @@ HOST_ONLY_KEYS = frozenset({
     "container_path",
     "ensure_timeout_s",
     "screen_timeout_s",
+    "rootless",
 })
 #: The only ``multitenancy.desktop`` keys a profile config may set.
 PROFILE_KEYS = frozenset({"enabled", "idle_stop_minutes"})
@@ -196,6 +250,8 @@ class DesktopDecision:
     shm_size: str = "1g"
     ensure_timeout_s: float = DEFAULT_ENSURE_TIMEOUT_S
     screen_timeout_s: float = DEFAULT_SCREEN_TIMEOUT_S
+    #: ``auto`` (rootless when the gateway is not root), ``true`` or ``false``.
+    rootless: str = "auto"
     #: Host-only keys the profile config tried to set (ignored, for diagnostics).
     ignored_profile_keys: tuple[str, ...] = ()
 
@@ -211,8 +267,12 @@ class DesktopDecision:
     def state_dir(self) -> Path:
         return profile_state_dir(self.shared_home, self.profile_home)
 
-    def spec_hash(self, owner_uid: int, owner_gid: int) -> str:
-        """Digest of everything a running container must have been created with."""
+    def spec_hash(self, owner_uid: int, owner_gid: int, *, rootless: bool = False) -> str:
+        """Digest of everything a running container must have been created with.
+
+        The rootless marker is added only when set, so a rootful container keeps
+        the digest it was created with before rootless support existed.
+        """
         spec = {
             "image": self.image,
             "network": self.network,
@@ -226,7 +286,12 @@ class DesktopDecision:
             "container_path": self.container_path,
             "exec_env": sorted(self.exec_env.items()),
             "tmpfs": list(TMPFS_PROFILE_SUBDIRS),
+            # Containers created with copy-up hold copies of the masked
+            # secrets; the changed digest rebuilds them.
+            "tmpfs_opts": TMPFS_NO_COPYUP,
         }
+        if rootless:
+            spec["userns"] = ROOTLESS_USERNS
         return hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
@@ -261,6 +326,39 @@ def _as_int(value: Any, default: int, *, minimum: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def _rootless_mode(value: Any, profile_name: str) -> str:
+    if value is None or str(value).strip() == "":
+        return "auto"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    mode = str(value).strip().lower()
+    if mode in ROOTLESS_MODES:
+        return mode
+    if mode in _TRUTHY:
+        return "true"
+    if mode in {"0", "no", "off", "disabled"}:
+        return "false"
+    logger.warning(
+        "[multitenancy] desktop config: rootless=%r is not auto|true|false; using auto (profile %s)",
+        value, profile_name,
+    )
+    return "auto"
+
+
+def _effective_uid() -> int:
+    """Separate function so tests pick the gateway's privilege level."""
+    return os.geteuid()
+
+
+def is_rootless(decision: "DesktopDecision") -> bool:
+    """Whether this gateway drives rootless podman for ``decision``."""
+    if decision.rootless == "true":
+        return True
+    if decision.rootless == "false":
+        return False
+    return _effective_uid() != 0
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -423,6 +521,7 @@ def _decision_from_sections(
         shm_size=str(shared_cfg.get("shm_size") or "1g").strip() or "1g",
         ensure_timeout_s=_as_float(shared_cfg.get("ensure_timeout_s"), DEFAULT_ENSURE_TIMEOUT_S),
         screen_timeout_s=_as_float(shared_cfg.get("screen_timeout_s"), DEFAULT_SCREEN_TIMEOUT_S),
+        rootless=_rootless_mode(shared_cfg.get("rootless"), profile_name),
         ignored_profile_keys=ignored,
     )
 
@@ -593,6 +692,73 @@ def _row_name(row: Mapping[str, Any]) -> str:
     if isinstance(names, list) and names:
         return str(names[0])
     return str(row.get("Name") or "")
+
+
+def _probe_rootless_podman(podman_bin: str, *, timeout: float) -> None:
+    """Fail closed unless ``podman info`` works and reports rootless mode.
+
+    Rootless podman needs the gateway user's runtime directory
+    (``XDG_RUNTIME_DIR``: a systemd user service or linger) and its own
+    storage. Without this probe the first symptom is an opaque ``podman run``
+    error, or worse, a gateway that is root after all running ``keep-id``.
+    """
+    try:
+        proc = _run_podman(podman_bin, ["info", "--format", "{{.Host.Security.Rootless}}"], timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise DesktopSandboxError("desktop_podman_unavailable", f"podman info failed: {exc}") from exc
+    if proc.returncode != 0:
+        raise DesktopSandboxError(
+            "desktop_podman_unavailable",
+            f"podman info failed (exit={proc.returncode}): {(proc.stderr or proc.stdout or '').strip()[-500:]}; "
+            "rootless podman needs XDG_RUNTIME_DIR (systemd user service or loginctl enable-linger) "
+            "and /etc/subuid + /etc/subgid ranges for the gateway user",
+        )
+    reported = (proc.stdout or "").strip().lower()
+    if reported != "true":
+        raise DesktopSandboxError(
+            "desktop_podman_unavailable",
+            f"desktop.rootless is in effect but podman reports Host.Security.Rootless={reported or '<empty>'!r}",
+        )
+
+
+def _run_timeout(decision: "DesktopDecision", exc: subprocess.TimeoutExpired) -> DesktopSandboxError:
+    """A rootless ``podman run`` that overran its budget.
+
+    The cause is not known here. Seen so far: tmpfs copy-up of a large masked
+    directory (fixed by ``TMPFS_NO_COPYUP``), the SELinux relabel of a large
+    profile tree, and the first rootless run of an image under ``keep-id``,
+    which copies every layer with remapped ownership (~70s on hermes-1, 25min
+    on a loaded hermes-pre for the 4GB desktop image; once per image).
+    """
+    return DesktopSandboxError(
+        "desktop_podman_run_timeout",
+        f"podman run {decision.container_name} exceeded {exc.timeout:.0f}s; check what `crun create` / "
+        "podman is still doing for it (ps, strace). Possible causes: tmpfs copy-up of a large masked "
+        "directory (every --tmpfs must carry notmpcopyup), SELinux relabel of a large "
+        f"profile tree ({decision.profile_home}), slow storage, or a first rootless run of {decision.image} "
+        f"with --userns={ROOTLESS_USERNS} copying the image layers, which a one-time prewarm as the gateway "
+        f"user avoids: podman run --rm --userns={ROOTLESS_USERNS} --entrypoint /bin/true {decision.image}",
+    )
+
+
+def _is_loader_env(name: str) -> bool:
+    return name in LOADER_ENV_NAMES or name.startswith(LOADER_ENV_PREFIXES)
+
+
+def _is_engine_env(name: str) -> bool:
+    return name in ENGINE_ENV_NAMES or name.startswith(ENGINE_ENV_PREFIXES)
+
+
+def _gateway_podman_env() -> dict[str, str]:
+    """The gateway's own podman environment: home/runtime/config paths + engine settings.
+
+    Taken from the gateway process (``os.environ``), which is the environment
+    ensure() ran podman with. Nothing else from the gateway is carried: the host
+    podman only needs these, and every name added is one more lever.
+    """
+    env = {name: os.environ[name] for name in PODMAN_HOST_ENV if name in os.environ}
+    env.update({name: value for name, value in os.environ.items() if _is_engine_env(name)})
+    return {name: value for name, value in env.items() if not _is_loader_env(name)}
 
 
 def _ensure_network(podman_bin: str, network: str, *, timeout: float) -> None:
@@ -901,11 +1067,31 @@ def run_args(decision: DesktopDecision, *, image_id: str = "") -> list[str]:
     selinux = _selinux_enforcing()
     shared_file_opts = _label("ro", True, selinux, mount=True)
     stat = profile_home.stat()
-    if decision.subid_base <= stat.st_uid < decision.subid_base + 65536:
-        raise _unavailable(
-            f"profile owner uid {stat.st_uid} collides with desktop.subid_base "
-            f"{decision.subid_base}; set multitenancy.desktop.subid_base elsewhere",
-        )
+    rootless = is_rootless(decision)
+    if rootless:
+        # keep-id maps the gateway user to container 10000. A profile owned by
+        # anyone else would surface inside as an unmapped (nobody) owner.
+        if stat.st_uid != _effective_uid():
+            raise _unavailable(
+                f"rootless podman: profile owner uid {stat.st_uid} is not the gateway uid "
+                f"{_effective_uid()}; keep-id can only map the gateway user",
+            )
+        id_args = [f"--userns={ROOTLESS_USERNS}"]
+        # Under keep-id a tmpfs is owned by container root (podman 5.8 leaves it
+        # unwritable for uid 10000: Bot Screen alloc lock). ``U`` chowns it to
+        # --user; podman 4.4 rejects tmpfs uid=/gid= options.
+        tmpfs_opts = f":rw,mode=0700,U,{TMPFS_NO_COPYUP}"
+    else:
+        if decision.subid_base <= stat.st_uid < decision.subid_base + 65536:
+            raise _unavailable(
+                f"profile owner uid {stat.st_uid} collides with desktop.subid_base "
+                f"{decision.subid_base}; set multitenancy.desktop.subid_base elsewhere",
+            )
+        tmpfs_opts = f":{TMPFS_NO_COPYUP}"
+        id_args = [
+            *_id_maps("--uidmap", stat.st_uid, decision.subid_base),
+            *_id_maps("--gidmap", stat.st_gid, decision.subid_base),
+        ]
 
     args: list[str] = [
         "run", "-d",
@@ -913,12 +1099,11 @@ def run_args(decision: DesktopDecision, *, image_id: str = "") -> list[str]:
         "--init",
         "--entrypoint", "/bin/sleep",
         "--user", f"{CONTAINER_UID}:{CONTAINER_GID}",
-        *_id_maps("--uidmap", stat.st_uid, decision.subid_base),
-        *_id_maps("--gidmap", stat.st_gid, decision.subid_base),
+        *id_args,
         "--label", f"{LABEL_ROLE}={LABEL_ROLE_VALUE}",
         "--label", f"{LABEL_PROFILE}={decision.profile_name}",
         "--label", f"{LABEL_PROFILE_HOME}={profile_home}",
-        "--label", f"{LABEL_SPEC}={decision.spec_hash(stat.st_uid, stat.st_gid)}",
+        "--label", f"{LABEL_SPEC}={decision.spec_hash(stat.st_uid, stat.st_gid, rootless=rootless)}",
         "--label", f"{LABEL_IMAGE_ID}={image_id}",
         "--label", f"{LABEL_SHARED_CONFIG}={_shared_config_id(shared_home) if shared_home != profile_home else 'none'}",
         "--memory", decision.memory,
@@ -939,10 +1124,10 @@ def run_args(decision: DesktopDecision, *, image_id: str = "") -> list[str]:
         # Secret files masked exactly like the bwrap local-harness policy.
         "--mount", f"type=bind,src=/dev/null,dst={profile_home / '.env'},ro",
         "--mount", f"type=bind,src={empty_auth},dst={profile_home / 'auth.json'},{shared_file_opts}",
-        "--tmpfs", CONTAINER_RUNTIME_DIR,
+        "--tmpfs", f"{CONTAINER_RUNTIME_DIR}{tmpfs_opts}",
     ]
     for rel in TMPFS_PROFILE_SUBDIRS:
-        args.extend(["--tmpfs", str(profile_home / rel)])
+        args.extend(["--tmpfs", f"{profile_home / rel}{tmpfs_opts}"])
 
     if shared_home != profile_home:
         # Allowlist only. ``desktop-state`` (lifecycle state), ``profiles``
@@ -1111,7 +1296,7 @@ def _spec_drift(info: _ContainerInfo, decision: DesktopDecision, *, image_id: st
     expected = {
         LABEL_PROFILE: decision.profile_name,
         LABEL_PROFILE_HOME: str(decision.profile_home),
-        LABEL_SPEC: decision.spec_hash(stat.st_uid, stat.st_gid),
+        LABEL_SPEC: decision.spec_hash(stat.st_uid, stat.st_gid, rootless=is_rootless(decision)),
         LABEL_SHARED_CONFIG: (
             _shared_config_id(decision.shared_home.resolve())
             if decision.shared_home.resolve() != decision.profile_home else "none"
@@ -1160,6 +1345,7 @@ def ensure(decision: DesktopDecision) -> ContainerHandle:
     if podman is None:
         raise _unavailable(f"podman is not executable at {decision.podman_bin!r}")
     name = decision.container_name
+    rootless = is_rootless(decision)
     state_dir = _ensure_state_dir(decision.state_dir)
     host_lock = state_root(decision.shared_home) / HOST_LOCK_NAME
     now = time.time()
@@ -1168,6 +1354,8 @@ def ensure(decision: DesktopDecision) -> ContainerHandle:
         deadline = time.monotonic() + decision.ensure_timeout_s
         started = False
         created = False
+        if rootless:
+            _probe_rootless_podman(podman, timeout=_remaining(deadline, "podman info"))
         try:
             with _flock(host_lock, timeout_s=HOST_LOCK_WAIT_S, what=f"ensure {name} (host quota)"):
                 info = _inspect_container(podman, name, timeout=_remaining(deadline, "inspect"))
@@ -1198,7 +1386,12 @@ def ensure(decision: DesktopDecision) -> ContainerHandle:
                         "[multitenancy] desktop container ensure: creating %s profile=%s image=%s",
                         name, decision.profile_name, decision.image,
                     )
-                    proc = _run_podman(podman, args, timeout=_remaining(deadline, "podman run"))
+                    try:
+                        proc = _run_podman(podman, args, timeout=_remaining(deadline, "podman run"))
+                    except subprocess.TimeoutExpired as exc:
+                        if not rootless:
+                            raise
+                        raise _run_timeout(decision, exc) from exc
                     if proc.returncode != 0:
                         raise _unavailable(
                             f"podman run {name} failed (exit={proc.returncode}): {proc.stderr.strip()[-800:]}"
@@ -1261,7 +1454,12 @@ def ensure(decision: DesktopDecision) -> ContainerHandle:
         "[multitenancy] desktop container ensure: %s up (profile=%s started=%s screen_started=%s rfb=%s)",
         name, decision.profile_name, started, screen_started, decision.rfb_socket,
     )
-    return ContainerHandle(name=name, started=started, screen_started=screen_started, podman_bin=podman)
+    return ContainerHandle(
+        name=name,
+        started=started,
+        screen_started=screen_started,
+        podman_bin=podman,
+    )
 
 
 def exec_args(
@@ -1271,17 +1469,26 @@ def exec_args(
     env: Mapping[str, str],
     *,
     workdir: Path,
-) -> list[str]:
-    """Build ``podman exec -i …`` argv that runs ``cmd`` with ``env`` inside.
+) -> tuple[list[str], dict[str, str]]:
+    """Build the ``podman exec -i …`` argv that runs ``cmd`` with ``env`` inside,
+    and the environment the HOST podman process must be spawned with.
 
-    Env values never enter argv: every passthrough name is given as ``-e KEY``
-    and podman reads the value from its own process environment (the caller
-    spawns podman with exactly this ``env``). Only non-secret container-side
-    overrides (PATH and runtime directories) are inline. Image-internal paths
-    come from the image ENV; MT only overrides them through ``desktop.exec_env``.
-    ``argv[0]`` is the absolute podman that ensure() resolved, never a bare name
-    the caller's PATH would resolve again.
+    The caller spawns podman with the returned env, never with ``env`` (the
+    worker env holds the tenant's profile ``.env``). The spawn env is the
+    gateway's podman environment (:func:`_gateway_podman_env`) plus the worker
+    values that cross by name. Per worker name:
+
+    * podman home/runtime paths (:data:`PODMAN_HOST_ENV`) and loader/interpreter
+      controls go inline as ``-e KEY=value`` — paths and flags, never secrets —
+      so they reach the container but never the host podman;
+    * container-engine controls are dropped entirely;
+    * everything else (including secrets) is ``-e KEY`` with the value only in
+      the spawn env: values never enter argv.
+
+    Image-internal paths come from the image ENV; MT only overrides them through
+    ``desktop.exec_env``. ``argv[0]`` is the absolute podman ensure() resolved.
     """
+    spawn_env = _gateway_podman_env()
     args = [
         handle.podman_bin, "exec", "-i",
         "--user", f"{CONTAINER_UID}:{CONTAINER_GID}",
@@ -1290,7 +1497,14 @@ def exec_args(
     for key in sorted(env):
         if key in EXEC_ENV_EXCLUDE or key in IMAGE_EXEC_ENV or key in decision.exec_env:
             continue
+        if _is_engine_env(key):
+            logger.warning("[multitenancy] desktop exec: worker env %s is a container-engine control; dropped", key)
+            continue
+        if key in PODMAN_HOST_ENV or _is_loader_env(key):
+            args.extend(["-e", f"{key}={env[key]}"])
+            continue
         args.extend(["-e", key])
+        spawn_env[key] = env[key]
     shared_bin = decision.shared_home / "bin"
     container_path = decision.container_path
     if shared_bin.is_dir():
@@ -1300,7 +1514,7 @@ def exec_args(
         args.extend(["-e", f"{key}={value}"])
     args.append(handle.name)
     args.extend(cmd)
-    return args
+    return args, spawn_env
 
 
 def map_executable(decision: DesktopDecision, executable: str) -> str | None:
@@ -1323,6 +1537,13 @@ def stop(decision: DesktopDecision, *, timeout_s: int = 10) -> bool:
     return proc.returncode == 0
 
 
+def _human_holds_lease(profile_home: Path) -> bool:
+    """Core's Bot Desktop lease for this profile says a human drives (an unreadable lease reads as human)."""
+    from tools.bot_desktop import lease
+
+    return lease.human_holds(str(profile_home))
+
+
 def idle_stop_sweep(
     *,
     podman_bin: str = "podman",
@@ -1336,7 +1557,8 @@ def idle_stop_sweep(
     turn ended more than the window ago (``last_used``). Both live in the
     gateway-owned state directory; a container without one was not started by
     this gateway and is left alone. A profile whose ensure() is in flight (its
-    profile lock is held) is skipped this tick.
+    profile lock is held) is skipped this tick, and so is one whose Bot Desktop
+    lease a human holds (the viewer bridge's takeover).
     """
     podman = _podman_available(podman_bin)
     if podman is None:
@@ -1382,6 +1604,14 @@ def idle_stop_sweep(
                     logger.info(
                         "[multitenancy] desktop idle sweep: %s past idle window but %d turn(s) active; keeping",
                         name, active,
+                    )
+                    continue
+                # Under the profile lock, which the viewer bridge's takeover also takes: a person who took
+                # over the screen (maybe mid-login) before this point is seen here, never stopped under.
+                if _human_holds_lease(Path(profile_home_raw)):
+                    logger.info(
+                        "[multitenancy] desktop idle sweep: %s past idle window but a human holds the lease; keeping",
+                        name,
                     )
                     continue
                 proc = _run_podman(podman, ["stop", "-t", "10", name], timeout=60.0)

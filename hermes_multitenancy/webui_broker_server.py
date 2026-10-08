@@ -4671,6 +4671,14 @@ def create_run_broker_app(
         owner_tenant=_owner_scoped_tenant,
         profile_home=_router._profile_name_to_home,
     )
+    from . import desktop_viewer as _desktop_viewer
+
+    _desktop_viewer.register_routes(
+        app,
+        authorize=_authorized,
+        resolve_profile=_resolve_owner_scoped_profile,
+        profile_home=_router._profile_name_to_home,
+    )
     app.router.add_get("/api/run-broker/experts", handle_experts)
     app.router.add_get("/api/run-broker/plugin-assets/{plugin_id}/{asset_name}", handle_plugin_asset)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
