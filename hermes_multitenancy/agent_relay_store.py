@@ -112,6 +112,8 @@ CREATE INDEX IF NOT EXISTS relay_logs_ts ON relay_logs(ts);
 """
 
 LOG_RETENTION_MS = 30 * 86_400_000
+ENROLLMENT_STALE_GRACE_MS = 86_400_000
+ENROLLMENT_COMPLETED_RETENTION_MS = 30 * 86_400_000
 LOG_FIELDS = ("ts", "level", "logger", "event", "status", "actor", "card_id", "message_id", "raw")
 
 
@@ -869,6 +871,19 @@ class RelayStore:
             ).rowcount
             self._conn.execute(
                 "DELETE FROM relay_logs WHERE ts < ?", (now - LOG_RETENTION_MS,)
+            )
+            # Enrollment rows are OAuth handshake records; tokens live in relay_tokens.
+            # Non-completed rows (pending/authorizing/failed/expired/claimed) are dead
+            # once expired, kept 24h for diagnosis. A completed row still holds the
+            # sealed token_payload that claim_enrollment hands to a polling client, so
+            # it is kept ENROLLMENT_COMPLETED_RETENTION_MS after completion.
+            self._conn.execute(
+                "DELETE FROM relay_enrollments WHERE status != 'completed' AND expires_at <= ?",
+                (now - ENROLLMENT_STALE_GRACE_MS,),
+            )
+            self._conn.execute(
+                "DELETE FROM relay_enrollments WHERE status = 'completed' AND updated_at <= ?",
+                (now - ENROLLMENT_COMPLETED_RETENTION_MS,),
             )
             self._conn.commit()
         return changed

@@ -287,7 +287,7 @@ _ADVERSARIAL_REASONS = [
     "ValueError: bad row at sqlite3.py line 42",
     "codex proxy upstream Authorization: Bearer hcx_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
     "CODEX_HOME could not be materialized: PermissionError(13, 'codex-home/config.toml')",
-    "no run-scoped Codex provider proxy credential for host proxy.internal.keep.com",
+    "no run-scoped Codex provider proxy credential for host proxy.internal.example.com",
 ]
 
 

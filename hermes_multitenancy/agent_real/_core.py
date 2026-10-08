@@ -5071,7 +5071,11 @@ def _resolve_hermes_agent_repo() -> Path:
 
 
 def _wrap_with_sandbox(
-    cmd: list[str], profile_home: Path, *, local_harness: bool = False
+    cmd: list[str],
+    profile_home: Path,
+    *,
+    local_harness: bool = False,
+    env: Optional[Mapping[str, str]] = None,
 ) -> list[str]:
     """Wrap ``cmd`` with ``sandbox-exec`` when ``HERMES_USE_SANDBOX=1``.
 
@@ -5083,7 +5087,21 @@ def _wrap_with_sandbox(
     Falls back to unsandboxed exec with a loud WARNING if the policy
     file is missing — better to keep the bot working than to fail closed
     in a way that masks the cause.
+
+    ``env`` is the exact environment the caller will spawn the wrapped command
+    with. The bwrap/sandbox-exec backends ignore it (their argv is unchanged);
+    the Linux desktop-container backend needs it to forward the worker env into
+    ``podman exec`` by name.
     """
+    # Desktop-enabled profiles (multitenancy.desktop.enabled) run inside their
+    # own podman container on Linux. The container IS the sandbox, so it is
+    # decided before the HERMES_USE_SANDBOX gate: a profile that asked for a
+    # desktop never runs computer_use on the gateway host. Everything else
+    # below is byte-for-byte the pre-desktop behaviour.
+    if sys.platform.startswith("linux"):
+        desktop = _desktop_decision_for_profile(profile_home)
+        if desktop.enabled:
+            return _wrap_linux_container(cmd, profile_home, desktop, env=env)
     # Per-profile gate. If HERMES_SANDBOX_PROFILES is set, the sandbox only
     # wraps subprocesses for profiles named in that comma-separated list.
     # Unset → all profiles are sandboxed (when the master toggle is on).
@@ -5572,6 +5590,123 @@ def _wrap_linux_bwrap(
     return wrapped
 
 
+def _desktop_decision_for_profile(profile_home: Path) -> "desktop_sandbox.DesktopDecision":
+    """Resolve the shared and the profile config SEPARATELY into a desktop decision.
+
+    They are deliberately not merged first: the profile's ``config.yaml`` sits in
+    the tenant-writable tree, so only the shared file may name the podman
+    binary, image, network, quotas and id maps the gateway runs with.
+    """
+    from .. import desktop_sandbox
+
+    try:
+        shared = _load_yaml(_resolve_shared_hermes_home(profile_home) / "config.yaml")
+        profile = _load_yaml(profile_home / "config.yaml")
+    except Exception as exc:
+        # Unreadable config cannot grant a desktop; it must not break the bwrap
+        # path either, which never needed the config to wrap a command.
+        logger.warning(
+            "[multitenancy] desktop decision: config unreadable for %s (%s); treating as disabled",
+            profile_home.name, exc,
+        )
+        shared, profile = {}, {}
+    return desktop_sandbox.desktop_decision(shared, profile_home, profile_config=profile)
+
+
+@contextmanager
+def _desktop_turn_scope(profile_home: Path):
+    """Hold one active-turn lease for a desktop profile while its worker runs.
+
+    The idle sweep counts these leases (gateway-owned ``turns.json``) instead
+    of podman ``ExecIDs``, because a warm worker is itself a permanent exec and
+    would otherwise keep the container "busy" forever. No-op for bwrap/sandbox
+    profiles and off Linux. A bookkeeping failure is logged, never fatal: the
+    worst case is one idle-stop landing during a run, not a refused turn.
+    """
+    if not sys.platform.startswith("linux"):
+        yield
+        return
+    from .. import desktop_sandbox
+
+    decision = _desktop_decision_for_profile(profile_home)
+    if not decision.enabled:
+        yield
+        return
+    token = None
+    try:
+        token = desktop_sandbox.begin_turn(decision.state_dir)
+    except Exception:
+        logger.exception("[multitenancy] desktop turn lease could not be taken for %s", decision.profile_name)
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                desktop_sandbox.end_turn(decision.state_dir, token)
+            except Exception:
+                logger.exception("[multitenancy] desktop turn lease could not be released for %s", decision.profile_name)
+
+
+def _wrap_linux_container(
+    cmd: list[str],
+    profile_home: Path,
+    decision: "desktop_sandbox.DesktopDecision",
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> list[str]:
+    """Linux desktop backend: run ``cmd`` inside the profile's podman container.
+
+    Fail-closed like bwrap: podman missing, the container not coming up, the
+    screen not publishing, an unmappable interpreter, or a missing env all raise
+    RuntimeError after a ``sandbox.denied`` security event. There is no bare
+    fallback — a desktop profile either runs in its container or not at all.
+    """
+    from .. import desktop_sandbox
+
+    # Same-path mounting means every path the worker sees must be the canonical
+    # host path (bwrap resolves too). An unresolved alias would be mounted under
+    # one name and addressed under another inside the container.
+    profile_home = profile_home.expanduser().resolve()
+
+    def _deny(reason: str, msg: str) -> RuntimeError:
+        logger.error("[multitenancy] desktop container denied profile=%s reason=%s: %s",
+                     profile_home.name, reason, msg)
+        append_security_event(
+            event_type="sandbox.denied", reason=reason, profile=profile_home.name
+        )
+        return RuntimeError(f"[multitenancy] desktop sandbox unavailable ({reason}): {msg}")
+
+    if env is None:
+        raise _deny(
+            "desktop_exec_env_missing",
+            "caller did not pass the worker env; podman exec cannot inherit it",
+        )
+    if not cmd:
+        raise _deny("desktop_exec_path_unmapped", "empty command")
+    mapped = desktop_sandbox.map_executable(decision, cmd[0])
+    if mapped is None:
+        raise _deny(
+            "desktop_exec_path_unmapped",
+            f"{cmd[0]!r} has no container-side equivalent (desktop.container_python)",
+        )
+    try:
+        handle = desktop_sandbox.ensure(decision)
+    except desktop_sandbox.DesktopSandboxError as exc:
+        err = _deny(exc.reason, str(exc))
+        if exc.user_message:
+            err = RuntimeError(f"{exc.user_message}（{exc.reason}）")
+        raise err from exc
+    workdir = Path(_aiagent_subprocess_cwd(profile_home))
+    wrapped = desktop_sandbox.exec_args(
+        decision, handle, [mapped, *cmd[1:]], env, workdir=workdir
+    )
+    logger.info(
+        "[multitenancy] desktop container wrap: profile=%s container=%s image=%s started=%s",
+        profile_home.name, handle.name, decision.image, handle.started,
+    )
+    return wrapped
+
+
 def _aiagent_subprocess_cwd(profile_home: Path) -> str:
     """Start child processes from the routed workspace so sandbox getcwd is allowed."""
     workspace = profile_home.expanduser() / "workspace"
@@ -5809,13 +5944,19 @@ async def _run_aiagent_subprocess(
     child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
     from .harness_webui_runtime import require_event_admission
 
-    cmd = _wrap_with_sandbox(
+    # The desktop backend may create/start a container (podman + waits): run the
+    # wrapper off the event loop so a slow ensure() never stalls other profiles.
+    cmd = await asyncio.to_thread(
+        _wrap_with_sandbox,
         [sys.executable, str(child_script)],
         profile_home,
         local_harness=require_event_admission(event, profile_home) is not None,
+        env=env,
     )
 
     proc = None
+    turn_scope = _desktop_turn_scope(profile_home)
+    turn_scope.__enter__()
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -5838,6 +5979,7 @@ async def _run_aiagent_subprocess(
             await proc.wait()
         raise
     finally:
+        turn_scope.__exit__(None, None, None)
         if env_scope_entered:
             await _exit_aiagent_subprocess_env_scope(env_scope, sys.exc_info())
         try:

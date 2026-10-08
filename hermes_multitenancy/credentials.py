@@ -80,36 +80,15 @@ class CredentialStore:
         subject_id = _clean_id("subject_id", subject_id)
         provider = _clean_id("provider", provider)
         secret_kind = _clean_id("secret_kind", secret_kind)
-        scopes_list = _normalize_scopes(scopes)
-        now = _now_ms()
-        sealed = _seal_json(payload, _require_key(self._key))
         try:
-            self._conn.execute(
-                """
-                INSERT INTO multitenancy_credentials
-                    (profile_name, subject_id, provider, secret_kind, scopes_json,
-                     scope_hash, expires_at, encrypted_payload, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                ON CONFLICT(profile_name, subject_id, provider, secret_kind) DO UPDATE SET
-                    scopes_json       = excluded.scopes_json,
-                    scope_hash        = excluded.scope_hash,
-                    expires_at        = excluded.expires_at,
-                    encrypted_payload = excluded.encrypted_payload,
-                    active            = 1,
-                    updated_at        = excluded.updated_at
-                """,
-                (
-                    profile_name,
-                    subject_id,
-                    provider,
-                    secret_kind,
-                    json.dumps(scopes_list, ensure_ascii=False, sort_keys=True),
-                    _scope_hash(scopes_list),
-                    expires_at,
-                    sealed,
-                    now,
-                    now,
-                ),
+            self._upsert(
+                profile_name=profile_name,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+                payload=payload,
+                scopes=scopes,
+                expires_at=expires_at,
             )
             if commit_if is not None and not commit_if(self._conn):
                 self._conn.rollback()
@@ -119,6 +98,103 @@ class CredentialStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    def put_credential_if(
+        self,
+        *,
+        profile_name: str,
+        subject_id: str,
+        provider: str,
+        secret_kind: str,
+        payload: dict[str, Any],
+        expect: Callable[[dict[str, Any] | None], bool],
+        scopes: Iterable[str] | None = None,
+        expires_at: int | None = None,
+    ) -> bool:
+        """Cross-process compare-and-set for one credential row.
+
+        ``BEGIN IMMEDIATE`` takes SQLite's write lock before the current row is
+        read, so no other connection (in any process) can commit between the
+        read that ``expect`` judges and the upsert that follows. ``expect``
+        receives the decrypted current payload, or ``None`` when no active row
+        exists. False -> rollback, return False, row untouched. True -> the
+        same upsert as :meth:`put_credential`, commit, return True. Waiting for
+        the lock is bounded by the connection's busy_timeout (5s default).
+        """
+        profile_name = _clean_id("profile_name", profile_name)
+        subject_id = _clean_id("subject_id", subject_id)
+        provider = _clean_id("provider", provider)
+        secret_kind = _clean_id("secret_kind", secret_kind)
+        key = _require_key(self._key)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._get_row(
+                profile_name=profile_name,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+            )
+            current = None if row is None else _open_json(row["encrypted_payload"], key)
+            if not expect(current):
+                self._conn.rollback()
+                return False
+            self._upsert(
+                profile_name=profile_name,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+                payload=payload,
+                scopes=scopes,
+                expires_at=expires_at,
+            )
+            self._conn.commit()
+            return True
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def _upsert(
+        self,
+        *,
+        profile_name: str,
+        subject_id: str,
+        provider: str,
+        secret_kind: str,
+        payload: dict[str, Any],
+        scopes: Iterable[str] | None,
+        expires_at: int | None,
+    ) -> None:
+        """Insert-or-replace one row; caller owns the transaction boundary."""
+        scopes_list = _normalize_scopes(scopes)
+        now = _now_ms()
+        sealed = _seal_json(payload, _require_key(self._key))
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_credentials
+                (profile_name, subject_id, provider, secret_kind, scopes_json,
+                 scope_hash, expires_at, encrypted_payload, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(profile_name, subject_id, provider, secret_kind) DO UPDATE SET
+                scopes_json       = excluded.scopes_json,
+                scope_hash        = excluded.scope_hash,
+                expires_at        = excluded.expires_at,
+                encrypted_payload = excluded.encrypted_payload,
+                active            = 1,
+                updated_at        = excluded.updated_at
+            """,
+            (
+                profile_name,
+                subject_id,
+                provider,
+                secret_kind,
+                json.dumps(scopes_list, ensure_ascii=False, sort_keys=True),
+                _scope_hash(scopes_list),
+                expires_at,
+                sealed,
+                now,
+                now,
+            ),
+        )
 
     def get_status(
         self,
@@ -284,6 +360,52 @@ class CredentialStore:
             self._conn.commit()
             return bool(cursor.rowcount)
         except Exception:
+            self._conn.rollback()
+            raise
+
+    def delete_credential_if(
+        self,
+        *,
+        profile_name: str,
+        subject_id: str,
+        provider: str,
+        secret_kind: str,
+        expect: Callable[[dict[str, Any] | None], bool],
+    ) -> bool:
+        """Cross-process compare-and-delete, same shape as
+        :meth:`put_credential_if`: under ``BEGIN IMMEDIATE`` read and decrypt
+        the current row (``None`` if absent), and delete it (same hard DELETE
+        as :meth:`delete_credential`) only if ``expect`` returns True."""
+        values = (
+            _clean_id("profile_name", profile_name),
+            _clean_id("subject_id", subject_id),
+            _clean_id("provider", provider),
+            _clean_id("secret_kind", secret_kind),
+        )
+        key = _require_key(self._key)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._get_row(
+                profile_name=values[0],
+                subject_id=values[1],
+                provider=values[2],
+                secret_kind=values[3],
+            )
+            current = None if row is None else _open_json(row["encrypted_payload"], key)
+            if not expect(current):
+                self._conn.rollback()
+                return False
+            self._conn.execute(
+                """
+                DELETE FROM multitenancy_credentials
+                WHERE profile_name = ? AND subject_id = ?
+                  AND provider = ? AND secret_kind = ?
+                """,
+                values,
+            )
+            self._conn.commit()
+            return True
+        except BaseException:
             self._conn.rollback()
             raise
 

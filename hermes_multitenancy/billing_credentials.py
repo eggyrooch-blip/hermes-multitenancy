@@ -4,6 +4,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 import re
@@ -29,6 +30,8 @@ from .billing_employee_key import (
 )
 from .credentials import CredentialStore
 from .run_broker import RunRejected
+
+logger = logging.getLogger(__name__)
 
 
 _EMPLOYEE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -477,8 +480,32 @@ class BillingCredentialManager:
             if payload is None:
                 return
             self._validate_local_payload(payload, metadata=metadata)
-            payload["invalid"] = True
-            self._save_payload(profile_name, employee_id, payload)
+            # The payer lock is in-process only; the refresh service is a
+            # separate process writing the same row. Save against the load-time
+            # snapshot so a rotation that landed meanwhile is never clobbered
+            # by this stale copy (audit MT #01).
+            if self._save_payload(
+                profile_name, employee_id, {**payload, "invalid": True},
+                expected=_cas_snapshot(payload),
+            ):
+                return
+            fresh = self._load_payload(profile_name, employee_id)
+            if fresh is None or str(fresh.get("key_id")) != str(payload["key_id"]):
+                # Someone rotated (or removed) the key this 401 was about; the
+                # new generation is not known to be bad, so leave it alone.
+                logger.warning(
+                    "billing mark_invalid skipped for %s: key rotated concurrently",
+                    employee_id,
+                )
+                return
+            if self._save_payload(
+                profile_name, employee_id, {**fresh, "invalid": True},
+                expected=_cas_snapshot(fresh),
+            ):
+                return
+            logger.warning(
+                "billing mark_invalid gave up for %s: row kept changing", employee_id
+            )
 
     def _ensure_locked(
         self,
@@ -869,17 +896,39 @@ class BillingCredentialManager:
         return dict(payload)
 
     def _save_payload(
-        self, profile_name: str, employee_id: str, payload: dict[str, Any]
-    ) -> None:
+        self,
+        profile_name: str,
+        employee_id: str,
+        payload: dict[str, Any],
+        *,
+        expected: tuple[int, str] | None = None,
+    ) -> bool:
+        """Write the vault row. With ``expected`` = the ``(credential_version,
+        key_id)`` seen at load time, write only if the row still carries that
+        pair (cross-process CAS); returns False when another writer got there
+        first. Without it, unconditional as before (always True)."""
         try:
             with self._vault_lock:
-                self._vault.put_credential(
+                if expected is None:
+                    self._vault.put_credential(
+                        profile_name=profile_name,
+                        subject_id=employee_id,
+                        provider=_PROVIDER,
+                        secret_kind=_SECRET_KIND,
+                        payload=payload,
+                        expires_at=int(payload["expires_at"]),
+                    )
+                    return True
+                want = (str(expected[0]), str(expected[1]))
+                return self._vault.put_credential_if(
                     profile_name=profile_name,
                     subject_id=employee_id,
                     provider=_PROVIDER,
                     secret_kind=_SECRET_KIND,
                     payload=payload,
                     expires_at=int(payload["expires_at"]),
+                    expect=lambda current: current is not None
+                    and _cas_snapshot_str(current) == want,
                 )
         except Exception as exc:
             if _is_vault_unavailable(exc):
@@ -889,14 +938,35 @@ class BillingCredentialManager:
             # "could not obtain", stays closed.
             raise RunRejected("billing credential vault write was rejected") from exc
 
-    def _delete_payload(self, profile_name: str, employee_id: str) -> None:
+    def _delete_payload(
+        self,
+        profile_name: str,
+        employee_id: str,
+        *,
+        expected: tuple[int, str] | None = None,
+    ) -> bool:
+        """Delete the vault row. With ``expected`` (the ``(credential_version,
+        key_id)`` this caller wrote), delete only if the row still carries that
+        pair; returns False when another writer changed it. Without it,
+        unconditional as before (always True)."""
         try:
             with self._vault_lock:
-                self._vault.delete_credential(
+                if expected is None:
+                    self._vault.delete_credential(
+                        profile_name=profile_name,
+                        subject_id=employee_id,
+                        provider=_PROVIDER,
+                        secret_kind=_SECRET_KIND,
+                    )
+                    return True
+                want = (str(expected[0]), str(expected[1]))
+                return self._vault.delete_credential_if(
                     profile_name=profile_name,
                     subject_id=employee_id,
                     provider=_PROVIDER,
                     secret_kind=_SECRET_KIND,
+                    expect=lambda current: current is not None
+                    and _cas_snapshot_str(current) == want,
                 )
         except Exception as exc:
             if _is_vault_unavailable(exc):
@@ -940,6 +1010,15 @@ class BillingCredentialManager:
                 lock = threading.RLock()
                 self._locks[employee_id] = lock
             return lock
+
+
+def _cas_snapshot(payload: dict[str, Any]) -> tuple[int, str]:
+    """The ``(credential_version, key_id)`` pair a CAS save compares against."""
+    return int(payload["credential_version"]), str(payload["key_id"])
+
+
+def _cas_snapshot_str(payload: dict[str, Any]) -> tuple[str, str]:
+    return str(payload.get("credential_version")), str(payload.get("key_id"))
 
 
 def _binding_from_payload(payload: dict[str, Any]) -> BillingIdentity:

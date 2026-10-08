@@ -227,10 +227,10 @@ def test_router_startup_refuses_when_group_feishu_repair_cannot_write(monkeypatc
     assert not list(group.glob(".config.yaml.tmp.*"))
 
 
-def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_media_retry(monkeypatch):
+def test_router_register_installs_clarify_after_media_retry(monkeypatch):
     import hermes_multitenancy
     from hermes_multitenancy import feishu_clarify_cards, feishu_media_retry
-    from hermes_multitenancy import feishu_helpdesk_events, group_inviter_hook
+    from hermes_multitenancy import group_inviter_hook
 
     calls: list[str] = []
 
@@ -241,11 +241,6 @@ def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_med
     monkeypatch.setattr(hermes_multitenancy, "may_own_cron_runtime", lambda: False)
     monkeypatch.setattr(hermes_multitenancy, "is_router_profile_runtime", lambda: True)
     monkeypatch.setattr(group_inviter_hook, "install_feishu_bot_added_hook", lambda: None)
-    monkeypatch.setattr(
-        feishu_helpdesk_events,
-        "install_feishu_helpdesk_events_patch",
-        lambda: calls.append("helpdesk"),
-    )
     monkeypatch.setattr(feishu_media_retry, "install_feishu_media_retry_patch", lambda: calls.append("media"))
     monkeypatch.setattr(feishu_clarify_cards, "install_feishu_clarify_card_action_patch", lambda: calls.append("clarify"))
     monkeypatch.setattr(hermes_multitenancy.webui_broker_server, "ensure_run_broker_server_started", lambda: None)

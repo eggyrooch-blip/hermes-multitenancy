@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -188,9 +189,78 @@ def list_scenes() -> list[SceneDefinition]:
 # a plaintext token is never accepted or persisted (auth = header name + env
 # var name only).
 
-def callback_from_payload(raw: Any) -> Optional[CallbackConfig]:
+#: notify-card numeric bounds (SPEC mt-notify-card-input-hardening). ``json.loads``
+#: accepts ``Infinity``/``NaN`` and arbitrarily large ints, so every caller-sent
+#: number is checked finite + bounded before it reaches ``int()`` / a stored row.
+CALLBACK_TIMEOUT_MIN_S = 1
+CALLBACK_TIMEOUT_MAX_S = 60
+CALLBACK_TIMEOUT_DEFAULT_S = 10
+MAX_SUBMITS_MIN = 1
+MAX_SUBMITS_MAX = 1000
+DETERMINISTIC_MARKER_MAX_LEN = 200
+#: the one placeholder a marker may carry; after removing every occurrence, ANY
+#: remaining ``{`` or ``}`` is rejected (format specs, conversions, attribute
+#: access, positional/unknown fields, nested or doubled braces alike).
+MARKER_PLACEHOLDER = "{registry_id}"
+
+
+def _bounded_int(value: Any, *, name: str, lo: int, hi: int) -> int:
+    """A caller-sent number as a truncated int in ``[lo, hi]``; ``ValueError``
+    otherwise (bool is rejected even though it is an ``int`` subclass; a float
+    must be finite; an int is range-checked directly — ``math.isfinite`` would
+    itself overflow on a huge int)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    n = int(value)
+    if not lo <= n <= hi:
+        raise ValueError(f"{name} must be between {lo} and {hi}")
+    return n
+
+
+def _lenient_int(value: Any) -> Optional[int]:
+    """Read-side twin for already-stored rows: the pre-hardening ``int()`` with
+    the non-finite / non-number cases mapped to ``None`` instead of raising.
+    Stored rows are NOT re-validated (rejecting them would silently drop a
+    per-push callback and fall back to scene/env); the HTTP writer clamps the
+    timeout it actually uses."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return int(value)
+
+
+def validate_deterministic_marker(raw: Any) -> str:
+    """Admit only literal text plus the ``{registry_id}`` placeholder, ≤200 chars,
+    valid UTF-8 (a lone surrogate would crash the SQLite write). Absent/empty →
+    ``""``; a non-string is rejected. The writers substitute with a literal
+    ``replace`` (never ``str.format``), so this is defence in depth that keeps
+    junk out of new rows."""
+    if raw is None or raw == "":
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError("deterministic_marker must be a string")
+    marker = raw
+    try:
+        marker.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("deterministic_marker must be valid UTF-8 text") from None
+    if len(marker) > DETERMINISTIC_MARKER_MAX_LEN:
+        raise ValueError(
+            f"deterministic_marker must be at most {DETERMINISTIC_MARKER_MAX_LEN} characters"
+        )
+    rest = marker.replace(MARKER_PLACEHOLDER, "")
+    if "{" in rest or "}" in rest:
+        raise ValueError("deterministic_marker may only contain the {registry_id} placeholder")
+    return marker
+
+
+def callback_from_payload(raw: Any, *, _strict: bool = True) -> Optional[CallbackConfig]:
     """Parse a notify-card ``callback`` override. ``None`` if absent; raises
-    ``ValueError`` if present but malformed (a push override MUST carry a url)."""
+    ``ValueError`` if present but malformed (a push override MUST carry a url).
+    ``timeout_s`` (optional, default 10) must be a finite number in [1, 60]."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -206,13 +276,24 @@ def callback_from_payload(raw: Any) -> Optional[CallbackConfig]:
     if not (scheme == "https" or (scheme == "http" and host in ("127.0.0.1", "::1", "localhost"))):
         raise ValueError("callback.url must use https (http allowed only for loopback)")
     timeout = raw.get("timeout_s")
+    if _strict:
+        # key ABSENT → default; present (explicit null included) → must validate.
+        timeout_s = (
+            _bounded_int(
+                timeout, name="callback.timeout_s",
+                lo=CALLBACK_TIMEOUT_MIN_S, hi=CALLBACK_TIMEOUT_MAX_S,
+            ) if "timeout_s" in raw else CALLBACK_TIMEOUT_DEFAULT_S
+        )
+    else:
+        stored = _lenient_int(timeout)
+        timeout_s = stored if stored is not None and stored > 0 else CALLBACK_TIMEOUT_DEFAULT_S
     auth_header = raw.get("auth_header")
     auth_token_env = raw.get("auth_token_env")
     return CallbackConfig(
         url=url,
         auth_header=str(auth_header).strip() or None if auth_header else None,
         auth_token_env=str(auth_token_env).strip() or None if auth_token_env else None,
-        timeout_s=int(timeout) if isinstance(timeout, (int, float)) and int(timeout) > 0 else 10,
+        timeout_s=timeout_s,
     )
 
 
@@ -240,26 +321,37 @@ def callback_from_json(raw: Any) -> Optional[CallbackConfig]:
     if not isinstance(data, dict):
         return None
     try:
-        return callback_from_payload(data)
+        return callback_from_payload(data, _strict=False)
     except ValueError:
         return None
 
 
-def behaviors_from_payload(raw: Any) -> Optional[SubmitBehaviors]:
+def behaviors_from_payload(raw: Any, *, _strict: bool = True) -> Optional[SubmitBehaviors]:
     """Parse a notify-card ``behaviors`` override on top of the framework
-    defaults. ``None`` if absent; raises ``ValueError`` if not an object."""
+    defaults. ``None`` if absent; raises ``ValueError`` if not an object or if
+    ``max_submits`` is present but not a finite number in [1, 1000]."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("behaviors must be an object")
     base = SubmitBehaviors()
     maxs = raw.get("max_submits", base.max_submits)
+    if _strict:
+        # key ABSENT → default; present (explicit null included) → must validate.
+        max_submits = (
+            _bounded_int(
+                maxs, name="behaviors.max_submits", lo=MAX_SUBMITS_MIN, hi=MAX_SUBMITS_MAX,
+            ) if "max_submits" in raw else base.max_submits
+        )
+    else:
+        # stored rows serialize an unset max_submits as null → tolerate it.
+        max_submits = None if maxs is None else _lenient_int(maxs)
     return SubmitBehaviors(
         submit_once=bool(raw.get("submit_once", base.submit_once)),
         allow_resubmit_before_commit=bool(
             raw.get("allow_resubmit_before_commit", base.allow_resubmit_before_commit)
         ),
-        max_submits=int(maxs) if isinstance(maxs, (int, float)) else None,
+        max_submits=max_submits,
     )
 
 
@@ -287,7 +379,7 @@ def behaviors_from_json(raw: Any) -> Optional[SubmitBehaviors]:
     if not isinstance(data, dict):
         return None
     try:
-        return behaviors_from_payload(data)
+        return behaviors_from_payload(data, _strict=False)
     except ValueError:
         return None
 
@@ -359,7 +451,7 @@ def scene_from_payload(payload: Any) -> SceneDefinition:
         skill=skill,
         writer="" if mode == MODE_YOLO else "kep-pre-claim-writer",
         fields=fields,
-        deterministic_marker=str(payload.get("deterministic_marker") or ""),
+        deterministic_marker=validate_deterministic_marker(payload.get("deterministic_marker")),
         callback=callback,
         behaviors=behaviors,
         mode=mode,

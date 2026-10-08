@@ -734,7 +734,24 @@ async def _stream_aiagent_subprocess(
     # Without .resolve() the child python sees an [Errno 1] Operation not
     # permitted when trying to open aiagent_subprocess.py through the symlink.
     child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
-    cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
+    # Off the event loop: the desktop backend may create/start a container.
+    try:
+        cmd = await asyncio.to_thread(
+            _wrap_with_sandbox, [sys.executable, str(child_script)], profile_home, env=env
+        )
+    except BaseException:
+        if warm_run is not None:
+            await warm_run.close()
+        await _pkg._exit_aiagent_subprocess_env_scope(env_scope, sys.exc_info())
+        try:
+            import shutil
+
+            shutil.rmtree(approval_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
+    turn_scope = _pkg._desktop_turn_scope(profile_home)
+    turn_scope.__enter__()
 
     started_at = time.monotonic()
     wall_started_at = time.time()
@@ -1232,6 +1249,7 @@ async def _stream_aiagent_subprocess(
                         sys.exc_info(),
                     )
         finally:
+            turn_scope.__exit__(None, None, None)
             if proc is not None and proc.returncode is None:
                 proc.kill()
                 await proc.wait()

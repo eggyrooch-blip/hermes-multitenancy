@@ -472,7 +472,6 @@ def test_feishu_patch_installers_use_plugin_adapter_layout(monkeypatch) -> None:
     adapter_cls = fake_module.FeishuAdapter
 
     from hermes_multitenancy import feishu_group_valve
-    from hermes_multitenancy import feishu_helpdesk_events
     from hermes_multitenancy import feishu_merge_forward_api
     from hermes_multitenancy import feishu_reaction_lifecycle
     from hermes_multitenancy import feishu_reply_quote_api
@@ -485,14 +484,12 @@ def test_feishu_patch_installers_use_plugin_adapter_layout(monkeypatch) -> None:
     group_inviter_hook._HOOK_INSTALLED = False
 
     feishu_group_valve.install_feishu_group_valve_patch()
-    feishu_helpdesk_events.install_feishu_helpdesk_events_patch()
     feishu_merge_forward_api.install_feishu_merge_forward_api_patch()
     feishu_reaction_lifecycle.install_feishu_reaction_lifecycle_patch()
     feishu_reply_quote_api.install_feishu_reply_quote_api_patch()
     group_inviter_hook.install_feishu_bot_added_hook()
 
     assert getattr(adapter_cls._require_mention_for, "_hermes_multitenancy_group_valve_require_mention_patched", False)
-    assert getattr(adapter_cls._build_event_handler, "_hermes_mt_helpdesk_events_patched", False)
     assert getattr(adapter_cls._extract_message_content, "_hermes_multitenancy_merge_forward_api_patched", False)
     assert getattr(adapter_cls.on_processing_complete, "_hermes_multitenancy_reaction_lifecycle_patched", False)
     assert getattr(adapter_cls._fetch_message_text, "_hermes_multitenancy_reply_quote_fetch_patched", False)

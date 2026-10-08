@@ -490,13 +490,23 @@ def _resolve_enabled_toolsets(
         try:
             from ..browser_policy import browser_decision, browser_toolsets_for_policy
 
-            return browser_toolsets_for_policy(
+            filtered = browser_toolsets_for_policy(
                 filtered,
                 browser_decision(config, profile_home),
             )
         except Exception as exc:
             logger.warning("[multitenancy] browser toolset policy failed: %s", exc)
             return [item for item in filtered or [] if item != "browser"] or None
+        # Desktop profiles get computer_use + browser back explicitly: the core
+        # api_server/webui default set strips computer_use, and only a profile
+        # that opted into its own desktop container may have it.
+        try:
+            from ..desktop_sandbox import desktop_enabled_for_profile, desktop_toolsets_for_policy
+
+            return desktop_toolsets_for_policy(filtered, desktop_enabled_for_profile(config, profile_home))
+        except Exception as exc:
+            logger.warning("[multitenancy] desktop toolset policy failed: %s", exc)
+            return filtered
 
     if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
         logger.info(

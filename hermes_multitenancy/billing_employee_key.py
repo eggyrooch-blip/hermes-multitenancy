@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 _EMPLOYEE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _KEY_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}")
@@ -526,12 +529,29 @@ def store_binding(preparer: Any, payer: Any, issued: IssuedKey) -> Any:
             preparer._store.put(binding)
         except Exception:
             if previous is not None:
-                manager._save_payload(
-                    payer.profile_name, payer.employee_user_id, previous
-                )
-            else:
-                manager._delete_payload(
-                    payer.profile_name, payer.employee_user_id
+                # Only undo our own write: the refresh service and the broker
+                # are separate processes, so if the row no longer carries the
+                # generation this adopt wrote, someone else has written since
+                # and restoring `previous` would clobber them (audit MT #01).
+                if not manager._save_payload(
+                    payer.profile_name, payer.employee_user_id, previous,
+                    expected=(binding.credential_version, binding.key_id),
+                ):
+                    logger.warning(
+                        "billing store_binding rollback skipped for %s: "
+                        "vault row changed after adopt",
+                        payer.employee_user_id,
+                    )
+            elif not manager._delete_payload(
+                payer.profile_name, payer.employee_user_id,
+                expected=(binding.credential_version, binding.key_id),
+            ):
+                # First-ever adopt: same rule — never delete a generation
+                # another process wrote after ours (codex review p1).
+                logger.warning(
+                    "billing store_binding rollback delete skipped for %s: "
+                    "vault row changed after adopt",
+                    payer.employee_user_id,
                 )
             raise
         return binding

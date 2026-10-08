@@ -164,6 +164,21 @@ def _register(ctx) -> None:
         except Exception:
             logger.exception("[push_card] send-sender / sweep wiring failed; continuing")
         try:
+            # Desktop containers (multitenancy.desktop) are stopped after their
+            # idle window by this sweep; without it every started desktop stays
+            # up forever. Linux-only inside; a no-op where podman is absent.
+            # The podman binary the sweep runs comes from the SHARED config
+            # (gateway-owned), never from a profile's config.yaml.
+            from .desktop_sandbox import ensure_desktop_idle_sweeps_started, host_desktop_settings
+            from .feishu_uat_auth import resolve_shared_home
+            _desktop_shared_home = resolve_shared_home()
+            ensure_desktop_idle_sweeps_started(
+                podman_bin=host_desktop_settings(_desktop_shared_home).podman_bin,
+                shared_home=_desktop_shared_home,
+            )
+        except Exception:
+            logger.exception("[desktop] idle sweep wiring failed; continuing")
+        try:
             from .feishu_message_trace import install_message_trace_filter
             install_message_trace_filter()
         except Exception:

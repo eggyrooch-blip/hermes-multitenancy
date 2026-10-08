@@ -257,8 +257,12 @@ class _AiagentWarmWorker:
             return
         self.proc = None
         child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
-        cmd = _wrap_with_sandbox([sys.executable, str(child_script), "--worker"], self.profile_home)
         env = _build_aiagent_warm_worker_base_env(self.profile_home)
+        # Off the event loop: the desktop backend may create/start a container.
+        cmd = await asyncio.to_thread(
+            _wrap_with_sandbox,
+            [sys.executable, str(child_script), "--worker"], self.profile_home, env=env,
+        )
         logger.info("[multitenancy] AIAgent warm worker spawning profile_home=%s", self.profile_home)
         proc = await asyncio.create_subprocess_exec(
             *cmd,

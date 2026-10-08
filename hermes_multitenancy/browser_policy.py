@@ -117,6 +117,19 @@ def browser_decision(
 
     cfg = _browser_config(config)
     if not _truthy(cfg.get("enabled")):
+        from .desktop_sandbox import desktop_enabled_in_config
+
+        # A profile that runs inside its own desktop container has a browser by
+        # construction (Chromium on the Bot Screen); the router check above still
+        # wins, so a misconfigured router profile stays browser-less.
+        if desktop_enabled_in_config(config):
+            return BrowserDecision(
+                enabled=True,
+                reason="profile desktop capability implies browser",
+                backend="local",
+                allow_private_urls=_truthy(cfg.get("allow_private_urls")),
+                profile_home=profile_home,
+            )
         return BrowserDecision(
             enabled=False,
             reason="profile browser capability is disabled",

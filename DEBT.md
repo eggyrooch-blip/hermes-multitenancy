@@ -293,7 +293,7 @@ dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单�
 
   另两条计入 16、但**不算债**，写出来是免得下次类扫又当新发现：
   `GET /health`（2 个字段，无租户数据）、`POST /feishu/helpdesk/events`
-  （ws-adapter 内部扇入口，owner 从事件体推出，本来就不是按调用方分租户的）。
+  （2026-10-07 已随 mt-helpdesk-orphan-chain-removal 删除）。
   → **真正的债面是 14 条**，其中 4 条是写操作。
 
 - **为什么现在不修**：这 16 条的调用方目前只有 WebUI 服务端（它自己已在 chat-plane 做过用户鉴权，

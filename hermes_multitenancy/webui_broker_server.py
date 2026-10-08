@@ -4573,99 +4573,6 @@ def create_run_broker_app(
             "service": "hermes-multitenancy-run-broker",
         })
 
-    _helpdesk_cache: dict = {}
-
-    async def handle_feishu_helpdesk_events(request):
-        # Internal endpoint: the Feishu ws-adapter forwards helpdesk ticket events
-        # here. Business logic + the hard test-helpdesk safety filter live in
-        # feishu_helpdesk_event.handle_helpdesk_event. Shadow by default (post gate).
-        if not _authorized(request):
-            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-        try:
-            payload = await request.json()
-        except Exception as exc:
-            return web.json_response({"ok": False, "error": f"bad json: {exc}"}, status=400)
-
-        from .feishu_helpdesk_event import handle_helpdesk_event
-
-        index = _helpdesk_cache.get("index")
-        if index is None:
-            from .helpdesk_rag import HelpdeskRagIndex
-
-            db = os.path.expanduser(
-                os.environ.get("HERMES_HELPDESK_INDEX_DB", "~/.hermes/profiles/helpdesk/ticket_index.db")
-            )
-            index = HelpdeskRagIndex(db)
-            _helpdesk_cache["index"] = index
-            doc_count = index.count()
-            if doc_count == 0:
-                logger.warning(
-                    "[multitenancy] helpdesk RAG index at %s is EMPTY (0 docs) — answers will be "
-                    "ungrounded; build the index (ingest faqs/tickets) before relying on it",
-                    db,
-                )
-            else:
-                logger.info("[multitenancy] helpdesk RAG index loaded: %d docs (%s)", doc_count, db)
-
-        # The test-helpdesk client is needed even in shadow mode: the event carries no
-        # helpdesk_id, so we confirm ticket membership by querying it with this helpdesk's
-        # token (real IT-helpdesk tickets fail and are dropped).
-        client = _helpdesk_cache.get("client")
-        if client is None:
-            from .feishu_helpdesk_client import HelpdeskClient
-
-            client = HelpdeskClient(
-                app_id=os.environ.get("HERMES_HELPDESK_APP_ID", ""),
-                app_secret=os.environ.get("HERMES_HELPDESK_APP_SECRET", ""),
-                helpdesk_id=os.environ.get("HERMES_HELPDESK_ID", ""),
-                helpdesk_token=os.environ.get("HERMES_HELPDESK_TOKEN", ""),
-            )
-            _helpdesk_cache["client"] = client
-
-        def _membership_check(ticket_id: str) -> bool:
-            try:
-                client.get_ticket(ticket_id)
-                return True
-            except Exception:
-                return False
-
-        post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
-        reply_fn = client.send_ticket_message if post_enabled else None
-
-        # SAFETY WELD: never operate against a denied (production) helpdesk, even if the
-        # env is misconfigured to point at it.
-        from .feishu_helpdesk_event import ALLOWED_HELPDESK_IDS, DENY_HELPDESK_IDS
-
-        configured_id = os.environ.get("HERMES_HELPDESK_ID", "").strip()
-        if configured_id in DENY_HELPDESK_IDS or configured_id not in ALLOWED_HELPDESK_IDS:
-            logger.error(
-                "[multitenancy] REFUSING helpdesk events: HERMES_HELPDESK_ID=%r is denied or not in the "
-                "allowlist %s — never auto-answer non-allowlisted / real-employee helpdesks",
-                configured_id, sorted(ALLOWED_HELPDESK_IDS),
-            )
-            return web.json_response({"ok": False, "error": "helpdesk not allowlisted"}, status=403)
-
-        def _process() -> None:
-            # heavy work OFF the event loop: membership API + RAG + inference (+ reply)
-            try:
-                result = handle_helpdesk_event(
-                    payload, index=index, membership_check=_membership_check, reply_fn=reply_fn, post=post_enabled
-                )
-            except Exception:
-                logger.exception("[multitenancy] helpdesk event handling failed")
-                return
-            logger.info(
-                "[multitenancy] helpdesk event action=%s ticket=%s posted=%s q=%r",
-                result.get("action"), result.get("ticket_id"), result.get("posted"),
-                (result.get("question") or "")[:80],
-            )
-            if result.get("answer"):
-                logger.info("[multitenancy] helpdesk draft answer: %s", str(result.get("answer"))[:600])
-
-        # fast-ack: never block the broker event loop on RAG/inference/Feishu I/O
-        asyncio.get_event_loop().run_in_executor(None, _process)
-        return web.json_response({"ok": True, "accepted": True})
-
     app = web.Application(client_max_size=_run_broker_client_max_size())
     async def _start_skillhub_drain(_app):
         from . import skillhub_installer
@@ -4674,7 +4581,6 @@ def create_run_broker_app(
 
     app.on_startup.append(_start_skillhub_drain)
     app.router.add_get("/api/run-broker/health", handle_health)
-    app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/runs/{run_id}/cancel", handle_run_cancel)
     app.router.add_post("/api/run-broker/source-refs/authorize", handle_source_refs_authorize)

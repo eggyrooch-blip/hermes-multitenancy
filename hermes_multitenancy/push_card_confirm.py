@@ -30,8 +30,10 @@ the card then guides re-auth and the row stays writable for a retry — kep gets
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -136,6 +138,34 @@ def build_kep_cli_args(
     return args
 
 
+def _render_marker(marker: str, registry_id: str) -> str:
+    """Literal ``{registry_id}`` substitution — NEVER ``str.format``: the marker
+    is caller-supplied (notify-card inline scene) and may already sit in stored
+    rows, so ``{registry_id:2000000000}`` must stay inert text (no 2GB pad) and
+    ``{unknown}`` must not KeyError the card forever."""
+    return str(marker or "").replace("{registry_id}", str(registry_id))
+
+
+#: HTTP writer timeout clamp (s). Applied at construction so rows stored before
+#: notify-card validated ``timeout_s`` (e.g. 10**9) cannot block for decades.
+HTTP_WRITER_TIMEOUT_MIN_S = 1.0
+HTTP_WRITER_TIMEOUT_MAX_S = 60.0
+
+
+HTTP_WRITER_TIMEOUT_DEFAULT_S = 10.0
+
+
+def _clamp_writer_timeout(timeout: Any) -> float:
+    """Clamp on the ORIGINAL number, then convert: ``float()`` first would
+    OverflowError on a stored 4000-digit int. Non-number / non-finite / bool →
+    the default."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        timeout = HTTP_WRITER_TIMEOUT_DEFAULT_S
+    elif isinstance(timeout, float) and not math.isfinite(timeout):
+        timeout = HTTP_WRITER_TIMEOUT_DEFAULT_S
+    return float(min(max(timeout, HTTP_WRITER_TIMEOUT_MIN_S), HTTP_WRITER_TIMEOUT_MAX_S))
+
+
 class MockKepPreClaimWriter(ClaimWriter):
     """In-memory stand-in for the real kep-pre writer (endpoint待sunke指定).
 
@@ -162,7 +192,7 @@ class MockKepPreClaimWriter(ClaimWriter):
         self.write_calls += 1
         if self.credential_expired:
             return WriteResult(ok=False, credential_expired=True, error="kep pre token expired")
-        marker = scene.deterministic_marker.format(registry_id=registry_id)
+        marker = _render_marker(scene.deterministic_marker, registry_id)
         reason = f"{values.get('reason', '')} {marker}".strip()
         # Build the argv the real writer would exec — asserts the array
         # discipline is exercised even though the mock does not shell out.
@@ -219,7 +249,7 @@ class HttpKepPreClaimWriter(ClaimWriter):
         auth_token_env: Optional[str] = None,
     ) -> None:
         self.url = url
-        self.timeout = timeout
+        self.timeout = _clamp_writer_timeout(timeout)
         self.auth_header = auth_header
         self.auth_token_env = auth_token_env
 
@@ -232,7 +262,7 @@ class HttpKepPreClaimWriter(ClaimWriter):
         write_idempotency_key: str,
         profile_name: str,
     ) -> WriteResult:
-        marker = scene.deterministic_marker.format(registry_id=registry_id)
+        marker = _render_marker(scene.deterministic_marker, registry_id)
         reason = f"{values.get('reason', '')} {marker}".strip()
         body = dict(values)
         body["reason"] = reason
@@ -357,7 +387,7 @@ def _bind_endpoint(
     if cb is None:
         return None, "未配置回调地址，请为该场景配置落库接口后重试。"
     return HttpKepPreClaimWriter(
-        cb.url, timeout=float(cb.timeout_s),
+        cb.url, timeout=cb.timeout_s,
         auth_header=cb.auth_header, auth_token_env=cb.auth_token_env,
     ), None
 
@@ -931,7 +961,14 @@ async def try_route_push_confirm_synthetic(gateway: Any, event: Any) -> bool:
         adapter = _get_feishu_adapter(gateway)
         if adapter is not None:
             _sendq.note_live_adapter(adapter)
-        result = _compute_confirm_result(card_event, action, value, form_value)
+        # The confirm core is blocking (sqlite CAS + urllib HTTP write to the
+        # callback, up to the writer timeout). This coroutine runs on the router
+        # event loop that dispatches EVERY tenant's messages, so run it in a
+        # worker thread; the CAS + write_idempotency_key live in the store, so
+        # exactly-once semantics are unchanged.
+        result = await asyncio.to_thread(
+            _compute_confirm_result, card_event, action, value, form_value,
+        )
         card = result.card
         if card is None and result.toast is not None:
             content = (result.toast.get("toast") or {}).get("content") or "已处理。"

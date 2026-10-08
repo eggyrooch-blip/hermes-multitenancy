@@ -9,6 +9,9 @@ import logging
 import os
 import re
 import threading
+import time
+from collections import deque
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +45,18 @@ RELAY_STORE_KEY = AppKey("relay_store", object)
 RELAY_EVENTS_KEY = AppKey("relay_events", object)
 RELAY_RETENTION_TASK_KEY = AppKey("relay_retention_task", asyncio.Task)
 RELAY_EVENT_STREAM_STOP_KEY = AppKey("relay_event_stream_stop", object)
+# POST /v1/enroll/sessions is unauthenticated by design (it starts OAuth) and is
+# reachable through the relay.example.com Caddy proxy, so every call is bounded:
+# sliding 60s window per source IP and globally. In-process is enough — the relay
+# is a single aiohttp process; a restart resetting the window is acceptable.
+ENROLL_PER_IP_PER_MIN = 10
+ENROLL_GLOBAL_PER_MIN = 120
+ENROLL_WINDOW_SECONDS = 60.0
+# Rejections are summarised: at most one persisted audit line per window, so a
+# client hammering past the limit cannot grow relay_logs either.
+ENROLL_REJECT_DISTINCT_KEY_CAP = 4096
+# Monotonic seconds; module-level so tests can drive the window without sleeping.
+_enroll_clock = time.monotonic
 FORBIDDEN_IDENTITY_FIELDS = frozenset(
     {"target", "recipient", "open_id", "user_id", "email", "employee_id", "profile", "profile_name", "agent"}
 )
@@ -171,6 +186,90 @@ class RelayEvents:
         return content
 
 
+def _enroll_client_ip(request: Any) -> str:
+    """Source IP for the enroll limiter.
+
+    A non-loopback peer is the client itself. A loopback peer is the same-host
+    Caddy reverse proxy, so the first X-Forwarded-For hop is used; a spoofed value
+    only spreads an attacker over more keys, which the global ceiling still caps.
+    """
+    remote = _normalized_ip(getattr(request, "remote", None))
+    if remote is not None and not ip_address(remote).is_loopback:
+        return remote
+    forwarded = str(request.headers.get("X-Forwarded-For", "") or "")
+    return _normalized_ip(forwarded.split(",", 1)[0]) or "unknown"
+
+
+def _normalized_ip(value: Any) -> str | None:
+    """Canonical text of a bare IPv4/IPv6 address; None for anything else.
+
+    Scoped IPv6 (``fe80::1%eth0``), ports and free text are refused, so whatever
+    becomes a limiter key is a plain address and never carries log fields.
+    """
+    text = str(value or "").strip()
+    if not text or "%" in text:
+        return None
+    try:
+        return str(ip_address(text))
+    except ValueError:
+        return None
+
+
+class _EnrollRateLimiter:
+    """Sliding-window counter: per-IP and global hits within the last window."""
+
+    def __init__(self) -> None:
+        self._global: deque[float] = deque()
+        self._per_ip: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+        self._rejected = 0
+        self._rejected_keys: set[str] = set()
+        self._last_summary: float | None = None
+
+    def allow(self, ip: str) -> tuple[bool, str | None]:
+        """(allowed, summary): summary is an audit line to log, at most one per window."""
+        with self._lock:
+            allowed = self._allow_locked(ip, _enroll_clock())
+            if not allowed:
+                self._rejected += 1
+                if len(self._rejected_keys) < ENROLL_REJECT_DISTINCT_KEY_CAP:
+                    self._rejected_keys.add(_sha(ip)[:12])
+            return allowed, self._take_summary_locked(_sha(ip)[:12])
+
+    def _take_summary_locked(self, last_key: str) -> str | None:
+        now = _enroll_clock()
+        if not self._rejected:
+            return None
+        if self._last_summary is not None and now - self._last_summary < ENROLL_WINDOW_SECONDS:
+            return None
+        line = (
+            "relay_audit event=enroll status=rate_limited rejected=%d keys=%d last_key=%s"
+            % (self._rejected, len(self._rejected_keys), last_key)
+        )
+        self._rejected = 0
+        self._rejected_keys.clear()
+        self._last_summary = now
+        return line
+
+    def _allow_locked(self, ip: str, now: float) -> bool:
+        cutoff = now - ENROLL_WINDOW_SECONDS
+        while self._global and self._global[0] <= cutoff:
+            self._global.popleft()
+        for key in [k for k, hits in self._per_ip.items() if not hits or hits[-1] <= cutoff]:
+            del self._per_ip[key]
+        hits = self._per_ip.get(ip)
+        if hits is not None:
+            while hits and hits[0] <= cutoff:
+                hits.popleft()
+        if len(self._global) >= ENROLL_GLOBAL_PER_MIN:
+            return False
+        if hits is not None and len(hits) >= ENROLL_PER_IP_PER_MIN:
+            return False
+        self._global.append(now)
+        self._per_ip.setdefault(ip, deque()).append(now)
+        return True
+
+
 def _error(
     code: str, message: str, status: int, retry_after: int | None = None
 ):
@@ -296,7 +395,20 @@ def create_agent_relay_app(
             return denied
         return web.json_response(store.usage_stats(*window))
 
-    async def start_enrollment(_request):
+    enroll_limiter = _EnrollRateLimiter()
+
+    async def start_enrollment(request):
+        allowed, summary = enroll_limiter.allow(_enroll_client_ip(request))
+        if summary is not None:
+            # Counts only, never the raw source: XFF is client-controlled.
+            logger.warning(summary)
+        if not allowed:
+            return _error(
+                "rate_limited",
+                "too many enrollment attempts; retry later",
+                429,
+                retry_after=int(ENROLL_WINDOW_SECONDS),
+            )
         return web.json_response(store.create_enrollment(oauth), status=201)
 
     async def oauth_callback(request):
@@ -536,7 +648,13 @@ def create_agent_relay_app(
             return _error("unauthorized", "invalid or revoked token", 401)
         try:
             since_ts = int(request.query.get("since_ts", 0))
-            limit = min(100, max(1, int(request.query.get("limit", 50))))
+            if not 0 <= since_ts < 2**63:
+                # SQLite binds int64 only; out of range is a 400, never an OverflowError 500.
+                raise ValueError
+            limit = int(request.query.get("limit", 50))
+            if not 0 <= limit < 2**63:
+                raise ValueError
+            limit = min(100, max(1, limit))
         except ValueError:
             return _error("invalid_query", "since_ts and limit must be integers", 400)
         replies = store.message_replies(
