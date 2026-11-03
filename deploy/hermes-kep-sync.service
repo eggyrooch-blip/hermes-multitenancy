@@ -1,0 +1,30 @@
+# 每日从 kep-cli 注册表现生成清单并 install/update 所有接入系统，同步到共享沙箱 bin。
+# 安装到 hermes-1（跑 hermes 用户）。占位符（@...@ / <...>）部署时按 README 替换。
+[Unit]
+Description=Hermes kep-cli self refresh and active-system sync
+After=network-online.target
+Wants=network-online.target
+# 失败即告警：模板单元读 prod 环境文件里的飞书群 webhook（URL 不入库）。
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+# 作为 hermes 用户的 user unit 安装（systemctl --user）；改 system-level 时加回 User=hermes。
+# 显式钉死环境：定时器不继承交互 shell，kep-cli 与 venv entrypoint 必须与沙箱 agent 解析一致。
+# PATH 必须含 kep-cli 安装目录 ~/.local/bin（install.sh 默认落点），否则 ExecStart 首步
+# `kep-cli list --json` 会 command-not-found；同时保留 .hermes/bin（Hermes 同步的业务 CLI）。
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin
+# 从注册表现生成清单：aidock 新增系统次日自动纳管，无需改配置。
+# --no-profile-sync：kep-sync 只维护"中央能力池"（共享二进制 + 共享 skill 源内容），
+# 绝不把 skill 铺给 profile。谁拿哪些 skill 由既有分发层决定（profile-skill-defaults /
+# skill-distribution → _sync_default_profile_skills）与专家 role-override（按角色精简）。
+# 这样能力池永远最新，而每个 profile/专家的上下文保持精简、不被全量 CLI skill 稀释。
+Environment=KEP_NO_AUTO_LOGIN=1
+ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli kep-maintain --kep-cli /home/hermes/.local/bin/kep-cli
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

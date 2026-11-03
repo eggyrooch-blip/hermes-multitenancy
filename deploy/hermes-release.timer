@@ -1,0 +1,13 @@
+# 每天 18:00 看一眼。选下班时间点：飞书是单活 WebSocket，切换必然有秒级中断。
+# 手动立刻发布：systemctl --user start hermes-release.service
+[Unit]
+Description=Check for a new Hermes release tag daily
+
+[Timer]
+OnCalendar=*-*-* 18:00:00
+RandomizedDelaySec=5min
+# 关机错过的那次开机后补跑
+Persistent=true
+
+[Install]
+WantedBy=timers.target

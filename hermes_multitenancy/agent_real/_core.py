@@ -1,0 +1,7242 @@
+"""Phase 3 — real (non-stub) agent runner.
+
+Replaces ``runtime._default_run_agent`` (Phase-1 echo stub) with a thin
+OpenAI-compatible LLM call that reads its config + credentials from the
+profile_home directory. Designed to plug into ``ProfileRuntime`` via:
+
+    ProfileRuntime(profile_home, run_agent_fn=real_run_agent)
+
+Resolution order for an API key, given a model spec like ``"zai/glm-5.1"``:
+  1. Environment variable ``<PROVIDER>_API_KEY`` (e.g. ``GLM_API_KEY``,
+     ``ZAI_API_KEY``, ``OPENROUTER_API_KEY``) — sourced from the profile's
+     ``.env`` file via ``python-dotenv``.
+  2. ``auth.json`` ``credential_pool[provider]`` — first entry whose
+     ``last_status`` is not ``"exhausted"``.
+
+Fallback strategy: try the primary ``model.default``; on any error, walk the
+``fallback`` list. Returns the first non-empty content string.
+
+Spike scope: deliberate one-shot LLM call, no SessionStore, no tool-loop, no
+streaming. Phase 4 will graduate to a real AIAgent loop (~1700 LOC per the
+architect estimate). For end-to-end demo today, this thin runner is enough.
+"""
+from __future__ import annotations
+
+import sys as _sys
+_pkg = _sys.modules[__package__]
+
+import json
+import asyncio
+import logging
+import os
+import sys
+import time
+import hashlib
+import tempfile
+import uuid
+import re
+import secrets
+import importlib
+import threading
+import shutil
+from urllib import request as urllib_request
+from contextlib import closing, contextmanager, nullcontext
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Optional
+
+from .. import credential_hub
+from .. import kep_cli_guard
+from ..credential_broker import lease_signing_secret, mint_lease
+from ..lark_cli_guard import (
+    HERMES_LARK_CLI_REAL_BIN,
+    HERMES_LARK_CLI_RUN_TOKEN,
+    HERMES_LARK_CLI_SELF_SERVE,
+    generate_lark_cli_run_token,
+    install_lark_cli_shim,
+)
+from ..lark_cli_auth_broker import (
+    LarkCliAuthBrokerContext,
+    start_lark_cli_auth_broker_server,
+)
+from ..runtime import (
+    require_sandbox_enabled,
+    sandbox_profile_enabled,
+    strict_context_enabled,
+)
+from ..security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
+from ..security_audit import append_security_event
+from ..run_models import resolve_profile_workspace
+from .. import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
+
+logger = logging.getLogger(__name__)
+
+
+class ExpertUnavailableError(RuntimeError):
+    """An explicit expert request could not be proven safe to execute."""
+
+    error_code = "EXPERT_UNAVAILABLE"
+    failure_subsystem = "expert_resolution"
+    retryable = False
+
+    def __init__(self) -> None:
+        super().__init__("EXPERT_UNAVAILABLE")
+
+
+class GatewayRestartInterruptedError(RuntimeError):
+    """The AIAgent child was killed by a signal — the gateway went down mid-run.
+
+    Carries a user-ready message. ``stream_run_agent`` and ``real_run_agent``
+    must surface it verbatim: the generic ``_PARTIAL_FAILURE_NOTICE`` would hide
+    *why* the turn broke, and both legacy fallbacks are wrong here — nothing is
+    wrong with the model, the process was killed (deploy/restart SIGTERMs the
+    whole process group).
+    """
+
+    error_code = "GATEWAY_RESTART_INTERRUPTED"
+    failure_subsystem = "gateway_lifecycle"
+    retryable = True
+
+
+def _gateway_restart_interrupted(signum: int) -> GatewayRestartInterruptedError:
+    """One wording for both the streaming and the non-streaming raise sites."""
+    return GatewayRestartInterruptedError(
+        f"⚠️ 这一轮被网关重启/关闭打断了（子进程收到信号 {signum}），"
+        "没能跑完。麻烦再发一次。"
+    )
+
+
+# StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
+# child writes one JSON event per line; asyncio's default 64 KiB limit makes a
+# single large event line (a big final answer, a large tool arg / thinking block)
+# raise LimitOverrun from readline(), which fails the whole run and can poison a
+# warm worker. Bound it generously instead of at 64 KiB. MED-2, audit 2026-07-03.
+# Override via HERMES_AIAGENT_STREAM_LIMIT_BYTES.
+def _resolve_aiagent_stream_limit() -> int:
+    # Parse defensively: a non-numeric env value must NOT crash module import.
+    raw = os.environ.get("HERMES_AIAGENT_STREAM_LIMIT_BYTES", "").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 0
+    return max(64 * 1024, val if val > 0 else 16 * 1024 * 1024)
+
+
+_AIAGENT_STREAM_LIMIT = _resolve_aiagent_stream_limit()
+
+
+
+
+# Set by ``stream_run_agent`` (the reader owns the lifecycle); read by
+# ``_lark_cli_auth_broker_scope`` to wire the sidecar's sink. Unset on paths
+# that don't stream (real_run_agent / Feishu), so the sink stays disabled there.
+_CREDENTIAL_EXPIRY_SIGNAL: ContextVar[Optional[_CredentialExpirySignal]] = ContextVar(
+    "hermes_lark_cli_credential_expiry_signal", default=None
+)
+# Mirror of _CREDENTIAL_EXPIRY_SIGNAL for the JIT permission-denied path. The
+# lark-cli auth broker records into this (same one-shot holder) from its handler
+# thread when a forwarded Feishu response carries an app/user scope-missing code
+# (99991672 / 99991679). Read after the run to yield ("auth_required", payload) so
+# the Feishu router pushes a device-code auth card and replays the original
+# request once the user authorizes. Unset (None) on paths that don't stream.
+_PERMISSION_AUTH_SIGNAL: ContextVar[Optional[_CredentialExpirySignal]] = ContextVar(
+    "hermes_lark_cli_permission_auth_signal", default=None
+)
+_EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK = threading.RLock()
+_EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 0
+_PROFILE_ANCHOR_ENV_KEYS = frozenset({
+    "HOME",
+    "WORKSPACE",
+    "TERMINAL_CWD",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "TMPDIR",
+    "HERMES_HOME",
+    "HERMES_SHARED_HOME",
+    "HERMES_PROFILE",
+    "KEP_PROFILE",
+    "KEP_AGENT_MODE",
+    "KEP_WORKSPACE_DIR",
+    # Per-run spec-hub checkout for a codex-mapped run (harness-base-codex-w0).
+    # Same treatment as KEP_WORKSPACE_DIR because the kep skills reach the hub
+    # by BOTH routes and a model checks them with `echo $KEP_SPEC_HUB_DIR` in a
+    # terminal call, which crosses the second scrub.
+    "KEP_SPEC_HUB_DIR",
+    "TERMINAL_HOME_MODE",
+})
+
+
+# Map a model provider prefix to the env-var name that holds its API key.
+# Keep this list short and explicit — adding a provider is one line.
+_PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "zai": ("GLM_API_KEY", "ZAI_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "moonshot": ("MOONSHOT_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+}
+
+# Names a custom provider's ``key_env`` may resolve from the gateway process
+# environment. Everything else must come from the profile's own .env.
+_AMBIENT_PROVIDER_KEY_ENV_NAMES = frozenset(
+    name for names in _PROVIDER_ENV_KEYS.values() for name in names
+)
+
+
+# Each provider's API base URL when the model spec has no explicit override.
+# Values mirror what ``hermes_cli/config.py`` infers for the same providers.
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "zai": "https://api.z.ai/api/coding/paas/v4",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "openai": "https://api.openai.com/v1",
+    "moonshot": "https://api.moonshot.cn/v1",
+    "deepseek": "https://api.deepseek.com",
+}
+
+_PROVIDER_BASE_URL_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_BASE_URL",),
+    "openai": ("OPENAI_BASE_URL",),
+    "openrouter": ("OPENROUTER_BASE_URL",),
+    "zai": ("ZAI_BASE_URL", "GLM_BASE_URL"),
+    "moonshot": ("MOONSHOT_BASE_URL",),
+    "deepseek": ("DEEPSEEK_BASE_URL",),
+}
+
+_MODEL_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    key
+    for names in (*_PROVIDER_ENV_KEYS.values(), *_PROVIDER_BASE_URL_ENV_KEYS.values())
+    for key in names
+)
+
+_AIAGENT_TOOL_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "FAL_KEY",
+    "TAVILY_API_KEY",
+    "TAVILY_BASE_URL",
+    "TENCENTCLOUD_SECRET_ID",
+    "TENCENTCLOUD_SECRET_KEY",
+    "VOD_SUBAPP_ID",
+    "VOD_REGION",
+    "VOD_STORAGE_MODE",
+    "VOD_POLL_TIMEOUT",
+    "VOD_POLL_INTERVAL",
+    "VOD_ENDPOINT",
+})
+
+_SHARED_AIAGENT_ENV_ALLOWLIST: frozenset[str] = (
+    _MODEL_ENV_ALLOWLIST | _AIAGENT_TOOL_ENV_ALLOWLIST
+)
+_BILLING_CONTROL_ENV_NAMES = frozenset({
+    "HERMES_AI_GATEWAY_BROKER_URL",
+    "HERMES_AI_GATEWAY_BROKER_TOKEN",
+    "HERMES_AI_GATEWAY_BROKER_TIMEOUT",
+    "HERMES_LITELLM_BILLING_ENABLED",
+    "HERMES_LITELLM_BILLING_PAYER_IDS",
+    "HERMES_LITELLM_BILLING_BASE_URL",
+    "HERMES_LITELLM_BILLING_ALLOWED_PATHS",
+})
+
+_FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_DOMAIN",
+    "FEISHU_UAT_ACCESS_TOKEN",
+    "FEISHU_UAT_REFRESH_TOKEN",
+})
+_AGENT_SHARED_ROLES = frozenset({"viewer", "editor", "manager"})
+_AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
+_CREDENTIAL_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+_CUSTOM_MODEL_CONTEXT_SUFFIX_RE = re.compile(r"\[\d+[kKmM]\]$")
+_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER = (
+    "[System: Empty message content sanitised to satisfy protocol]"
+)
+_CODEX_EVIDENCE_AUDIENCE = "hermes-codex-run"
+
+
+def _strip_empty_message_protocol_placeholder(text: Any) -> str:
+    return str(text or "").replace(_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER, "")
+
+
+def _animated_stream_status(phase: str, tick: int) -> str:
+    del phase
+    marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
+    return marker
+
+
+def _strip_stream_status_animation_markers(text: str) -> str:
+    result = str(text or "")
+    for marker in _STREAM_STATUS_ANIMATION_MARKERS:
+        result = result.replace(marker, "")
+    return result
+
+
+def _maybe_budget_footer(content: str, tool_turns: int, cap: int) -> str:
+    """Append a budget-exhaustion footer when the tool-turn cap is reached."""
+    if cap <= 0 or tool_turns < cap:
+        return content
+    footer = f"\n\n---\n⚠️ 已用满 {cap} 步工具预算，以上为目前进展；回复“继续”可接着查。"
+    base = content or ""
+    if base.endswith(footer):
+        return base
+    return base + footer
+
+
+async def stream_run_agent(  # type: ignore[override]
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+):
+    """Yields ``(kind, text)`` tuples — Phase 4 routes through the real AIAgent.
+
+    With the AIAgent path enabled, the LLM gets the full toolset and can
+    actually call PR-added UAT tools. The subprocess bridge emits NDJSON
+    events so the parent can forward tool/reasoning/text deltas into the
+    Feishu streaming card while the synchronous AIAgent loop is still running.
+
+    Falls back to the legacy streaming path on AIAgent failure (preserves
+    the visible-typing UX even when tools cannot fire). ``messages`` is the
+    router-provided conversation history; the subprocess receives prior turns
+    as ``conversation_history`` and the current event text as the active user
+    message.
+    """
+    _resolve_explicit_expert_for_execution(event, profile_home)
+    from . import executor_map
+
+    mapped_codex = (
+        executor_map.runtime_for_event(event, profile_home)
+        == executor_map.CODEX_APP_SERVER
+    )
+    signal = _CredentialExpirySignal()
+    signal_token = _CREDENTIAL_EXPIRY_SIGNAL.set(signal)
+    permission_signal = _CredentialExpirySignal()
+    permission_signal_token = _PERMISSION_AUTH_SIGNAL.set(permission_signal)
+    try:
+        content_parts: list[str] = []
+        final_text = ""
+        saw_child_done = False
+        tool_started_count = 0
+        pending_operation_ref: dict[str, str] | None = None
+
+        def _with_operation_ref(value: Any) -> Any:
+            if not pending_operation_ref or not isinstance(value, dict):
+                return value
+            return {**value, "operation_ref": dict(pending_operation_ref)}
+
+        stream = _verified_codex_stream(event, profile_home, messages=messages)
+        async for kind, payload in stream:
+            if kind == "done":
+                final_text = str(payload or "")
+                saw_child_done = True
+                continue
+            if kind == "tool_started":
+                tool_started_count += 1
+            if kind == "tool_completed" and isinstance(payload, dict):
+                failure_subsystem = payload.get("failure_subsystem")
+                error_code = payload.get("error_code")
+                retryable = payload.get("retryable")
+                if (
+                    str(payload.get("name") or "") == "lark_cli"
+                    and str(error_code or "") == "FEISHU_AUTH_REAUTH_REQUIRED"
+                    and payload.get("session_id")
+                    and payload.get("tool_call_id")
+                ):
+                    pending_operation_ref = {
+                        "session_id": str(payload["session_id"]),
+                        "tool_call_id": str(payload["tool_call_id"]),
+                    }
+                if failure_subsystem and error_code and isinstance(retryable, bool):
+                    from ..run_broker import record_current_run_failure
+
+                    record_current_run_failure(
+                        failure_subsystem=str(failure_subsystem),
+                        error_code=str(error_code),
+                        retryable=retryable,
+                    )
+            if kind == "content":
+                text = str(payload or "")
+                if text:
+                    content_parts.append(text)
+                    yield "content", text
+                continue
+            yield kind, payload
+        content_text = _strip_empty_message_protocol_placeholder("".join(content_parts))
+        if final_text and not content_text.strip():
+            yield "content", final_text
+            content_text = final_text
+        elif final_text.endswith(_TRUNCATION_NOTICE) and _TRUNCATION_NOTICE not in content_text:
+            # Genuine output-length truncation AFTER partial answer text already
+            # streamed into the card: the streamed text is incomplete, so append
+            # the continue hint as a trailing delta. (_finalize_aiagent_result now
+            # returns "<partial text>\n\n<notice>", so match on the suffix.)
+            tail = "\n\n" + _TRUNCATION_NOTICE
+            yield "content", tail
+            content_text += tail
+        cap = int(os.getenv("HERMES_MAX_ITERATIONS", "30"))
+        footer_text = _maybe_budget_footer(content_text, tool_started_count, cap)
+        footer_tail = footer_text[len(content_text):]
+        if footer_tail:
+            yield "content", footer_tail
+        auth_required = signal.get() or permission_signal.get()
+        if auth_required:
+            yield "auth_required", _with_operation_ref(auth_required)
+        if final_text or content_parts:
+            # The child's done is consumed above, never re-yielded, so the
+            # carryover commit gate cannot see it — flag it on the event. Only
+            # HERE: an empty done with no content falls through to the legacy
+            # replay below, and that run's tools must not vouch for its answer.
+            if saw_child_done:
+                from .. import turn_tool_context as _turn_tool_context
+
+                _turn_tool_context.mark_done(event)
+            return
+    except Exception as exc:
+        if isinstance(exc, _WebUIVisionAdmissionRejected):
+            logger.info(
+                "[multitenancy] WebUI vision terminal refused legacy stream replay"
+            )
+            yield "content", str(exc)
+            return
+        from . import executor_unavailable_ux
+
+        if executor_unavailable_ux.is_unavailable(exc):
+            # Employee-facing UX boundary (t04): re-raise with a fixed Chinese
+            # action message only. Internal code + audit already recorded by
+            # render_unavailable — nothing past this point sees exc.reason.
+            # Catches t02's mapped-Codex ExecutorUnavailable AND t01's
+            # CodexSessionBridgeRejected (thread-binding fail-closed) —
+            # whichever raise site produced it.
+            raise executor_unavailable_ux.render_unavailable(
+                exc, event=event
+            ) from exc
+        if isinstance(exc, ExpertUnavailableError):
+            raise
+        if isinstance(exc, GatewayRestartInterruptedError):
+            # Handled BEFORE the billing / partial-content / legacy-fallback
+            # ladder below, all three of which would bury the honest message:
+            # the generic notice would replace it, and the legacy stream would
+            # swallow it entirely and answer as if nothing happened.
+            if content_parts:
+                # Keep what the user already saw and append the reason, rather
+                # than overwriting it with _PARTIAL_FAILURE_NOTICE.
+                yield "content", "\n\n" + str(exc)
+                from ..run_broker import mark_current_run_output_incomplete
+
+                mark_current_run_output_incomplete()
+                return
+            raise
+        from .streaming import AiagentToolStallTimeout
+
+        if isinstance(exc, AiagentToolStallTimeout):
+            # The child was killed for stream silence; streaming.py already
+            # logged WHICH tool stalled and closed its dangling calls. Name it
+            # to the user too instead of the generic notice — also when the
+            # model called the tool before saying anything (no preamble), on
+            # every transport. A stall with NO tool in flight and no content
+            # keeps the historical raise (nothing new to say).
+            if content_parts or exc.tool_name:
+                yield "content", ("\n\n" if content_parts else "") + exc.user_notice
+                from ..run_broker import mark_current_run_output_incomplete
+
+                mark_current_run_output_incomplete()
+                return
+            raise
+        if mapped_codex:
+            raise _codex_unavailable(
+                event,
+                profile_home,
+                "mapped Codex runtime failed before verified completion",
+            ) from exc
+        kind = _billing_failure_kind(event, exc)
+        retry_safe = (
+            getattr(exc, "billing_retry_safe", False) is True
+            and not content_parts
+            and tool_started_count == 0
+        )
+        if kind == "invalid_credential":
+            if retry_safe and not getattr(event, "_hermes_billing_retry", False):
+                # Same as the non-streaming path: mark for the sweep, degrade
+                # this attempt, never mint on the employee's request path.
+                # Deliberately unguarded — a RunRejected out of `mark_invalid`
+                # is drift, and drift must surface, not degrade (codex #p1).
+                _mark_billing_event_invalid(event)
+                _degrade_billing_event(event)
+                from ..run_broker import mark_current_run_retried
+
+                mark_current_run_retried()
+                retry_stream = stream_run_agent(
+                    event,
+                    profile_home,
+                    messages=messages,
+                )
+                async for retry_kind, retry_payload in retry_stream:
+                    yield retry_kind, retry_payload
+                return
+            _mark_billing_event_invalid(event)
+            message = _billing_failure_message(kind, retry_safe=retry_safe)
+            if content_parts:
+                yield "content", f"\n\n{message}"
+                return
+            raise RuntimeError(message) from exc
+        if kind in {"budget_exceeded", "rate_limit"}:
+            message = _billing_failure_message(kind, retry_safe=retry_safe)
+            if content_parts:
+                yield "content", f"\n\n{message}"
+                return
+            raise RuntimeError(message) from exc
+        # A credential expiry may have been signalled before the stream raised
+        # (the sidecar returns a graceful 503, but a later step can still throw).
+        # Surface it here too so the re-auth card isn't silently dropped on the
+        # exception tail.
+        auth_required = signal.get() or permission_signal.get()
+        if auth_required:
+            yield "auth_required", _with_operation_ref(auth_required)
+        # If we already streamed partial content into the card, re-running the
+        # legacy stream below would DUPLICATE everything the user has seen. Stop
+        # with an honest recovery hint instead of re-streaming. (Only fall through
+        # to the legacy stream when nothing was shown yet — e.g. a tool-call
+        # failure that raised before any answer token.)
+        if content_parts:
+            # This branch used to be silent: a dead turn left no log line at all.
+            logger.warning(
+                "[multitenancy] streaming AIAgent path failed after partial content; appending partial notice: %s",
+                exc,
+                exc_info=True,
+            )
+            yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
+            from ..run_broker import mark_current_run_output_incomplete
+
+            mark_current_run_output_incomplete()
+            return
+        if tool_started_count:
+            logger.warning(
+                "[multitenancy] streaming AIAgent path failed after tool start; refusing legacy replay",
+                exc_info=True,
+            )
+            raise
+        metadata = _event_metadata(event)
+        if (
+            metadata.get("litellm_billing_enforced") is True
+            or metadata.get("litellm_billing_user_id")
+        ):
+            raise RuntimeError(
+                "Billing-bound run cannot fall back to the unmetered legacy stream"
+            ) from exc
+        logger.warning(
+            "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
+            exc, exc_info=True,
+        )
+    finally:
+        _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
+        _PERMISSION_AUTH_SIGNAL.reset(permission_signal_token)
+
+    async for kind, text in _pkg._stream_loop(event, profile_home, messages=messages):
+        yield kind, text
+
+
+def _normalize_reasoning_compare(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _reasoning_for_state_db(
+    content: str,
+    reasoning: str,
+    *,
+    preserve_reasoning: bool = True,
+) -> str | None:
+    """Return reasoning safe to persist for WebUI history rendering."""
+    reasoning_text = str(reasoning or "")
+    if not preserve_reasoning or not reasoning_text.strip():
+        return None
+    content_norm = _normalize_reasoning_compare(content)
+    reasoning_norm = _normalize_reasoning_compare(reasoning_text)
+    if content_norm and content_norm == reasoning_norm:
+        return None
+    return reasoning_text
+
+
+
+
+async def real_run_agent(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> str:
+    """Run the inbound event through hermes' real AIAgent (with tool-loop).
+
+    Phase 4 — replaces the spike one-shot ``chat.completions.create`` call
+    with a full ``AIAgent.run_conversation()`` loop, so PR-added UAT tools
+    (e.g. feishu_calendar_list_events) actually fire. Sets
+    ``sender_open_id_scope`` so per-user UAT files are loaded correctly.
+
+    Falls back to the legacy thin LLM call (kept below as
+    ``_legacy_real_run_agent``) on any AIAgent failure so the spike-style
+    fallback path still answers the user — without tools, but at least with
+    a coherent reply.
+    """
+    _resolve_explicit_expert_for_execution(event, profile_home)
+    from . import executor_map
+
+    mapped_codex = (
+        executor_map.runtime_for_event(event, profile_home)
+        == executor_map.CODEX_APP_SERVER
+    )
+    billing_retried = False
+    while True:
+        try:
+            if messages is not None:
+                result = await _run_aiagent_subprocess(
+                    event, profile_home, messages=messages
+                )
+            else:
+                result = await _run_aiagent_subprocess(event, profile_home)
+            await _complete_codex_spend_receipt(event, profile_home)
+            return result
+        except Exception as exc:
+            if isinstance(exc, _WebUIVisionAdmissionRejected):
+                logger.info(
+                    "[multitenancy] WebUI vision terminal refused legacy runner replay"
+                )
+                return str(exc)
+            from . import executor_unavailable_ux
+
+            if executor_unavailable_ux.is_unavailable(exc):
+                # Employee-facing UX boundary (t04): re-raise with a fixed
+                # Chinese action message only. Internal code + audit already
+                # recorded by render_unavailable — nothing past this point
+                # sees exc.reason. Catches t02's mapped-Codex
+                # ExecutorUnavailable AND t01's CodexSessionBridgeRejected
+                # (thread-binding fail-closed) — whichever raise site
+                # produced it.
+                raise executor_unavailable_ux.render_unavailable(
+                    exc, event=event
+                ) from exc
+            if isinstance(exc, ExpertUnavailableError):
+                raise
+            if isinstance(exc, GatewayRestartInterruptedError):
+                # Must jump the ladder below: the legacy spike runner would
+                # silently re-run the whole prompt (double tool side effects,
+                # double spend) and answer as if nothing had happened, hiding
+                # the restart from the user entirely.
+                raise
+            if mapped_codex:
+                raise _codex_unavailable(
+                    event,
+                    profile_home,
+                    "mapped Codex runtime failed before verified completion",
+                ) from exc
+            kind = _billing_failure_kind(event, exc)
+            retry_safe = getattr(exc, "billing_retry_safe", False) is True
+            if kind == "invalid_credential":
+                if retry_safe and not billing_retried:
+                    # Mark first so the sweep re-provisions, then degrade so
+                    # THIS attempt is still served (unattributed).
+                    # NOT wrapped in try/except: `mark_invalid` validates the
+                    # stored tuple and raises plain RunRejected when it does not
+                    # match this run's metadata — i.e. drift, "obtained but
+                    # WRONG". Swallowing that and degrading anyway would bury a
+                    # real integrity defect inside normal traffic, which is the
+                    # one thing the degrade must never do (codex #p1 2026-08-07).
+                    _mark_billing_event_invalid(event)
+                    _degrade_billing_event(event)
+                    from ..run_broker import mark_current_run_retried
+
+                    mark_current_run_retried()
+                    billing_retried = True
+                    continue
+                _mark_billing_event_invalid(event)
+                raise RuntimeError(
+                    _billing_failure_message(kind, retry_safe=retry_safe)
+                ) from exc
+            if kind in {"budget_exceeded", "rate_limit"}:
+                raise RuntimeError(
+                    _billing_failure_message(kind, retry_safe=retry_safe)
+                ) from exc
+            logger.warning(
+                "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
+                exc, exc_info=True,
+            )
+            metadata = _event_metadata(event)
+            if (
+                metadata.get("litellm_billing_enforced") is True
+                or metadata.get("litellm_billing_user_id")
+            ):
+                raise RuntimeError(
+                    "Billing-bound run cannot fall back to the unmetered legacy runner"
+                ) from exc
+            break
+    # Legacy / fallback path — no tool-loop, but still answers.
+    return await _legacy_real_run_agent(event, profile_home, messages=messages)
+
+
+async def _legacy_real_run_agent(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> str:
+    """Original spike implementation — kept as a fallback for the AIAgent path."""
+    # P0-1: strict mode requires the real agent to run ONLY inside the isolated
+    # AIAgent subprocess (per-profile env, no parent HERMES_HOME reliance). The
+    # legacy in-process runner reads the parent process env/config directly, so
+    # in strict mode we fail closed rather than silently degrade to it.
+    if strict_context_enabled():
+        try:
+            from ..security_audit import append_security_event
+
+            append_security_event(
+                event_type="route.denied",
+                reason="strict_in_process_real_runner_disabled",
+                profile=profile_home.name,
+            )
+        except Exception:
+            logger.debug("[multitenancy] route.denied audit failed", exc_info=True)
+        raise RuntimeError(
+            "HERMES_MULTITENANCY_STRICT_CONTEXT=1: in-process legacy real runner "
+            "is disabled; the AIAgent isolated subprocess is required."
+        )
+    from openai import AsyncOpenAI
+    from dotenv import dotenv_values
+
+    config = _load_profile_config(profile_home)
+    auth = _load_json(profile_home / "auth.json")
+    env_overrides = dotenv_values(profile_home / ".env") if (profile_home / ".env").exists() else {}
+
+    primary = config.get("model", {}).get("default")
+    fallback_models = config.get("fallback") or []
+    candidates: list[str] = [primary] if primary else []
+    candidates.extend(fallback_models)
+
+    soul_text = _load_soul(profile_home)
+    # Expert Role-Override overlay (ephemeral, this run only). Per the live verdict
+    # (composition B) the override block leads the single system message; SOUL stays
+    # as the demoted base persona. SOUL.md on disk is never modified.
+    system_text = _compose_system_text(event, profile_home, soul_text)
+    user_text = getattr(event, "text", "") or ""
+
+    if messages is None:
+        effective_messages: list[dict] = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+    else:
+        effective_messages = [
+            {"role": "system", "content": system_text},
+            *messages,
+        ]
+
+    last_error: Optional[BaseException] = None
+
+    for model_spec in candidates:
+        if not model_spec:
+            continue
+        try:
+            provider, model_name = _split_model_spec(
+                model_spec,
+                strip_custom_context_suffix=True,
+            )
+        except ValueError as exc:
+            logger.debug("real_run_agent: bad model spec %r: %s", model_spec, exc)
+            continue
+
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider, env_overrides)
+        if not api_key:
+            logger.debug("real_run_agent: no API key for provider %s", provider)
+            continue
+
+        base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        try:
+            rsp = await client.chat.completions.create(
+                model=model_name,
+                messages=effective_messages,
+                max_tokens=512,
+            )
+            text = (rsp.choices[0].message.content or "").strip()
+            if text:
+                logger.debug(
+                    "real_run_agent: %s ok (prompt=%d completion=%d)",
+                    model_spec,
+                    rsp.usage.prompt_tokens if rsp.usage else -1,
+                    rsp.usage.completion_tokens if rsp.usage else -1,
+                )
+                return text
+            # Empty content (often signals quota exhausted) — try next.
+            logger.info("real_run_agent: %s returned empty, falling back", model_spec)
+        except Exception as exc:
+            last_error = exc
+            logger.info("real_run_agent: %s failed (%s), falling back", model_spec, exc)
+
+    if last_error is not None:
+        raise RuntimeError(f"all providers failed; last error: {last_error}") from last_error
+    raise RuntimeError("all providers exhausted (no usable key or non-empty response)")
+
+
+# -- helpers ---------------------------------------------------------------
+
+
+def _split_model_spec(
+    spec: str,
+    *,
+    strip_custom_context_suffix: bool = False,
+) -> tuple[str, str]:
+    """Split ``provider/model_name`` into its parts."""
+    if "/" not in spec:
+        raise ValueError(f"model spec missing provider prefix: {spec!r}")
+    provider, name = spec.split("/", 1)
+    provider = provider.strip().lower()
+    name = name.strip()
+    if strip_custom_context_suffix and provider.startswith("custom:"):
+        name = _CUSTOM_MODEL_CONTEXT_SUFFIX_RE.sub("", name)
+    return provider, name
+
+
+def _event_metadata(event: Any) -> dict[str, Any]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _event_delegation_id(event: Any) -> str:
+    """The credential-delegation grant this event is the replay of, if any.
+
+    Set by ``_dispatch_synthetic_auth_complete`` on the synthetic replay event
+    (attribute + raw_event metadata, so it survives either carrier). Binds a
+    ``once`` lease to the exact run it was granted for.
+    """
+    try:
+        direct = str(getattr(event, "hermes_delegation_id", "") or "").strip()
+        if direct:
+            return direct
+        return str(_event_metadata(event).get("delegation_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _trusted_feishu_runtime_identity(event: Any) -> tuple[str, str, str] | None:
+    metadata = _event_metadata(event)
+    if not str(metadata.get("trusted_ticket_fingerprint") or "").strip():
+        return None
+    actor = str(metadata.get("trusted_actor_subject") or "").strip()
+    credential = str(metadata.get("trusted_credential_subject") or "").strip()
+    tool_scope = str(metadata.get("feishu_tool_scope") or "").strip()
+    chat_type = str(metadata.get("trusted_chat_type") or "").strip()
+    # Two sealed actor shapes: an employee open_id, or the bot-actor sentinel
+    # from the trusted-ingress bot path. The bot shape is only legal on the
+    # group bot scope and its credential subject must never be an employee.
+    actor_shape_ok = actor.startswith("ou_") or (
+        actor.startswith("bot:")
+        and tool_scope == "feishu:bot"
+        and chat_type == "group"
+        and not credential.startswith("ou_")
+    )
+    if (
+        not actor_shape_ok
+        or str(metadata.get("sender_open_id") or "").strip() != actor
+        or not credential
+        or tool_scope not in {"feishu:user", "feishu:bot"}
+        or chat_type not in {"p2p", "group"}
+        or (tool_scope == "feishu:bot") != (chat_type == "group")
+        or not str(metadata.get("trusted_chat_id") or "").strip()
+        or not str(metadata.get("trusted_profile_name") or "").strip()
+        or (tool_scope == "feishu:user" and credential != actor)
+    ):
+        raise RuntimeError("Trusted Feishu runtime identity is incomplete or inconsistent")
+    return actor, credential, tool_scope
+
+
+def _billing_failure_kind(event: Any, error: Any) -> str:
+    metadata = _event_metadata(event)
+    if (
+        metadata.get("litellm_billing_enforced") is not True
+        and not metadata.get("litellm_billing_user_id")
+    ):
+        return ""
+    from ..billing_identity import classify_litellm_error
+
+    return classify_litellm_error(error)
+
+
+def _degrade_billing_event(event: Any) -> None:
+    """Retry this run unattributed instead of re-minting the dead credential.
+
+    Re-minting here would issue a key on the employee's own request path, which
+    `billing-runtime-never-mints` removed: the refresh sweep owns minting. The
+    credential is marked invalid first so the sweep re-provisions it, then the
+    billing metadata is stripped so THIS attempt still gets served — on the
+    shared key, unbilled, with a `billing_degraded_unattributed` audit line.
+    """
+    from ..billing_identity import degrade_billing_metadata
+
+    raw_event = getattr(event, "raw_event", None)
+    raw = dict(raw_event) if isinstance(raw_event, dict) else {}
+    raw["metadata"] = degrade_billing_metadata(_event_metadata(event))
+    event.raw_event = raw
+    # A streaming retry must reuse the session epoch created by the first
+    # attempt instead of looking like another fresh conversation.
+    event._hermes_billing_retry = True
+
+
+def _mark_billing_event_invalid(event: Any) -> None:
+    from ..billing_identity import mark_billing_credential_invalid
+
+    mark_billing_credential_invalid(_event_metadata(event))
+
+
+def _billing_failure_message(kind: str, *, retry_safe: bool) -> str:
+    if kind == "budget_exceeded":
+        return "该员工本月 LiteLLM 额度已用尽，请联系管理员调整额度或等待下月重置。"
+    if kind == "rate_limit":
+        return "LiteLLM 当前请求过于频繁，请稍后再试。"
+    if kind == "invalid_credential" and not retry_safe:
+        return "员工计费凭证已失效；为避免重复执行工具，本次未自动重试，请重新发送请求。"
+    return "员工计费凭证暂不可用，请稍后重试。"
+
+
+def _subprocess_failure(
+    message: str,
+    *,
+    retry_safe: bool = False,
+    error_code: Any = None,
+    failure_subsystem: Any = None,
+    retryable: Any = None,
+) -> RuntimeError:
+    code = str(error_code or "").strip()
+    subsystem = str(failure_subsystem or "").strip()
+    if code == "EXPERT_UNAVAILABLE" and subsystem == "expert_resolution":
+        return ExpertUnavailableError()
+    error = RuntimeError(message)
+    error.billing_retry_safe = bool(retry_safe)  # type: ignore[attr-defined]
+    if code:
+        error.error_code = code  # type: ignore[attr-defined]
+    if subsystem:
+        error.failure_subsystem = subsystem  # type: ignore[attr-defined]
+    if isinstance(retryable, bool):
+        error.retryable = retryable  # type: ignore[attr-defined]
+    return error
+
+
+def _redact_billing_runtime_text(value: Any, event: Any, env: Mapping[str, str]) -> str:
+    text = _redact_ingest_runtime_text(value, event)
+    # The payer key has two names during a Codex run: the billing name is
+    # consumed by run.py, while CODEX_RUNTIME_KEY survives Hermes' own
+    # HERMES_*_KEY scrub and is read by Codex' env_key. Redact both aliases by
+    # value so diagnostics cannot reveal the credential whichever name leaked.
+    secrets = {
+        str(env.get(name) or "")
+        for name in ("HERMES_LITELLM_RUNTIME_API_KEY", CODEX_RUNTIME_KEY_ENV)
+        if str(env.get(name) or "")
+    }
+    for secret in secrets:
+        text = text.replace(secret, "[REDACTED:litellm_billing_key]")
+        if len(secret) >= 16:
+            text = text.replace(
+                secret[:12], "[REDACTED:litellm_billing_key:prefix]"
+            )
+    return text
+
+
+def _expert_id_for_event(event: Any) -> str:
+    """Return the per-run ``expert_id`` from WebUI broker metadata, else ''.
+
+    The broker threads ``X-Hermes-Expert-Id`` / ``metadata.expert_id`` into
+    ``event.raw_event.metadata.expert_id``; when present we overlay that expert's
+    Role-Override persona for this run only (see ``expert_overlay``).
+    """
+    return str(_event_metadata(event).get("expert_id") or "").strip()
+
+
+_BROKER_ROLE_OVERRIDE_EVENT_KEY = "broker_role_override"
+_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY = "expert_id"
+_BROKER_ROLE_OVERRIDE_BLOCK_KEY = "block"
+# The active expert's authorized skill names, resolved gateway-side (routing
+# table available) and threaded to the sandboxed child so its disabled-skill
+# scope can un-hide exactly the active expert's skills WITHOUT re-resolving the
+# owner (routing is unavailable in the child; a tenant-writable marker must
+# never be the authority — see expert_overlay._routing_group_owner_open_id).
+_BROKER_ROLE_OVERRIDE_SKILLS_KEY = "skills"
+
+
+def _broker_role_override_payload_for_event(
+    event: Any,
+    profile_home: Path,
+) -> Optional[dict[str, str]]:
+    """Resolve the expert override in the parent before sandboxing the child."""
+    expert_id = _expert_id_for_event(event)
+    if not expert_id:
+        return None
+    existing = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+    if isinstance(existing, dict):
+        payload_expert_id = str(existing.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
+        block = existing.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+        if payload_expert_id == expert_id and isinstance(block, str) and block.strip():
+            carried = {
+                _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
+                _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
+            }
+            skills = existing.get(_BROKER_ROLE_OVERRIDE_SKILLS_KEY)
+            if isinstance(skills, list):
+                carried[_BROKER_ROLE_OVERRIDE_SKILLS_KEY] = [
+                    str(s).strip() for s in skills if str(s).strip()
+                ]
+            return carried
+        raise ExpertUnavailableError()
+    try:
+        from ..expert_overlay import (
+            build_role_override_block,
+            resolve_caller_departments,
+            resolve_expert,
+        )
+
+        try:
+            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+        except Exception:
+            sender_open_id = None
+        overlay = resolve_expert(
+            profile_home,
+            expert_id,
+            department_ids=resolve_caller_departments(
+                profile_home,
+                open_id=sender_open_id,
+            ),
+        )
+        if overlay is None:
+            raise ExpertUnavailableError()
+        declared_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
+        readable_skills = {path.name for path in overlay.skill_dirs}
+        if not declared_skills.issubset(readable_skills):
+            raise ExpertUnavailableError()
+        block = build_role_override_block(overlay)
+    except ExpertUnavailableError:
+        raise
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert overlay parent resolution failed expert_id=%s",
+            expert_id,
+            exc_info=True,
+        )
+        raise ExpertUnavailableError()
+    if not block:
+        raise ExpertUnavailableError()
+    return {
+        _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
+        _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
+        _BROKER_ROLE_OVERRIDE_SKILLS_KEY: [
+            str(s).strip() for s in overlay.skills if str(s).strip()
+        ],
+    }
+
+
+def _resolve_explicit_expert_for_execution(event: Any, profile_home: Path) -> None:
+    """Bind an explicit expert before any model/tool subprocess can start."""
+    payload = _broker_role_override_payload_for_event(event, profile_home)
+    if payload is not None:
+        setattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, payload)
+
+
+def _broker_role_override_block_for_event(event: Any, expert_id: str) -> Optional[str]:
+    """Return the broker-resolved override carried on the subprocess event."""
+    payload = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+    if not isinstance(payload, dict):
+        return None
+    payload_expert_id = str(payload.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
+    if payload_expert_id != expert_id:
+        raise ExpertUnavailableError()
+    block = payload.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+    if isinstance(block, str) and block.strip():
+        return block
+    raise ExpertUnavailableError()
+
+
+def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[str]:
+    """Resolve the ephemeral Role-Override block; explicit experts fail closed."""
+    expert_id = _expert_id_for_event(event)
+    if not expert_id:
+        return None
+    broker_block = _broker_role_override_block_for_event(event, expert_id)
+    if broker_block:
+        logger.info(
+            "[multitenancy] expert overlay active from broker payload expert_id=%s profile=%s",
+            expert_id, getattr(profile_home, "name", profile_home),
+        )
+        return broker_block
+    try:
+        from ..expert_overlay import role_override_block_for
+
+        # Pass the TRUSTED sender open_id so department-scoped experts can be
+        # resolved against the caller's REAL departments (fail-closed when the
+        # caller can't be resolved). open_id is best-effort; profile_home already
+        # carries the profile_name for profile-scoped audiences.
+        try:
+            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+        except Exception:
+            sender_open_id = None
+        block = role_override_block_for(profile_home, expert_id, open_id=sender_open_id)
+        if not block:
+            raise ExpertUnavailableError()
+        logger.info(
+            "[multitenancy] expert overlay active expert_id=%s profile=%s",
+            expert_id, getattr(profile_home, "name", profile_home),
+        )
+        return block
+    except ExpertUnavailableError:
+        raise
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert overlay resolution failed expert_id=%s",
+            expert_id, exc_info=True,
+        )
+        raise ExpertUnavailableError()
+
+
+# Hard rules that make the todo tool fire on real multi-step work (the tool's
+# own schema description is advisory-only by design — todo_tool.py: "No system
+# prompt mutation"; measured usage before this block: 4 calls in 3562 WebUI
+# messages). Kept ~150 tokens: command sentences only, no examples — this rides
+# ``ephemeral_system_prompt`` and is re-paid every turn.
+_TODO_PROGRESS_RULES = "\n".join(
+    [
+        "任务进度规则（任务清单工具，硬性要求）:",
+        "- 任何需要 ≥3 个不同步骤的任务，动手前先用任务清单工具写出完整步骤清单。",
+        "- 开始做某一步之前，先把该步标为 in_progress；同一时刻恰好一条 in_progress。",
+        "- 每完成一步立即标 completed，禁止攒到最后一起标。",
+        "- 测试未过、实现不完整、或有未解决错误时，绝不把该步标 completed。",
+        "- 每次调用任务清单工具都重写全量清单（不用 merge），执行中发现的新步骤随时补进清单。",
+        "- 少于 3 步的琐碎任务或纯问答不要用任务清单工具。",
+    ]
+)
+
+
+_TODO_TOOL_NAMES = frozenset({"todo", "todo_list"})
+
+
+def _resolve_toolset_collection(toolset_names: Any) -> list[str]:
+    """Resolve several Hermes toolsets without relying on a removed core helper."""
+    from toolsets import resolve_toolset
+
+    tools: set[str] = set()
+    for name in toolset_names:
+        tools.update(resolve_toolset(name))
+    return sorted(tools)
+
+
+def _todo_tool_available(enabled_toolsets: Any, disabled_toolsets: Any) -> bool:
+    """True only when the run's final surface contains a todo tool.
+
+    Instructing the model to call a tool absent from its schema causes failed
+    tool calls (review HIGH finding), so this resolves composite toolset names
+    through core's ``toolsets`` registry instead of naive name matching. Fails
+    closed: unresolvable → False.
+    """
+    try:
+        def _resolve(items: Any) -> set[str]:
+            if not isinstance(items, (list, tuple, set, frozenset)):
+                raise TypeError("toolsets must be a collection")
+            names = {str(item).strip() for item in items if str(item).strip()}
+            return set(_resolve_toolset_collection(sorted(names)))
+
+        if disabled_toolsets is not None:
+            if not isinstance(disabled_toolsets, (list, tuple, set, frozenset)):
+                return False
+            disabled_names = {
+                str(item).strip() for item in disabled_toolsets if str(item).strip()
+            }
+            if _TODO_TOOL_NAMES.intersection(disabled_names) or _TODO_TOOL_NAMES.intersection(
+                _resolve(disabled_names)
+            ):
+                return False
+    except Exception:
+        return False
+    if enabled_toolsets is None:
+        # merge_default / core-default runs keep the core toolset, which
+        # includes a todo tool (toolsets.py `_HERMES_CORE_TOOLS`).
+        return True
+    try:
+        enabled_names = {
+            str(item).strip() for item in enabled_toolsets if str(item).strip()
+        }
+        return bool(
+            _TODO_TOOL_NAMES.intersection(enabled_names)
+            or _TODO_TOOL_NAMES.intersection(_resolve(enabled_names))
+        )
+    except Exception:
+        return False
+
+
+def _todo_progress_rules_block(
+    enabled_toolsets: Any = None, disabled_toolsets: Any = None
+) -> Optional[str]:
+    """Return the todo hard rules only when the todo tool is actually available."""
+    if not _todo_tool_available(enabled_toolsets, disabled_toolsets):
+        return None
+    return _TODO_PROGRESS_RULES
+
+
+def _installed_profile_skill_names(profile_home: Path) -> set[str]:
+    """Best-effort fail-closed skill list for expert gating errors."""
+    personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"
+    try:
+        data = json.loads(personal_manifest.read_text(encoding="utf-8"))
+        skills = data.get("skills") if isinstance(data, dict) else None
+        if isinstance(skills, dict):
+            return {str(name).strip() for name in skills if str(name).strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    names: set[str] = set()
+    skills_root = Path(profile_home).expanduser() / "skills"
+    try:
+        for child in skills_root.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_dir() or child.is_symlink():
+                names.add(child.name)
+    except OSError:
+        logger.warning(
+            "[multitenancy] could not enumerate profile skills for fail-closed expert gating: %s",
+            skills_root,
+            exc_info=True,
+        )
+    return names
+
+
+def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> set[str]:
+    """Names of expert skills to HIDE for this run (能力随专家私有).
+
+    Returns every expert-declared skill EXCEPT the ACTIVE expert's own — so a
+    non-expert run hides ALL expert skills (keeping its skill catalog
+    byte-identical) and an expert run hides only OTHER experts' skills.
+
+    Applied by monkeypatching core's ``get_disabled_skill_names`` (see
+    ``_apply_expert_skill_scope_for_aiagent``), NOT via
+    ``HERMES_DISABLED_SKILLS_EXTRA``: upstream/prod core reads disabled skills
+    from ``config.yaml`` ONLY and ignores that env var (it is honored solely by
+    the abandoned fork core), so the env path is a silent no-op on prod.
+
+    Fail-closed: on any resolution error, hide a best-effort superset rather than
+    leak. Returns an empty set when there are no expert manifests at all.
+    """
+    try:
+        from ..expert_overlay import (
+            active_expert_declared_skills,
+            all_expert_skill_names,
+            resolve_caller_departments,
+            resolve_expert,
+        )
+
+        all_expert_skills = all_expert_skill_names(profile_home)
+        if not all_expert_skills:
+            return set()
+
+        active_skills: set[str] = set()
+        # PREFERRED: the gateway PARENT already authorized the active expert
+        # against the TRUSTED routing table and threaded it onto the event as
+        # ``broker_role_override``. Trust that decision directly — it is the only
+        # correct source for a GROUP profile, whose owner cannot be re-resolved in
+        # this sandboxed child (routing is unavailable and the marker is
+        # tenant-writable). Un-hide exactly that expert's declared skills.
+        override = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+        authorized_expert_id = ""
+        if isinstance(override, dict):
+            authorized_expert_id = str(
+                override.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or ""
+            ).strip()
+            block = override.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+            if authorized_expert_id and isinstance(block, str) and block.strip():
+                carried = override.get(_BROKER_ROLE_OVERRIDE_SKILLS_KEY)
+                if isinstance(carried, list) and carried:
+                    active_skills = {str(s).strip() for s in carried if str(s).strip()}
+                else:
+                    active_skills = active_expert_declared_skills(
+                        profile_home, authorized_expert_id
+                    )
+            else:
+                authorized_expert_id = ""
+
+        # FALLBACK (no broker payload — legacy/direct path): re-resolve with the
+        # audience gate. This works in the child for PERSONAL profiles (owner
+        # resolution is not needed; departments come from the org snapshot, which
+        # IS mounted) and stays fail-closed for anyone the audience denies.
+        if not authorized_expert_id:
+            expert_id = _expert_id_for_event(event)
+            if expert_id:
+                try:
+                    sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+                except Exception:
+                    sender_open_id = None
+                overlay = resolve_expert(
+                    profile_home,
+                    expert_id,
+                    department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
+                )
+                if overlay is not None:
+                    active_skills = {str(s).strip() for s in overlay.skills if str(s).strip()}
+
+        return all_expert_skills - active_skills
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert disabled-skill scope failed for %s; using fail-closed fallback",
+            profile_home,
+            exc_info=True,
+        )
+        fallback_names: set[str] = set()
+        try:
+            from ..expert_overlay import readable_expert_skill_names
+
+            fallback_names = readable_expert_skill_names(profile_home)
+        except Exception:
+            logger.debug("[multitenancy] readable expert skill fallback failed", exc_info=True)
+        if not fallback_names:
+            fallback_names = _installed_profile_skill_names(profile_home)
+        return fallback_names
+
+
+
+
+def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
+    """System-message text for the legacy chat-completions paths.
+
+    When the run carries an expert overlay, lead with the Hermes-hosted expert
+    mode block before SOUL. With
+    no overlay this is exactly ``soul_text`` (byte-stable for the normal path).
+    SOUL.md on disk is never written; the expert mode is in-memory for this run only.
+    """
+    block = _role_override_block_for_event(event, profile_home)
+    if not block:
+        return soul_text
+    policy_env, _ = credential_hub._kep_skill_env_policy(credential_hub.scan_profile_skills(profile_home))
+    if policy_env == "pre":
+        status_line = credential_hub.kep_auth_state_line(
+            profile_dir=profile_home,
+            home_dir=profile_home / "home",
+            profile_name=profile_home.name,
+            shared_home=_resolve_shared_hermes_home(profile_home),
+        )
+        if status_line:
+            return f"{status_line}\n\n{block}" + (f"\n\n---\n\n{soul_text}" if soul_text else "")
+    return block + (f"\n\n---\n\n{soul_text}" if soul_text else "")
+
+
+def _model_spec_for_event(
+    default_spec: str,
+    event: Any,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return per-run model override from WebUI broker metadata when present.
+
+    ``custom:*`` models are NOT validated against the profile's
+    ``custom_providers`` registry: in production that registry is a stale
+    single-model snapshot, not a catalog of live models, so validating
+    against it demoted every non-default WebUI model pick back to the
+    profile default. An invalid model must fail loudly at the gateway.
+    *config* now only gates the parse check below.
+    """
+    metadata = _event_metadata(event)
+    model = str(metadata.get("model") or "").strip()
+    if not model:
+        return default_spec
+    provider = str(metadata.get("provider") or "").strip()
+    if provider:
+        provider_prefix = f"{provider}/"
+        if model.startswith(provider_prefix):
+            spec = model
+        else:
+            spec = f"{provider}/{model}"
+    elif "/" in model:
+        spec = model
+    else:
+        default_provider, _default_model = _split_model_spec(default_spec)
+        spec = f"{default_provider}/{model}"
+    if config is None or spec == default_spec:
+        return spec
+    try:
+        # ponytail: parse-only validation; the registry check is gone, but an
+        # empty provider or model component is as unusable as a parse failure
+        # (run.py would surface "Run is unavailable"), so both fall back here.
+        spec_provider, spec_model = _split_model_spec(
+            spec, strip_custom_context_suffix=True
+        )
+        if not spec_provider or not spec_model:
+            raise ValueError(f"model spec has empty components: {spec!r}")
+    except Exception:
+        logger.warning(
+            "model override %r unparsable; falling back to profile default %r",
+            spec,
+            default_spec,
+        )
+        return default_spec
+    return spec
+
+
+def _resolve_api_key(
+    provider: str,
+    env_overrides: dict[str, Any],
+    auth: dict[str, Any],
+) -> Optional[str]:
+    """Find an API key for *provider* — env vars first, auth.json second."""
+    for env_name in _PROVIDER_ENV_KEYS.get(provider, ()):
+        key = env_overrides.get(env_name) or os.environ.get(env_name)
+        if key:
+            return key
+    pool = auth.get("credential_pool", {}).get(provider)
+    if isinstance(pool, list):
+        for cred in pool:
+            if not isinstance(cred, dict):
+                continue
+            if cred.get("last_status") == "exhausted":
+                continue
+            token = cred.get("access_token")
+            if token:
+                return token
+    return None
+
+
+def _resolve_custom_provider_api_key(
+    config: dict[str, Any],
+    provider: str,
+    env_overrides: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Inline ``api_key`` for a ``custom:<name>`` provider from config.yaml.
+
+    ``_resolve_api_key`` only checks env vars + auth.json's inline tokens.
+    Multi-tenant profiles configure their LLM via the ``custom_providers:`` list
+    (the model migration to litellm.sre stores the key inline there; the secret
+    in auth.json's credential_pool lives in an encrypted vault, NOT as an inline
+    access_token), so ``_resolve_api_key`` returned None and every turn raised
+    "no API key for primary provider 'custom:...'". Match the custom provider by
+    its ``custom:<normalized-name>`` slug or by base_url and return the inline key.
+    """
+    # Only the custom-provider family. The vault-based credential_pool resolver
+    # is intentionally NOT used here: the encrypted vault is masked inside the
+    # bwrap sandbox where this runs, so the inline config.yaml key is the only
+    # one readable in-context. Revisit if the vault-in-sandbox masking is fixed.
+    pl = provider.lower() if provider else ""
+    if not (pl == "custom" or pl.startswith("custom:")):
+        return None
+    custom_providers = config.get("custom_providers")
+    if not isinstance(custom_providers, list):
+        return None
+    want_name = provider.split(":", 1)[1].strip().lower() if ":" in provider else ""
+    model_base_url = str((config.get("model") or {}).get("base_url") or "").strip().rstrip("/")
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+        base_url = str(
+            entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+        ).strip().rstrip("/")
+        # When the provider carries a :name slug, match by name ONLY — never by
+        # base_url, which is the default model's URL and would wrongly match a
+        # different entry. Bare "custom" (no slug) falls back to base_url.
+        if want_name:
+            matched = name == want_name
+        else:
+            matched = bool(model_base_url) and base_url == model_base_url
+        if matched:
+            key = str(entry.get("api_key") or "").strip()
+            if key:
+                return key
+            # A custom provider may NAME its secret rather than inline it
+            # (``key_env: ZAI_API_KEY``, secret in the profile's .env). Reading
+            # only the inline field made every such profile raise "no API key
+            # for primary provider" on every single turn — and ``fallback_providers``
+            # are all key_env-shaped, so the fallbacks died with it. Lookup
+            # order: profile .env overrides, then process env — but the process
+            # env only for registered provider credential names (the same names
+            # _resolve_api_key already reads from it). Any other name, e.g.
+            # ``key_env: FEISHU_APP_SECRET``, would ship a gateway secret to
+            # whatever base_url the profile config names (GitHub #15).
+            key_env = next(
+                (
+                    value
+                    for value in (
+                        str(entry.get("key_env") or "").strip(),
+                        str(entry.get("api_key_env") or "").strip(),
+                    )
+                    if value
+                ),
+                "",
+            )
+            if key_env:
+                env_key = str((env_overrides or {}).get(key_env) or "").strip()
+                if not env_key and key_env in _AMBIENT_PROVIDER_KEY_ENV_NAMES:
+                    env_key = str(os.environ.get(key_env) or "").strip()
+                if env_key:
+                    return env_key
+    return None
+
+
+def _resolve_base_url(
+    provider: str,
+    is_primary: bool,
+    config: dict[str, Any],
+    env_overrides: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve the API base URL for *provider*. Primary model honors profile config/env."""
+    if is_primary:
+        explicit = config.get("model", {}).get("base_url")
+        if explicit:
+            return explicit
+        for env_name in _PROVIDER_BASE_URL_ENV_KEYS.get(provider, ()):
+            value = (env_overrides or {}).get(env_name) or os.environ.get(env_name)
+            if value:
+                return str(value)
+    if provider.lower() == "custom" or provider.lower().startswith("custom:"):
+        want_name = provider.split(":", 1)[1].strip().lower() if ":" in provider else ""
+        model_base_url = str((config.get("model") or {}).get("base_url") or "").strip()
+        for entry in config.get("custom_providers") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+            base_url = str(
+                entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+            ).strip()
+            if want_name and name == want_name and base_url:
+                return base_url
+            if not want_name and model_base_url and base_url.rstrip("/") == model_base_url.rstrip("/"):
+                return base_url
+    return _PROVIDER_BASE_URLS.get(provider)
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    import yaml
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def _merge_profile_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge shared Hermes config with profile-local overrides."""
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_profile_config(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _normalize_model_spec_inplace(config: dict[str, Any]) -> None:
+    """Runtime safety net: if ``model.default`` is a bare model name (no provider
+    prefix) but ``model.provider`` is set, prepend it so ``_split_model_spec`` can
+    parse it.
+
+    This mirrors router._normalize_profile_config but runs at every config READ,
+    not only at provision time. Root-cause fix for the recurring
+    "model spec missing provider prefix: 'tencent-sonnet-4-6'" failures: the
+    provision-time normalization can be bypassed by some write paths, leaving a
+    bare default on disk; without a runtime net, every turn for that profile then
+    fails. Applying it here makes a bare-but-providered config self-heal at read
+    time, so no write path can ever fail a turn this way again.
+    """
+    model = config.get("model")
+    if not isinstance(model, dict):
+        return
+    default_model = str(model.get("default") or "").strip()
+    provider = str(model.get("provider") or "").strip()
+    if default_model and provider and not default_model.lower().startswith(f"{provider.lower()}/"):
+        model["default"] = f"{provider}/{default_model}"
+
+
+def _load_profile_config(profile_home: Path) -> dict[str, Any]:
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    shared = _load_yaml(shared_home / "config.yaml")
+    profile = _load_yaml(profile_home / "config.yaml")
+    merged = _merge_profile_config(shared, profile)
+    _normalize_model_spec_inplace(merged)
+    return merged
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _load_soul(profile_home: Path) -> str:
+    """Read SOUL.md as the system prompt; fall back to a generic prompt."""
+    soul = profile_home / "SOUL.md"
+    if soul.exists():
+        text = soul.read_text().strip()
+        if text:
+            return text
+    return "You are a helpful assistant."
+
+
+def _resolve_shared_hermes_home(profile_home: Path) -> Path:
+    """Return the default Hermes root that stores cross-profile shared auth."""
+    explicit = os.getenv("HERMES_SHARED_HOME")
+    if explicit:
+        return Path(explicit).expanduser()
+    profile_home = Path(profile_home).expanduser()
+    if profile_home.parent.name == "profiles":
+        return profile_home.parent.parent
+    return profile_home
+
+
+def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> Path:
+    """Bind Feishu UAT lookups to the profile's own ``feishu_uat/`` subdir.
+
+    Previously pointed at ``<shared>/feishu_uat/`` (one directory shared by
+    every profile). That layout meant every profile's subprocess could
+    enumerate every tenant's UAT JSON via ``os.listdir(FEISHU_UAT_DIR)``;
+    the per-open_id filename was the only thing keeping reads separate.
+
+    With this change, ``FEISHU_UAT_DIR`` is rebound to ``<profile>/feishu_uat/``
+    so a subprocess sees only the JSON files that belong to its tenant.
+    Combined with the 0700 profile_home (commit "Harden profile directory
+    tree at provision time") and the env whitelist (commit "Isolate AIAgent
+    subprocess env"), cross-tenant UAT enumeration becomes a filesystem-level
+    deny under档 A.
+
+    Caveat: the gateway-process OAuth callback handler lives in the upstream
+    hermes-agent repo and still writes new bindings to ``<shared>/feishu_uat/``.
+    The org-sync pass copies those forward into the right profile via
+    :func:`hermes_multitenancy.sync.feishu_org._migrate_feishu_uat_for_employee`.
+    New bindings captured between sync passes are invisible to the AIAgent
+    subprocess until the next sync — TODO: route OAuth callbacks through the
+    multitenancy router so writes land profile-scoped from the start.
+
+    Returns the shared_home (still used for cron jobs and snapshot cache).
+    """
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    profile_uat_dir = profile_home / "feishu_uat"
+    profile_uat_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    feishu_oapi_module.FEISHU_UAT_PATH = profile_home / "feishu_uat.json"
+    feishu_oapi_module.FEISHU_UAT_DIR = profile_uat_dir
+    _install_feishu_app_db_broker(feishu_oapi_module, shared_home)
+    _install_feishu_uat_db_broker(feishu_oapi_module, profile_home, shared_home)
+    return shared_home
+
+
+class _MissingCurrentSenderOpenId:
+    def get(self) -> str:
+        return ""
+
+
+@contextmanager
+def _missing_sender_open_id_scope(_value: Optional[str]) -> Iterator[None]:
+    yield
+
+
+def _load_feishu_oapi_runtime(profile_home: Path) -> tuple[Any, Any, Path]:
+    """Load legacy Feishu OAPI context when Hermes still provides it.
+
+    Hermes v0.14 upstream no longer carries the local fork's
+    ``tools.feishu_oapi_client`` module. WebUI/API Run Broker traffic can still
+    run with core tools and lark-cli, so missing legacy OAPI support should not
+    abort AIAgent startup.
+    """
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    try:
+        from tools import feishu_oapi_client as feishu_oapi
+    except Exception as exc:
+        logger.info("[multitenancy] legacy Feishu OAPI client unavailable; skipping OAPI credential patch: %s", exc)
+        _configure_cron_home(shared_home)
+        return _missing_sender_open_id_scope, _MissingCurrentSenderOpenId(), shared_home
+
+    sender_open_id_scope = feishu_oapi.sender_open_id_scope
+    current_sender_open_id = feishu_oapi.current_sender_open_id
+    shared_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
+    _install_legacy_feishu_refresh_bridge(shared_home)
+    _configure_cron_home(shared_home)
+    return sender_open_id_scope, current_sender_open_id, shared_home
+
+
+def _install_legacy_feishu_refresh_bridge(shared_home: Path) -> None:
+    """Route old Hermes UAT refresh calls through multitenancy.
+
+    Legacy fork modules refresh per-user UAT by calling
+    ``hermes_cli.feishu_auth.refresh_uat_for_user(open_id, app_id, app_secret)``.
+    In the multitenancy target state, that function must not own token
+    lifecycle.  Patch it to resolve the routed profile and delegate to
+    ``feishu_uat_auth.refresh_uat_for_user`` instead.
+    """
+    try:
+        feishu_auth = importlib.import_module("hermes_cli.feishu_auth")
+    except Exception:
+        return
+
+    if getattr(feishu_auth, "_hermes_mt_refresh_bridge_installed", False):
+        return
+    original = getattr(feishu_auth, "refresh_uat_for_user", None)
+    if original is None:
+        return
+    setattr(feishu_auth, "_hermes_mt_original_refresh_uat_for_user", original)
+
+    def _refresh_uat_for_user_via_multitenancy(
+        open_id: str,
+        app_id: str | None = None,
+        app_secret: str | None = None,
+    ) -> dict[str, Any] | None:
+        refresh_mod = importlib.import_module("hermes_multitenancy.feishu_uat_auth")
+        return refresh_mod.refresh_uat_for_user(
+            open_id=str(open_id),
+            client_id=app_id,
+            client_secret=app_secret,
+            shared_home=shared_home,
+            force=True,
+        )
+
+    feishu_auth.refresh_uat_for_user = _refresh_uat_for_user_via_multitenancy
+    feishu_auth._hermes_mt_refresh_bridge_installed = True
+
+
+def _install_feishu_app_db_broker(feishu_oapi_module: Any, shared_home: Path) -> None:
+    """Patch Feishu app credential resolution to prefer the credential vault."""
+    original = getattr(feishu_oapi_module, "_hermes_mt_original_resolve_feishu_credentials", None)
+    if original is None:
+        original = getattr(feishu_oapi_module, "_resolve_feishu_credentials", None)
+        if original is None:
+            return
+        setattr(feishu_oapi_module, "_hermes_mt_original_resolve_feishu_credentials", original)
+
+    def _resolve_feishu_credentials_with_broker() -> tuple[str, str, str]:
+        from ..credentials import CredentialStore
+
+        store = None
+        try:
+            store = CredentialStore(shared_home / "multitenancy.db")
+            status = store.get_status(
+                profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                provider="feishu",
+                secret_kind="app",
+            )
+            if status.get("status") == "valid":
+                payload = store.get_secret_for_runtime(
+                    profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                    subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                    provider="feishu",
+                    secret_kind="app",
+                )
+                app_id = str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
+                app_secret = str(payload.get("app_secret") or payload.get("FEISHU_APP_SECRET") or "").strip()
+                domain = str(payload.get("domain") or payload.get("FEISHU_DOMAIN") or "feishu").strip().lower()
+                if app_id and app_secret:
+                    logger.info("[multitenancy] loaded Feishu app credential from credential vault")
+                    return app_id, app_secret, domain or "feishu"
+        except Exception:
+            logger.debug("[multitenancy] Feishu app credential vault lookup skipped", exc_info=True)
+        finally:
+            if store is not None:
+                store.close()
+        return original()
+
+    feishu_oapi_module._resolve_feishu_credentials = _resolve_feishu_credentials_with_broker
+
+
+def _install_feishu_uat_db_broker(feishu_oapi_module: Any, profile_home: Path, shared_home: Path) -> None:
+    """Patch Feishu UAT loading to prefer the multitenancy credential vault.
+
+    This is a read-through migration bridge: existing profile-local JSON files
+    keep working, but successful reads are copied into ``multitenancy.db`` as
+    sealed credential rows.  Once production canaries prove parity, JSON can be
+    demoted to a migration-only fallback.
+    """
+    original = getattr(feishu_oapi_module, "_hermes_mt_original_load_uat", None)
+    if original is None:
+        original = getattr(feishu_oapi_module, "_load_uat", None)
+        if original is None:
+            return
+        setattr(feishu_oapi_module, "_hermes_mt_original_load_uat", original)
+
+    def _load_uat_with_broker(open_id: Optional[str] = None) -> dict:
+        if open_id:
+            from ..credentials import CredentialStore
+
+            try:
+                store = CredentialStore(shared_home / "multitenancy.db")
+                status = store.get_status(
+                    profile_name=profile_home.name,
+                    subject_id=open_id,
+                    provider="feishu",
+                    secret_kind="uat",
+                )
+                if status.get("status") == "valid":
+                    payload = store.get_secret_for_runtime(
+                        profile_name=profile_home.name,
+                        subject_id=open_id,
+                        provider="feishu",
+                        secret_kind="uat",
+                    )
+                    if status.get("expires_at") is not None and "expires_at" not in payload:
+                        payload["expires_at"] = status["expires_at"]
+                    store.close()
+                    logger.info(
+                        "[multitenancy] loaded Feishu UAT from credential vault profile=%s subject=%s",
+                        profile_home.name,
+                        open_id,
+                    )
+                    return payload
+                store.close()
+            except Exception:
+                logger.debug(
+                    "[multitenancy] Feishu UAT credential vault lookup skipped",
+                    exc_info=True,
+                )
+
+        data = original(open_id)
+        if open_id and isinstance(data, dict) and data.get("access_token"):
+            _store_feishu_uat_payload(shared_home, profile_home.name, open_id, data)
+        return data
+
+    feishu_oapi_module._load_uat = _load_uat_with_broker
+
+
+def _store_feishu_uat_payload(shared_home: Path, profile_name: str, open_id: str, data: dict[str, Any]) -> None:
+    try:
+        from ..credentials import CredentialStore
+
+        scopes = data.get("scopes") or data.get("scope") or []
+        if isinstance(scopes, str):
+            scopes = [part for part in scopes.replace(",", " ").split() if part]
+        expires_at = data.get("expires_at")
+        store = CredentialStore(shared_home / "multitenancy.db")
+        store.put_credential(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+            payload=data,
+            scopes=scopes,
+            expires_at=int(expires_at) if expires_at else None,
+        )
+        store.close()
+        logger.info(
+            "[multitenancy] imported profile Feishu UAT into credential vault profile=%s subject=%s",
+            profile_name,
+            open_id,
+        )
+    except Exception:
+        logger.debug("[multitenancy] failed to import Feishu UAT into credential vault", exc_info=True)
+
+
+def _configure_cron_home(shared_home: Path) -> None:
+    """Bind cron storage path for AIAgent subprocesses.
+
+    Behavior depends on HERMES_HOME layout:
+    - Multitenancy nested layout (``<root>/profiles/<name>``): no-op. Cron
+      writes go to the profile default ``<profile>/cron/jobs.json``; a
+      dedicated multi-profile worker in this plugin (see ``cron_worker``)
+      scans all profiles and dispatches due jobs.
+    - Single-profile or legacy layout: rebind to shared Hermes home so the
+      gateway's built-in cron ticker (which scans ``<shared>/cron/jobs.json``)
+      can see the jobs.
+    """
+    current_home = os.environ.get("HERMES_HOME")
+    if current_home:
+        current_path = Path(current_home).expanduser()
+        if current_path.parent.name == "profiles":
+            _install_profile_cron_owner_patch(current_path)
+            logger.info(
+                "[multitenancy] cron jobs stay in profile-default location: %s/cron/",
+                current_path,
+            )
+            return
+
+    import importlib
+
+    shared_home = Path(shared_home).expanduser()
+    old_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = str(shared_home)
+        cron_jobs = importlib.import_module("cron.jobs")
+        cron_jobs.HERMES_DIR = shared_home.resolve()
+        cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+
+        cronjob_tools = importlib.import_module("tools.cronjob_tools")
+
+        def _validate_shared_cron_script_path(script: Optional[str]) -> Optional[str]:
+            if not script or not str(script).strip():
+                return None
+            raw = str(script).strip()
+            if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
+                return (
+                    "Script path must be relative to shared ~/.hermes/scripts/. "
+                    f"Got absolute or home-relative path: {raw!r}."
+                )
+            from tools.path_security import validate_within_dir
+
+            scripts_dir = shared_home / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
+            if containment_error:
+                return f"Script path escapes the shared scripts directory via traversal: {raw!r}"
+            return None
+
+        cronjob_tools._validate_cron_script_path = _validate_shared_cron_script_path
+        _install_profile_cron_owner_patch(shared_home)
+        logger.info("[multitenancy] cron jobs bound to shared Hermes home: %s", cron_jobs.JOBS_FILE)
+    except Exception as exc:
+        logger.warning("[multitenancy] failed to bind cron jobs to shared Hermes home: %s", exc)
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+
+
+def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
+    """Patch native cronjob tools so Feishu-created jobs persist owner context."""
+    import importlib
+
+    try:
+        cronjob_tools = importlib.import_module("tools.cronjob_tools")
+    except Exception:
+        logger.debug("[multitenancy] cronjob owner patch skipped", exc_info=True)
+        return
+    if getattr(cronjob_tools, "_hermes_multitenancy_owner_patch", False):
+        return
+
+    original_create_job = getattr(cronjob_tools, "create_job", None)
+    original_update_job = getattr(cronjob_tools, "update_job", None)
+    original_trigger_job = getattr(cronjob_tools, "trigger_job", None)
+    original_cronjob = getattr(cronjob_tools, "cronjob", None)
+    original_execute_job_now = getattr(cronjob_tools, "_execute_job_now", None)
+    if original_create_job is None or original_update_job is None:
+        return
+
+    def _profile_home() -> Path:
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        return Path(raw).expanduser() if raw else Path(default_profile_home).expanduser()
+
+    def _owner_updates(job: dict) -> dict[str, Any]:
+        from ..cron_worker import infer_cron_owner_context
+
+        return infer_cron_owner_context(job, profile_home=_profile_home())
+
+    def create_job_with_owner(*args: Any, **kwargs: Any) -> Any:
+        job = original_create_job(*args, **kwargs)
+        if not isinstance(job, dict):
+            return job
+        updates = _owner_updates(job)
+        if not updates:
+            return job
+        updated = original_update_job(job["id"], updates)
+        return updated or {**job, **updates}
+
+    def update_job_with_owner(job_id: str, updates: dict[str, Any]) -> Any:
+        job = original_update_job(job_id, updates)
+        if not isinstance(job, dict):
+            return job
+        owner_updates = _owner_updates(job)
+        if not owner_updates:
+            return job
+        if (
+            job.get("owner_open_id") == owner_updates.get("owner_open_id")
+            and job.get("owner_profile") == owner_updates.get("owner_profile")
+        ):
+            return job
+        refreshed = original_update_job(job_id, owner_updates)
+        return refreshed or {**job, **owner_updates}
+
+    def trigger_job_via_run_broker(job_id: str) -> Any:
+        from .. import cron_worker
+
+        resolver = getattr(cronjob_tools, "resolve_job_ref", None)
+        job = resolver(job_id) if callable(resolver) else None
+        if not isinstance(job, dict):
+            raise RuntimeError(
+                f"Cron job '{job_id}' not found. Use cronjob(action='list') to inspect jobs."
+            )
+        updates = _owner_updates(job)
+        owner_open_id = str(job.get("owner_open_id") or updates.get("owner_open_id") or "").strip()
+        if not owner_open_id.startswith("ou_"):
+            raise RuntimeError("cron owner_open_id is required for RunBroker trigger")
+        return cron_worker.trigger_profile_cron_job_via_run_broker(
+            job_id=str(job.get("id") or job_id),
+            profile_home=_profile_home(),
+            owner_open_id=owner_open_id,
+        )
+
+    def cronjob_with_runbroker(action: str, *args: Any, **kwargs: Any) -> Any:
+        normalized = (action or "").strip().lower()
+        if normalized not in {"run", "run_now", "trigger"}:
+            return original_cronjob(action, *args, **kwargs)
+
+        job_id = kwargs.get("job_id")
+        if job_id is None and args:
+            job_id = args[0]
+        job = trigger_job_via_run_broker(str(job_id or ""))
+        formatter = getattr(cronjob_tools, "_format_job", None)
+        formatted = formatter(job) if callable(formatter) else job
+        return json.dumps({"success": True, "job": formatted, "queued": True}, indent=2)
+
+    def execute_job_now_via_runbroker(job: dict[str, Any]) -> dict[str, Any]:
+        result = trigger_job_via_run_broker(str(job.get("id") or ""))
+        return {"claimed": True, "success": True, "job": result, "queued": True}
+
+    cronjob_tools.create_job = create_job_with_owner
+    cronjob_tools.update_job = update_job_with_owner
+    if original_trigger_job is not None:
+        cronjob_tools.trigger_job = trigger_job_via_run_broker
+    if original_cronjob is not None:
+        cronjob_tools.cronjob = cronjob_with_runbroker
+    if original_execute_job_now is not None:
+        cronjob_tools._execute_job_now = execute_job_now_via_runbroker
+    cronjob_tools._hermes_multitenancy_owner_patch = True
+    logger.info("[multitenancy] patched native cronjob tool owner context")
+
+
+def _log_aiagent_tool_progress(
+    event_type: str,
+    tool_name: str,
+    preview: Any = None,
+    args: Any = None,
+    **kwargs: Any,
+) -> None:
+    """Persist AIAgent tool progress for gateway stress-test observability."""
+    if event_type == "tool.started":
+        logger.info("[multitenancy] tool.started %s preview=%s", tool_name, preview or "")
+    elif event_type == "tool.completed":
+        logger.info(
+            "[multitenancy] tool.completed %s duration=%.2fs error=%s",
+            tool_name,
+            float(kwargs.get("duration") or 0.0),
+            bool(kwargs.get("is_error")),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Isolated AIAgent subprocess bridge
+# ---------------------------------------------------------------------------
+
+
+def _jsonable(value: Any) -> Any:
+    """Return a JSON-safe representation for dataclass/enum-ish event fields."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
+    return str(value)
+
+
+def _jsonable_deep(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_deep(v) for v in value]
+    return _jsonable(value)
+
+
+def _get_nested_value(obj: Any, path: tuple[str, ...]) -> Any:
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def _find_ou_value(obj: Any) -> str:
+    """Best-effort recursive search for a Feishu open_id in raw event data."""
+    if isinstance(obj, str):
+        return obj if obj.startswith("ou_") else ""
+    if isinstance(obj, dict):
+        for key in ("open_id", "openId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.startswith("ou_"):
+                return value
+        for value in obj.values():
+            found = _find_ou_value(value)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            found = _find_ou_value(value)
+            if found:
+                return found
+    return ""
+
+
+def _resolve_subprocess_sender_open_id(event: Any) -> str:
+    """Resolve sender ou_* for the child process after Feishu batching."""
+    trusted_identity = _trusted_feishu_runtime_identity(event)
+    current = ""
+    try:
+        from tools.feishu_oapi_client import current_sender_open_id
+        current = str(current_sender_open_id.get() or "").strip()
+    except Exception:
+        pass
+
+    if trusted_identity is not None:
+        actor, _credential, _tool_scope = trusted_identity
+        if current and current != actor:
+            raise RuntimeError("Trusted Feishu ambient identity does not match admission")
+        return actor
+
+    if current.startswith("ou_"):
+        return current
+
+    source = getattr(event, "source", None)
+    for candidate in (
+        getattr(event, "sender_open_id", None),
+        getattr(source, "open_id", None) if source is not None else None,
+        getattr(source, "user_id", None) if source is not None else None,
+        getattr(source, "user_id_alt", None) if source is not None else None,
+    ):
+        if candidate and str(candidate).startswith("ou_"):
+            return str(candidate)
+
+    raw = getattr(event, "raw_message", None)
+    for path in (
+        ("event", "sender", "sender_id", "open_id"),
+        ("event", "message", "sender", "sender_id", "open_id"),
+        ("sender", "sender_id", "open_id"),
+        ("message", "sender", "sender_id", "open_id"),
+        ("sender_id", "open_id"),
+    ):
+        value = _get_nested_value(raw, path)
+        if value and str(value).startswith("ou_"):
+            return str(value)
+    return _find_ou_value(raw)
+
+
+def _jsonable_messages(messages: Optional[list[dict]]) -> list[dict] | None:
+    if not messages:
+        return None
+    payload_messages: list[dict] = []
+    for message in messages:
+        if isinstance(message, dict):
+            jsonable = _jsonable_deep(message)
+            if isinstance(jsonable, dict):
+                payload_messages.append(jsonable)
+    return payload_messages
+
+
+def _event_to_subprocess_payload(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> dict[str, Any]:
+    """Serialize the small MessageEvent surface needed by the child runner."""
+    source = getattr(event, "source", None)
+    source_payload: dict[str, Any] = {}
+    if source is not None:
+        for key in (
+            "platform",
+            "chat_id",
+            "chat_name",
+            "chat_type",
+            "user_id",
+            "user_name",
+            "thread_id",
+            "chat_topic",
+            "user_id_alt",
+            "chat_id_alt",
+            "is_bot",
+            "guild_id",
+            "parent_chat_id",
+            "message_id",
+            "hermes_group_topic",
+            "hermes_raw_thread_id",
+            "hermes_root_id",
+        ):
+            if hasattr(source, key):
+                source_payload[key] = _jsonable(getattr(source, key))
+
+    message_id = (
+        getattr(event, "message_id", None)
+        or source_payload.get("message_id")
+        or ""
+    )
+    payload = {
+        "event": {
+            "text": getattr(event, "text", "") or "",
+            "message_id": _jsonable(message_id),
+            "sender_open_id": _resolve_subprocess_sender_open_id(event),
+            "source": source_payload,
+        },
+        "profile_home": str(Path(profile_home).expanduser().resolve()),
+    }
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        payload["event"]["raw_event"] = _jsonable_deep(raw_event)
+    broker_role_override = _broker_role_override_payload_for_event(event, profile_home)
+    if broker_role_override is not None:
+        payload["event"][_BROKER_ROLE_OVERRIDE_EVENT_KEY] = broker_role_override
+    payload_messages = _jsonable_messages(messages)
+    if payload_messages is not None:
+        payload["messages"] = payload_messages
+    # Present means carryover is ON for this run and the child may capture tool
+    # bodies (the text may still be empty on turn 1); absent means off end to end.
+    from ..turn_tool_context import child_payload as _turn_tool_child_payload
+
+    carry_payload = _turn_tool_child_payload(event)
+    if carry_payload is not None:
+        payload["turn_tool_context"] = carry_payload
+    return payload
+
+
+def _ingest_secret_env_from_event(event: Any) -> dict[str, str]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    secret_dir = str(metadata.get("ingest_secret_dir") or "").strip()
+    manifest_raw = metadata.get("ingest_secrets")
+    if not secret_dir or not isinstance(manifest_raw, list):
+        return {}
+
+    manifest: list[dict[str, str]] = []
+    for item in manifest_raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        secret_type = str(item.get("type") or "").strip()
+        usage = str(item.get("usage") or "").strip()
+        if name and secret_type:
+            manifest.append({"name": name, "type": secret_type, "usage": usage})
+    if not manifest:
+        return {}
+    return {
+        "HERMES_INGEST_SECRET_DIR": secret_dir,
+        "HERMES_INGEST_SECRET_MANIFEST": json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+
+
+_INGEST_DISABLED_TOOLSETS: frozenset[str] = frozenset({"delegation"})
+_INGEST_KNOWN_DELEGATING_TOOLSETS: frozenset[str] = frozenset({
+    "hermes-acp",
+    "hermes-api-server",
+    "hermes-bluebubbles",
+    "hermes-cli",
+    "hermes-cron",
+    "hermes-dingtalk",
+    "hermes-discord",
+    "hermes-email",
+    "hermes-feishu",
+    "hermes-gateway",
+    "hermes-homeassistant",
+    "hermes-matrix",
+    "hermes-mattermost",
+    "hermes-qqbot",
+    "hermes-signal",
+    "hermes-slack",
+    "hermes-sms",
+    "hermes-telegram",
+    "hermes-webhook",
+    "hermes-wecom",
+    "hermes-wecom-callback",
+    "hermes-weixin",
+    "hermes-whatsapp",
+    "hermes-yuanbao",
+})
+_INGEST_REQUIRED_TOOLSETS: tuple[str, ...] = ("terminal",)
+_INGEST_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_INGEST_AUTH_BEARER_RE = re.compile(
+    r"\b(authorization\s*[:=]\s*bearer\s+)([A-Za-z0-9._~+/=-]{8,})",
+    re.IGNORECASE,
+)
+_INGEST_JWT_LIKE_RE = re.compile(r"\beyJ[A-Za-z0-9._-]{16,}\b")
+
+
+def _is_ingest_run_event(event: Any) -> bool:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return False
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        str(metadata.get("source") or "").strip() == "ingest"
+        or "ingest_secret_dir" in metadata
+        or "ingest_secrets" in metadata
+    )
+
+
+def _ingest_enabled_toolsets(toolsets: Optional[list[str]], platform_key: str) -> Optional[list[str]]:
+    # Ingest is a one-shot API surface, not an interactive chat surface with an
+    # async child-result delivery channel. Delegation can strand the useful work
+    # in a child session while the poller only sees the parent turn.
+    # Per-run secrets are only useful when the agent can consume them inside an
+    # execution tool, so preserve terminal even for strict profile toolsets.
+    base = list(toolsets or [])
+    if not base:
+        base = _fallback_default_toolsets(platform_key)
+    filtered = [item for item in base if not _ingest_toolset_allows_delegation(item)]
+    if not filtered:
+        filtered = [
+            item for item in _fallback_default_toolsets(platform_key)
+            if not _ingest_toolset_allows_delegation(item)
+        ]
+    for required in _INGEST_REQUIRED_TOOLSETS:
+        if required not in filtered:
+            filtered.append(required)
+    return filtered or None
+
+
+def _ingest_toolset_allows_delegation(toolset_name: Any) -> bool:
+    name = str(toolset_name or "").strip()
+    if not name:
+        return False
+    if name in _INGEST_DISABLED_TOOLSETS or name in _INGEST_KNOWN_DELEGATING_TOOLSETS:
+        return True
+    try:
+        from toolsets import resolve_toolset
+
+        return "delegate_task" in set(resolve_toolset(name))
+    except Exception:
+        return False
+
+
+def _ingest_runtime_secret_manifest(event: Any | None = None) -> list[dict[str, str]]:
+    raw_manifest = os.environ.get("HERMES_INGEST_SECRET_MANIFEST")
+    if raw_manifest:
+        try:
+            manifest = json.loads(raw_manifest)
+        except Exception:
+            manifest = None
+        if isinstance(manifest, list):
+            return [item for item in manifest if isinstance(item, dict)]
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        metadata = raw_event.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("ingest_secrets"), list):
+            return [item for item in metadata["ingest_secrets"] if isinstance(item, dict)]
+    return []
+
+
+def _ingest_runtime_secret_dir(event: Any | None = None) -> str:
+    secret_dir = str(os.environ.get("HERMES_INGEST_SECRET_DIR") or "").strip()
+    if secret_dir:
+        return secret_dir
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        metadata = raw_event.get("metadata")
+        if isinstance(metadata, dict):
+            return str(metadata.get("ingest_secret_dir") or "").strip()
+    return ""
+
+
+def _ingest_runtime_secret_values(event: Any | None = None) -> list[tuple[str, str]]:
+    secret_dir = _ingest_runtime_secret_dir(event)
+    if not secret_dir:
+        return []
+    root = Path(secret_dir)
+    values: list[tuple[str, str]] = []
+    for item in _ingest_runtime_secret_manifest(event):
+        name = str(item.get("name") or "").strip()
+        if not _INGEST_SECRET_NAME_RE.fullmatch(name):
+            continue
+        path = root / name
+        try:
+            value = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if value:
+            values.append((name, value))
+    values.sort(key=lambda pair: len(pair[1]), reverse=True)
+    return values
+
+
+def _redact_ingest_runtime_text(text: Any, event: Any | None = None) -> str:
+    value = str(text or "")
+    for name, secret_value in _ingest_runtime_secret_values(event):
+        value = value.replace(secret_value, f"[REDACTED:{name}]")
+        value = _redact_ingest_secret_prefixes(
+            value,
+            secret_name=name,
+            secret_value=secret_value,
+        )
+    value = _INGEST_AUTH_BEARER_RE.sub(
+        lambda match: f"{match.group(1)}[REDACTED:authorization]",
+        value,
+    )
+    value = _INGEST_JWT_LIKE_RE.sub("[REDACTED:jwt]", value)
+    return value
+
+
+def _redact_ingest_secret_prefixes(
+    text: str,
+    *,
+    secret_name: str,
+    secret_value: str,
+) -> str:
+    if len(secret_value) < 8:
+        return text
+    value = text
+    for length in range(min(len(secret_value) - 1, 64), 7, -1):
+        prefix = secret_value[:length]
+        if prefix:
+            value = value.replace(prefix, f"[REDACTED:{secret_name}:prefix]")
+    return value
+
+
+def _redact_ingest_runtime_value(value: Any, event: Any | None = None) -> Any:
+    if isinstance(value, str):
+        return _redact_ingest_runtime_text(value, event)
+    if isinstance(value, list):
+        return [_redact_ingest_runtime_value(item, event) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_ingest_runtime_value(item, event) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _redact_ingest_runtime_value(item, event)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _agent_share_context_from_event(event: Any) -> dict[str, str]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    context = metadata.get(_AGENT_SHARE_CONTEXT_METADATA_KEY)
+    if not isinstance(context, dict):
+        return {}
+    return {
+        "agent_id": str(context.get("agent_id") or "").strip(),
+        "actor_open_id": str(context.get("actor_open_id") or "").strip(),
+        "agent_owner_open_id": str(context.get("agent_owner_open_id") or "").strip(),
+        "share_role": str(context.get("share_role") or "").strip(),
+    }
+
+
+# ── Codex app-server runtime seam (harness-base-codex-w0, PLAN §2 C3/C4/C6) ──
+#
+# The employee's LiteLLM payer key is handed to codex under a SECOND name, since
+# `HERMES_LITELLM_RUNTIME_API_KEY` is popped by `run.py`'s
+# `billing_runtime_from_environment` before codex is ever spawned.
+#
+# NOT the ticket's original `HERMES_CODEX_RUNTIME_KEY`: hermes-agent strips every
+# `HERMES_*_KEY` / `_TOKEN` / `_SECRET` from a spawned child unconditionally
+# (`tools/environments/local.py::_is_hermes_internal_secret`, applied by
+# `hermes_subprocess_env(inherit_credentials=True)` — the exact helper
+# `CodexAppServerClient.__init__` builds codex's spawn env with), so a
+# HERMES_-prefixed name would be dropped BEFORE codex could read it, and codex
+# would fail to authenticate with no MT-side trace. Verified against the 0.19.1
+# release source (`_is_hermes_internal_secret("HERMES_CODEX_RUNTIME_KEY")` is
+# True, `("CODEX_RUNTIME_KEY")` is False); locked by
+# tests/test_codex_runtime_key_env.py. The name below is a provider credential,
+# which is precisely the class `inherit_credentials=True` exists to let through.
+CODEX_RUNTIME_KEY_ENV = "CODEX_RUNTIME_KEY"
+CODEX_PROXY_BASE_URL_ENV = "CODEX_PROXY_BASE_URL"
+#: Mirror of the resolved executor, so a run's own env states which runtime drove
+#: it (the SPEC's `env | grep` evidence) instead of it being inferable only from
+#: gateway logs.
+EXECUTOR_RUNTIME_ENV = "HERMES_EXECUTOR_RUNTIME"
+#: Every name that exists ONLY for a codex-mapped run. `_build_subprocess_env`
+#: drops all of them for any other run, so "not mapped" stays byte-identical to
+#: today even if the gateway environment happens to carry one.
+_CODEX_RUNTIME_ENV_NAMES: tuple[str, ...] = (
+    "CODEX_HOME",
+    "HERMES_CODEX_BIN",
+    "KEP_SPEC_HUB_DIR",
+    CODEX_RUNTIME_KEY_ENV,
+    CODEX_PROXY_BASE_URL_ENV,
+    EXECUTOR_RUNTIME_ENV,
+)
+
+
+# Whitelisted parent-process env keys carried into AIAgent subprocesses.
+#
+# Anything not listed here is dropped before spawning the child — this is the
+# core of profile isolation档 A. New HERMES_* plumbing variables MUST be added
+# explicitly so a future feature does not accidentally widen the surface.
+#
+# Provider API keys/tokens are NEVER on this list. They live in
+# ``<profile_home>/.env`` or ``auth.json`` and are loaded inside the child by
+# ``_run_with_aiagent``'s own dotenv path. Credential-vault encryption keys
+# are explicit Hermes plumbing so the sandboxed Feishu client can decrypt only
+# its own DB credential row; terminal/code subprocesses apply secret-name env
+# filtering before executing model-generated commands.
+#
+_SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    # Operator kill switch for profile MCP-server registration
+    # (agent_real/mcp_servers.py). The gate is evaluated INSIDE the child, so it
+    # is inert unless the name carries across this allowlist.
+    "HERMES_MULTITENANCY_DISABLE_PROFILE_MCP",
+    # POSIX basics
+    "PATH", "USER", "LOGNAME", "SHELL", "TERM",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    # Python runtime
+    "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONIOENCODING",
+    "PYTHONDONTWRITEBYTECODE",
+    # macOS Cocoa text-encoding marker (some Python builds require it)
+    "__CF_USER_TEXT_ENCODING",
+    # SSL trust stores — some skills call HTTPS endpoints and need CA bundles
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Hermes plumbing the child reads directly. Add new keys here when wiring
+    # additional configuration through to the subprocess.
+    "HERMES_AIAGENT_SUBPROCESS_TIMEOUT",
+    "HERMES_MAX_ITERATIONS",
+    "HERMES_MULTITENANCY_APPROVAL_TIMEOUT",
+    "HERMES_MULTITENANCY_TOOLSETS_MODE",
+    # Expert-bot cron routing LABEL only (the expert app id). Safe to forward:
+    # unlike HERMES_MULTITENANCY_FIXED_EXPERT (deliberately NOT allowlisted — it
+    # would flip _may_own_feishu_runtime() in a per-user subprocess), the app id
+    # is an identifier, not an ownership grant, and only the expert gateway ever
+    # sets it. Lets the create subprocess tag a cron job's source_app.
+    "HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID",
+    "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY",
+    "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+    "HERMES_CREDENTIAL_KEY",
+    "HERMES_APPROVAL_GATEWAY_TIMEOUT",
+    "HERMES_VOD_IMAGE_MODEL_OVERRIDE",
+    # RunBroker *URLs* only. The bearer is deliberately NOT inheritable: the
+    # claim that once justified forwarding it — "server enforces per-profile
+    # scope via X-Hermes-Profile / X-Hermes-User-Key" — was false, those headers
+    # are caller-asserted (2026-08-04 security review). The child's
+    # cronjob(action=run) tool instead receives a run-scoped token minted per
+    # spawn by `_aiagent_subprocess_env_scope`, whose (profile, open_id) binding
+    # lives server-side. `_build_subprocess_env` also pops the two key names
+    # unconditionally as a backstop against this allowlist regrowing them.
+    "HERMES_RUN_BROKER_URL",
+    "HERMES_MULTITENANCY_RUN_BROKER_URL",
+    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
+    "HERMES_MULTITENANCY_CRED_BROKER_URL",
+    "HERMES_MULTITENANCY_CRED_LEASE",
+    "HERMES_MULTITENANCY_RUN_ID",
+    "HERMES_LARK_CLI_RUN_TOKEN",
+    "HERMES_LARK_CLI_AUTHORIZED",
+    "HERMES_LARK_CLI_REAL_BIN",
+    "HERMES_MT_SECURITY_AUDIT_PATH",
+    "HERMES_MT_SECURITY_AUDIT_ENABLED",
+    # Codex app-server runtime (harness-base-codex-w0). HERMES_EXECUTOR_MAP is
+    # load-bearing rather than cosmetic: `run.py` re-resolves the executor map in
+    # the CHILD to set `api_mode`, and without the path here the child sees no
+    # map at all and every mapped run silently stays on the native runtime.
+    # The other four arrive per-run through `extra`; they are declared because
+    # this list's contract is that plumbing is explicit, and
+    # `_build_subprocess_env` drops them again for any run not mapped to codex.
+    "HERMES_EXECUTOR_MAP",
+    *_CODEX_RUNTIME_ENV_NAMES,
+}) | frozenset(kep_cli_guard.kep_cli_real_bin_env_keys())
+
+_FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
+_FEISHU_APP_CREDENTIAL_SUBJECT = "feishu_app"
+
+
+def _profile_anchor_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Return non-secret profile anchors shared by subprocess and in-process runs."""
+    profile_home = profile_home.expanduser()
+    pivot = {
+        "HOME":            profile_home / "home",
+        "WORKSPACE":       profile_home / "workspace",
+        "XDG_CACHE_HOME":  profile_home / "cache",
+        "XDG_CONFIG_HOME": profile_home / "config",
+        "XDG_STATE_HOME":  profile_home / "state",
+        "XDG_DATA_HOME":   profile_home / "data",
+        "TMPDIR":          profile_home / "tmp",
+    }
+    for path in pivot.values():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _install_keep_login_compat(profile_home)
+    return {
+        **{key: str(path) for key, path in pivot.items()},
+        "TERMINAL_CWD":     str(pivot["WORKSPACE"]),
+        "HERMES_HOME":        str(profile_home),
+        "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
+        "HERMES_PROFILE":     profile_home.name,
+        "KEP_PROFILE":        profile_home.name,
+        # Execution-environment contract read by the Keep expert plugins
+        # (using-server-dev 第 0 步): `online` = this runtime can clone the
+        # target repo inside the session; unset = assume a long-lived local
+        # checkout, which a Hermes run never has — that branch is what made an
+        # expert answer "cannot reach your internal git" instead of cloning.
+        # Asserted unconditionally (never inherited from the gateway env) and
+        # anchored here so BOTH run paths — the subprocess env build and the
+        # in-process `_apply_runtime_env_for_aiagent` — carry it, terminal
+        # second scrub included.
+        "KEP_AGENT_MODE":     "online",
+        # The same plugins use `$KEP_WORKSPACE_DIR/KepSpecHub` as the session
+        # working volume; online mode without it dead-ends just as hard.
+        "KEP_WORKSPACE_DIR":  str(pivot["WORKSPACE"]),
+        "TERMINAL_HOME_MODE": "profile",
+    }
+
+
+
+
+def _browser_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Expose profile-scoped env for Hermes native browser tools."""
+    try:
+        from ..browser_policy import browser_decision, browser_env
+
+        config = _load_yaml(profile_home / "config.yaml")
+        return browser_env(browser_decision(config, profile_home))
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve browser env for subprocess", exc_info=True)
+        return {}
+
+
+def _lark_cli_sidecar_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Expose lark-cli authsidecar plumbing without exposing Feishu tokens."""
+    parent = os.environ
+    proxy = str(parent.get("HERMES_LARK_CLI_AUTH_PROXY") or "").strip()
+    key = str(parent.get("HERMES_LARK_CLI_PROXY_KEY") or "").strip()
+    app_id = _resolve_lark_cli_app_id(profile_home)
+    if not (proxy and key and app_id):
+        return {}
+
+    binary = _resolve_lark_cli_authsidecar_binary(profile_home)
+    if not binary.exists():
+        return {}
+
+    return {
+        "HERMES_LARK_CLI_BIN": str(binary),
+        "LARKSUITE_CLI_AUTH_PROXY": proxy,
+        "LARKSUITE_CLI_PROXY_KEY": key,
+        "LARKSUITE_CLI_APP_ID": app_id,
+        "LARKSUITE_CLI_BRAND": str(parent.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
+        "LARKSUITE_CLI_DEFAULT_AS": _lark_cli_default_identity(profile_home, ""),
+        "LARKSUITE_CLI_STRICT_MODE": str(parent.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
+    }
+
+
+def _resolve_lark_cli_authsidecar_binary(profile_home: Path) -> Path:
+    configured_bin = str(os.environ.get("HERMES_LARK_CLI_BIN") or "").strip()
+    if configured_bin:
+        return Path(configured_bin).expanduser()
+    return _resolve_shared_hermes_home(profile_home) / "bin" / "lark-cli-authsidecar"
+
+
+def _default_security_audit_path_for_subprocess(profile_home: Path) -> Path:
+    configured = str(os.environ.get("HERMES_MT_SECURITY_AUDIT_PATH") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    # Never point the subprocess at DEFAULT_SECURITY_AUDIT_PATH: inside bwrap
+    # /var/log/hermes is not bound, the namespace root is a tmpfs, so mkdir
+    # "succeeds" and every event dies with the sandbox (2026-08-31: forced
+    # script_channel.granted events never reached disk while append reported
+    # success). The profile tree is the one RW bind guaranteed durable from
+    # inside the sandbox — and the same host path outside it. The filename is
+    # the SPEC-pinned acceptance path (security-audit.jsonl), deliberately NOT
+    # DEFAULT_SECURITY_AUDIT_PATH.name — operators read this file back for UAT.
+    return profile_home / "logs" / "security-audit.jsonl"
+
+
+def _resolve_lark_cli_app_id(profile_home: Path) -> str:
+    _load_lark_cli_shared_env(profile_home)
+    app_id = str(os.environ.get("HERMES_LARK_CLI_APP_ID") or "").strip()
+    if app_id:
+        return app_id
+    app_id = _resolve_lark_cli_app_id_from_profile_uat(profile_home)
+    if app_id:
+        return app_id
+    try:
+        from ..credentials import CredentialStore
+
+        store = CredentialStore(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                provider="feishu",
+                secret_kind="app",
+            )
+        finally:
+            store.close()
+        return str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_lark_cli_app_id_from_profile_uat(profile_home: Path) -> str:
+    """Read the public app_id from the current profile's UAT JSON if present."""
+    uat_dir = Path(profile_home).expanduser() / "feishu_uat"
+    try:
+        candidates = sorted(
+            (path for path in uat_dir.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return ""
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        app_id = str(payload.get("app_id") or payload.get("client_id") or "").strip()
+        if app_id:
+            return app_id
+    return ""
+
+
+def _is_group_profile_home(profile_home: Path) -> bool:
+    profile_home = Path(profile_home).expanduser()
+    if profile_home.name.startswith("feishu_group_"):
+        return True
+    marker = profile_home / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return str(payload.get("kind") or "").strip().lower() == "group"
+
+
+def _group_profile_chat_id(profile_home: Path) -> str:
+    marker = Path(profile_home).expanduser() / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("chat_id") or "").strip()
+
+
+_LARK_CLI_SHARED_ENV_KEYS = frozenset(
+    {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+        "HERMES_CREDENTIAL_KEY",
+        "HERMES_LARK_CLI_APP_ID",
+        "HERMES_LARK_CLI_BRAND",
+        "HERMES_LARK_CLI_DEFAULT_AS",
+        "HERMES_LARK_CLI_STRICT_MODE",
+    }
+)
+
+
+def _load_lark_cli_shared_env(profile_home: Path) -> dict[str, str]:
+    """Load only lark-cli broker control-plane env from the shared .env file."""
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    env_path = shared_home / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    parsed: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key not in _LARK_CLI_SHARED_ENV_KEYS or os.environ.get(key):
+            continue
+        value = value.strip().strip("'\"")
+        if value:
+            os.environ[key] = value
+            parsed[key] = value
+    return parsed
+
+
+def _payload_has_live_access_token(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    token = str(payload.get("access_token") or payload.get("user_access_token") or payload.get("token") or "").strip()
+    if not token:
+        return False
+    expires_raw = payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")
+    try:
+        expires = int(expires_raw or 0)
+    except (TypeError, ValueError):
+        return True
+    if expires <= 0:
+        return True
+    now_ms = int(time.time() * 1000)
+    expires_ms = expires if expires > 10_000_000_000 else expires * 1000
+    return expires_ms > now_ms + 60_000
+
+
+def _profile_has_lark_cli_user_credential(profile_home: Path, open_id: str) -> bool:
+    open_id = str(open_id or "").strip()
+    if not open_id or _is_group_profile_home(profile_home):
+        return False
+
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    try:
+        from ..feishu_uat_auth import refresh_uat_if_needed
+
+        refreshed = refresh_uat_if_needed(
+            profile_name=Path(profile_home).name,
+            open_id=open_id,
+            shared_home=shared_home,
+            headroom_seconds=300,
+        )
+        if _payload_has_live_access_token(refreshed):
+            return True
+    except Exception:
+        pass
+
+    try:
+        data = json.loads((Path(profile_home).expanduser() / "feishu_uat" / f"{open_id}.json").read_text(encoding="utf-8"))
+        if _payload_has_live_access_token(data):
+            return True
+    except Exception:
+        pass
+
+    try:
+        from ..credentials import CredentialStore
+
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=Path(profile_home).name,
+                subject_id=open_id,
+                provider="feishu",
+                secret_kind="uat",
+            )
+        finally:
+            store.close()
+        return _payload_has_live_access_token(payload)
+    except Exception:
+        return False
+
+
+def _lark_cli_default_identity(profile_home: Path, open_id: str) -> str:
+    """Return the identity lark-cli should use when a tool call says auto.
+
+    Group profiles never load member UAT, so they default to bot identity.
+    Personal profiles use user identity only when a live UAT exists for the
+    current sender; otherwise they fall back to bot identity.
+    """
+    explicit = str(os.environ.get("HERMES_LARK_CLI_DEFAULT_AS") or "").strip().lower()
+    if explicit in {"user", "bot"}:
+        return explicit
+    if _profile_has_lark_cli_user_credential(profile_home, open_id):
+        return "user"
+    return "bot"
+
+
+def _log_feishu_identity_context(
+    *,
+    profile_home: Path,
+    shared_home: Path,
+    sender_open_id: str,
+) -> None:
+    """Log Feishu token lookup paths without implying group profiles use member UAT."""
+    profile_home = Path(profile_home).expanduser()
+    shared_home = Path(shared_home).expanduser()
+    logger.info(
+        "[multitenancy] Feishu identity context sender=%s profile=%s "
+        "profile_uat_dir=%s legacy Feishu UAT compatibility dir=%s "
+        "lark_cli_default_identity=%s group_profile=%s",
+        sender_open_id,
+        profile_home.name,
+        profile_home / "feishu_uat",
+        shared_home / "feishu_uat",
+        _lark_cli_default_identity(profile_home, sender_open_id),
+        _is_group_profile_home(profile_home),
+    )
+
+
+def _owner_mapped_bot_chat_ids(profile_home: Path, sender_open_id: str) -> frozenset[str]:
+    sender_open_id = str(sender_open_id or "").strip()
+    if not sender_open_id or _is_group_profile_home(profile_home):
+        return frozenset()
+    table = None
+    try:
+        from ..routing import KIND_GROUP, RoutingTable
+
+        table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        rows = table.list_by_owner(sender_open_id, kind=KIND_GROUP)
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve owner-mapped bot chat ids", exc_info=True)
+        return frozenset()
+    finally:
+        if table is not None:
+            try:
+                table.close()
+            except Exception:
+                logger.debug("[multitenancy] failed to close owner-mapped routing table", exc_info=True)
+    return frozenset(str(row.chat_id or "").strip() for row in rows if str(row.chat_id or "").strip())
+
+
+def _profile_owner_open_id(profile_home: Path) -> str:
+    profile_name = Path(profile_home).name
+    table = None
+    try:
+        from ..routing import RoutingTable
+
+        table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        row = table.lookup_by_profile_name(profile_name)
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve profile owner open_id", exc_info=True)
+        return ""
+    finally:
+        if table is not None:
+            try:
+                table.close()
+            except Exception:
+                logger.debug("[multitenancy] failed to close profile-owner routing table", exc_info=True)
+    return str(row.owner_open_id or "").strip() if row is not None else ""
+
+
+@contextmanager
+def _lark_cli_auth_broker_scope(
+    profile_home: Path,
+    sender_open_id: str,
+    *,
+    tool_scope: str = "",
+    chat_type: str = "",
+    chat_id: str = "",
+) -> Iterator[dict[str, str]]:
+    """Start a per-run lark-cli auth broker and return child env overrides."""
+    app_id = _resolve_lark_cli_app_id(profile_home)
+    sender_open_id = str(sender_open_id or "").strip()
+    if not sender_open_id:
+        sender_open_id = _profile_owner_open_id(profile_home)
+    binary = _resolve_lark_cli_authsidecar_binary(profile_home)
+    is_group_profile = _is_group_profile_home(profile_home)
+    if not (app_id and binary.exists() and (sender_open_id or is_group_profile)):
+        yield {}
+        return
+
+    default_as = _lark_cli_default_identity(profile_home, sender_open_id)
+    allowed_bot_chat_ids = _owner_mapped_bot_chat_ids(profile_home, sender_open_id)
+    trusted_profile_kind = ""
+    if tool_scope:
+        identity = tool_scope.removeprefix("feishu:")
+        if (
+            identity not in {"user", "bot"}
+            or chat_type not in {"p2p", "group"}
+            or (identity == "bot") != (chat_type == "group")
+            or not chat_id
+        ):
+            raise RuntimeError("Trusted Feishu tool scope does not match sealed chat context")
+        default_as = identity
+        allowed_identities = frozenset({identity})
+        trusted_profile_kind = "group" if chat_type == "group" else "user"
+    else:
+        allowed_identities = frozenset({"user", "bot"})
+    key = secrets.token_urlsafe(32)
+    expiry_signal = _CREDENTIAL_EXPIRY_SIGNAL.get(None)
+    permission_signal = _PERMISSION_AUTH_SIGNAL.get(None)
+    server = start_lark_cli_auth_broker_server(
+        LarkCliAuthBrokerContext(
+            shared_home=_resolve_shared_hermes_home(profile_home),
+            profile_name=profile_home.name,
+            user_open_id=sender_open_id,
+            hmac_key=key,
+            allowed_identities=allowed_identities,
+            profile_kind=trusted_profile_kind or ("group" if is_group_profile else "user"),
+            current_chat_id=(
+                chat_id
+                if trusted_profile_kind == "group"
+                else (_group_profile_chat_id(profile_home) if is_group_profile else "")
+            ),
+            allowed_bot_chat_ids=allowed_bot_chat_ids,
+            credential_expiry_sink=expiry_signal.set if expiry_signal is not None else None,
+            permission_denied_sink=permission_signal.set if permission_signal is not None else None,
+        )
+    )
+    try:
+        env = {
+            "HERMES_LARK_CLI_BIN": str(binary),
+            "HERMES_FEISHU_USER_OPEN_ID": sender_open_id,
+            "LARKSUITE_CLI_AUTH_PROXY": server.url,
+            "LARKSUITE_CLI_PROXY_KEY": key,
+            "LARKSUITE_CLI_APP_ID": app_id,
+            "LARKSUITE_CLI_BRAND": str(os.environ.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
+            "LARKSUITE_CLI_DEFAULT_AS": default_as,
+            "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
+        }
+        if allowed_bot_chat_ids:
+            env["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] = ",".join(sorted(allowed_bot_chat_ids))
+        yield env
+    finally:
+        server.close()
+
+
+def resume_pending_lark_cli_step(
+    profile_home: Path,
+    subject: str,
+    *,
+    trusted_chat_id: str = "",
+    session_ref: str | None = None,
+    call_ref: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve one actor-bound auth wait without persisting or replaying its payload."""
+    from ..operation_checkpoint import OperationCheckpointStore
+    from ..runtime import strict_context_enabled
+
+    if not strict_context_enabled():
+        return None
+    profile_home = Path(profile_home).expanduser().resolve(strict=False)
+    subject = str(subject or "").strip()
+    if not profile_home.is_dir() or not subject:
+        return None
+    checkpoint_path = profile_home / "state" / "operation-checkpoints.db"
+    if not checkpoint_path.is_file():
+        return None
+    store = OperationCheckpointStore(checkpoint_path)
+    try:
+        row = store.find_pending(
+            profile_name=profile_home.name,
+            subject=subject,
+            connector="lark-cli",
+            session_ref=str(session_ref or "").strip() or None,
+            call_ref=str(call_ref or "").strip() or None,
+        )
+        if row is None:
+            return None
+        stored_session_ref = str(row.get("session_ref") or "").strip()
+        stored_call_ref = str(row.get("call_ref") or "").strip()
+        if (
+            (session_ref and str(session_ref).strip() != stored_session_ref)
+            or (call_ref and str(call_ref).strip() != stored_call_ref)
+            or not stored_session_ref
+            or not stored_call_ref
+        ):
+            return None
+
+        tool_scope = str(row.get("tool_scope") or "").strip()
+        chat_type = str(row.get("chat_type") or "").strip()
+        chat_fence = str(row.get("chat_fence") or "").strip()
+        chat_id = str(trusted_chat_id or "").strip()
+        if tool_scope or chat_type or chat_fence:
+            if (
+                tool_scope not in {"feishu:user", "feishu:bot"}
+                or chat_type not in {"p2p", "group"}
+                or (tool_scope == "feishu:bot") != (chat_type == "group")
+                or not chat_fence
+                or not chat_id
+                or hashlib.sha256(chat_id.encode("utf-8")).hexdigest() != chat_fence
+                or (chat_type == "group" and _group_profile_chat_id(profile_home) != chat_id)
+            ):
+                return None
+
+        if not store.transition(
+            str(row["operation_id"]),
+            profile_name=profile_home.name,
+            subject=subject,
+            expected_state="waiting_auth",
+            state="failed",
+            step="resend_required",
+        ):
+            return None
+    finally:
+        store.close()
+    return {
+        "ok": False,
+        "recovered": False,
+        "failure_subsystem": "permission",
+        "error_code": "FEISHU_OPERATION_RESEND_REQUIRED",
+        "retryable": False,
+        "resend_required": True,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Codex app-server runtime wiring (harness-base-codex-w0)
+#
+# t01 decides WHETHER a run is executed by codex, t02 builds its CODEX_HOME and
+# t03 builds its workspace. This is the only place those three meet the run: the
+# parent-side env scope and the event's cwd carrier.
+# --------------------------------------------------------------------------- #
+
+def _codex_unavailable(event: Any, profile_home: Path, reason: str) -> Exception:
+    """Audit a fail-closed codex precondition and return the error to raise.
+
+    ``ExecutorUnavailable`` (an ``ExpertUnavailableError``) is the ONLY shape
+    that survives the caller's fallback ladder — ``real_run_agent`` /
+    ``stream_run_agent`` re-raise it, and re-run the turn on the native runtime
+    for anything else. A clone failure or a missing key raised as a plain
+    ``RuntimeError`` would therefore be answered by the hermes tool loop while
+    every log still said codex, which is the degradation C1 forbids.
+    """
+    from . import executor_map
+
+    try:
+        append_security_event(
+            force=True,
+            event_type="codex_runtime_unavailable",
+            profile=str(getattr(profile_home, "name", profile_home)),
+            expert_id=_expert_id_for_event(event),
+            reason=reason[:300],
+            decision="rejected",
+        )
+    except Exception:  # pragma: no cover - audit must never mask the real error
+        logger.debug("[multitenancy] codex unavailable audit failed", exc_info=True)
+    logger.error("[multitenancy] codex runtime unavailable: %s", reason)
+    return executor_map.ExecutorUnavailable(reason)
+
+
+def _codex_git_inputs_for_event(event: Any) -> dict[str, str]:
+    """Where this run's workspace clones from (C5).
+
+    Run metadata is the only W0·0 carrier. Process env is deliberately ignored:
+    a sticky demo value must never redirect a later employee run.
+    """
+    metadata = _event_metadata(event)
+
+    return {
+        name: str(metadata.get(name) or "").strip()
+        for name in ("repo_git_url", "repo_ref", "spec_hub_git_url")
+    }
+
+
+def _codex_expert_plugin_dir(profile_home: Path, expert_id: str) -> Optional[Path]:
+    """The managed plugin repo whose ``.codex-plugin`` makes codex *this* expert.
+
+    Routed through ``resolve_expert`` rather than straight to the manifests so the
+    audience gate that decides whether this caller may activate the expert also
+    decides whose plugin gets copied into the sandbox.
+    """
+    from ..expert_overlay import _iter_managed_manifests, resolve_expert
+
+    overlay = resolve_expert(profile_home, expert_id)
+    plugin_id = str(getattr(overlay, "plugin_id", "") or "").strip()
+    if not plugin_id:
+        return None
+    for manifest, _path in _iter_managed_manifests(profile_home):
+        if str(manifest.get("plugin_id") or "").strip() != plugin_id:
+            continue
+        repo = str(manifest.get("repo") or "").strip()
+        if repo:
+            return Path(repo).expanduser()
+    return None
+
+
+def _codex_thread_bound_model(event: Any, profile_home: Path) -> str:
+    """The model this Harness thread is already running, read from its own home.
+
+    Round 2+ of a WebUI Harness session need not carry ``metadata["model"]``:
+    prod 2026-09-03 23:09 died on "codex requires an explicit GPT model" while
+    round 1 of the same thread had logged ``codex home materialized ...
+    model=GPT-5-priority``. That ``codex-home/config.toml`` is keyed by the very
+    workflow id the resume-thread binding is keyed by, and holds the exact model
+    string round 1 ran and billed against — so it is this thread's own record,
+    not a new store and not a cross-thread memory.
+
+    Empty unless a bound thread exists AND its config is readable: the caller
+    fails closed on empty, never guesses a model.
+    """
+    if not str(getattr(event, "_harness_resume_thread_id", "") or "").strip():
+        return ""
+    from . import codex_home, run_workspace
+    from .harness_webui_runtime import require_event_admission
+
+    try:
+        admission = require_event_admission(event, profile_home)
+        if admission is None:
+            return ""
+        return codex_home.read_config_model(
+            codex_home.codex_home_for(
+                run_workspace.workflow_root(profile_home, admission.workflow_id)
+            )
+        )
+    except Exception:
+        logger.debug(
+            "[multitenancy] codex thread-bound model lookup failed", exc_info=True
+        )
+        return ""
+
+
+def _codex_model_and_base_url(event: Any, profile_home: Path) -> tuple[str, str]:
+    """The (model, base_url) the child will actually talk to.
+
+    Resolved with the same helpers ``run.py`` uses, so ``config.toml`` pins the
+    endpoint the run is billed against instead of a second, drifting answer.
+    """
+    config = _load_profile_config(profile_home)
+    primary = str((config.get("model") or {}).get("default") or "").strip()
+    if not primary:
+        raise ValueError("profile config missing model.default")
+    primary_provider, _primary_model = _split_model_spec(
+        primary,
+        strip_custom_context_suffix=True,
+    )
+    if not str(_event_metadata(event).get("model") or "").strip():
+        carried = _codex_thread_bound_model(event, profile_home)
+        if not carried:
+            raise _codex_unavailable(
+                event,
+                profile_home,
+                "codex requires an explicit GPT model"
+                + (
+                    ": this harness thread has no bound model to carry over"
+                    if getattr(event, "_harness_resume_thread_id", None)
+                    else ""
+                ),
+            )
+        raw_event = getattr(event, "raw_event", None)
+        metadata = raw_event.get("metadata") if isinstance(raw_event, dict) else None
+        if not isinstance(metadata, dict):
+            metadata = {}
+            if isinstance(raw_event, dict):
+                raw_event["metadata"] = metadata
+        # Fills the hole only — a model on THIS turn never reaches here, so a
+        # per-turn switch still wins. Written back onto the event (not just used
+        # locally) so the child payload bills the same model round 1 did.
+        # ponytail: the carried string is config.toml's, i.e. already stripped of
+        # a ``[1m]`` context suffix; codex is billed the same either way. Persist
+        # the raw metadata spec if that hint ever has to survive a round.
+        metadata["model"] = f"{primary_provider}/{carried}"
+    provider, model_only = _split_model_spec(
+        _model_spec_for_event(primary, event),
+        strip_custom_context_suffix=True,
+    )
+    model_parts = model_only.split("/")
+    model_family = model_parts[-1].lower()
+    if provider.lower() != primary_provider.lower():
+        raise _codex_unavailable(event, profile_home, "codex model provider mismatch")
+    if (
+        len(model_parts) > 2
+        or (len(model_parts) == 2 and model_parts[0].lower() != "tencent")
+        or not model_family.startswith("gpt-")
+    ):
+        raise _codex_unavailable(
+            event,
+            profile_home,
+            "codex requires an explicit GPT model",
+        )
+    env_overrides: dict[str, Any] = {}
+    dotenv_path = profile_home / ".env"
+    if dotenv_path.exists():
+        from dotenv import dotenv_values
+
+        env_overrides = dict(dotenv_values(dotenv_path))
+    base_url = str(
+        _resolve_base_url(primary_provider, True, config, env_overrides) or ""
+    ).strip()
+    if not base_url:
+        raise _codex_unavailable(event, profile_home, "codex billing base_url missing")
+    return model_only, base_url
+
+
+def _codex_readonly_token_for_event(event: Any, profile_home: Path) -> str:
+    """Resolve this actor's own read-tier GitLab credential, never a fallback."""
+    from ..credential_delegation import profile_is_solely_owned_by
+    from ..credential_materializer import (
+        _payload_content,
+        entry_targets_profile,
+        resolve_runtime_secret,
+    )
+    from ..credentials import CredentialStore
+    from ..gitlab_token_intake import gitlab_config_entry
+    from ..trusted_feishu_ingress import TrustedFeishuAdmission
+    from ..trusted_runtime_principal import TrustedRuntimePrincipal
+
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    db_path = shared_home / "multitenancy.db"
+    actor = ""
+    credential_subject = ""
+    admission = getattr(event, "trusted_feishu_ingress_admission", None)
+    if (
+        isinstance(admission, TrustedFeishuAdmission)
+        and admission.is_authentic()
+        and getattr(admission, "actor_kind", "user") == "user"
+        and getattr(admission, "tool_scope", "") == "feishu:user"
+        and getattr(admission, "profile_name", "") == profile_home.name
+    ):
+        actor = str(getattr(admission, "actor_subject", "") or "").strip()
+        credential_subject = str(
+            getattr(admission, "credential_subject", "") or ""
+        ).strip()
+    else:
+        principal = getattr(event, "trusted_runtime_principal", None)
+        if (
+            isinstance(principal, TrustedRuntimePrincipal)
+            and principal.is_authentic()
+            and getattr(principal, "channel", "") == "webui"
+            and getattr(principal, "profile_name", "") == profile_home.name
+        ):
+            actor = str(getattr(principal, "actor_subject", "") or "").strip()
+            credential_subject = str(
+                getattr(principal, "credential_subject", "") or ""
+            ).strip()
+    if not actor.startswith("ou_") or credential_subject != actor:
+        raise RuntimeError("read credential requires a sealed matching principal")
+    if not profile_is_solely_owned_by(db_path, profile_home.name, actor):
+        raise RuntimeError("read credential actor/profile binding is missing or ambiguous")
+    entry = gitlab_config_entry(shared_home)
+    if not entry or not entry_targets_profile(
+        entry, shared_home=shared_home, profile_name=profile_home.name
+    ):
+        raise RuntimeError("read credential is not configured for this profile")
+
+    secret_kind = str(entry.get("secret_kind") or "token").strip()
+    store = CredentialStore(db_path)
+    try:
+        status = store.get_status(
+            profile_name=profile_home.name,
+            subject_id=str(entry.get("subject_id") or ""),
+            provider="gitlab",
+            secret_kind=secret_kind,
+            required_scopes=("read_api", "read_repository"),
+        )
+        payload, vault_profile = resolve_runtime_secret(
+            store, entry, profile_name=profile_home.name
+        )
+    finally:
+        store.close()
+    scopes = set(status.get("scopes") or ())
+    if (
+        status.get("status") != "valid"
+        or vault_profile != profile_home.name
+        or scopes != {"read_api", "read_repository"}
+        or payload is None
+        or str(payload.get("owner_actor_subject") or "").strip() != actor
+        or payload.get("token_owner_verified") is not True
+    ):
+        raise RuntimeError("actor-bound read credential is unavailable")
+    token = _payload_content(payload, entry.get("payload_key")).strip()
+    if not token:
+        raise RuntimeError("actor-bound read credential is empty")
+    return token
+
+
+def _codex_run_workspace_for_event(event: Any, profile_home: Path) -> Optional[Any]:
+    """This run's prepared workspace, or ``None`` when it is not a codex run.
+
+    Safe (and meant) to call twice: once before the child payload is serialized,
+    so ``raw_event["workspace"]`` carries the clone, and once from the env scope,
+    which needs the same paths. ``run_workspace.prepare`` reuses an existing
+    checkout, so the second call is a handful of stats.
+
+    The runtime is re-resolved from the operator config here rather than read off
+    the event: the child's ``_executor_runtime`` mirror cannot travel back to the
+    parent, and an event-carried value would be caller-writable.
+    """
+    from . import executor_map, run_workspace
+
+    if (
+        executor_map.runtime_for_event(event, profile_home)
+        != executor_map.CODEX_APP_SERVER
+    ):
+        return None
+    from .harness_webui_runtime import require_event_admission
+
+    local_admission = require_event_admission(event, profile_home)
+    if local_admission is not None:
+        try:
+            return run_workspace.bind_existing(
+                profile_home,
+                local_admission.workflow_id,
+                local_admission.workspace,
+            )
+        except executor_map.ExecutorUnavailable:
+            raise
+        except Exception as exc:
+            raise _codex_unavailable(
+                event, profile_home, f"local Harness workspace could not be prepared: {exc}"
+            ) from exc
+    inputs = _codex_git_inputs_for_event(event)
+    try:
+        token = _codex_readonly_token_for_event(event, profile_home)
+        principal = getattr(event, "trusted_runtime_principal", None)
+        from ..gitlab_owner_scope_attestation import (
+            require_trusted_gitlab_run_attestation,
+        )
+
+        require_trusted_gitlab_run_attestation(
+            getattr(event, "trusted_gitlab_run_attestation", None),
+            expected_run_id=run_workspace.workflow_id_for(event),
+            actor_subject=str(getattr(principal, "actor_subject", "") or ""),
+            profile=profile_home.name,
+            token=token,
+            fingerprint_key=getattr(event, "trusted_gitlab_fingerprint_key", b""),
+        )
+        _require_codex_spend_state_for_event(event, profile_home)
+        return run_workspace.prepare(
+            profile_home,
+            run_workspace.workflow_id_for(event),
+            repo_git_url=inputs["repo_git_url"],
+            repo_ref=inputs["repo_ref"] or None,
+            spec_hub_git_url=inputs["spec_hub_git_url"],
+            readonly_token=token,
+        )
+    except executor_map.ExecutorUnavailable:
+        raise
+    except Exception as exc:
+        raise _codex_unavailable(
+            event, profile_home, f"run workspace could not be prepared: {exc}"
+        ) from exc
+
+
+def _require_codex_spend_state_for_event(event: Any, profile_home: Path) -> Any:
+    """Return the sealed pre-model snapshot for a mapped Codex run."""
+    from . import executor_map, run_workspace
+
+    if (
+        executor_map.runtime_for_event(event, profile_home)
+        != executor_map.CODEX_APP_SERVER
+    ):
+        return None
+    from .harness_webui_runtime import require_event_admission
+
+    local_admission = require_event_admission(event, profile_home)
+    if local_admission is not None:
+        metadata = _event_metadata(event)
+        if (
+            metadata.get("litellm_billing_enforced") is not True
+            or str(metadata.get("litellm_billing_actor_subject") or "").strip()
+            != local_admission.actor_subject
+            or not str(
+                metadata.get("litellm_billing_employee_user_id") or ""
+            ).strip()
+        ):
+            raise _codex_unavailable(
+                event,
+                profile_home,
+                "actor-bound Harness billing identity is unavailable",
+            )
+        return metadata
+    try:
+        from ..single_actor_spend_receipt import require_single_actor_spend_state
+
+        state = getattr(event, "trusted_single_actor_spend_state", None)
+        require_single_actor_spend_state(
+            state,
+            principal=getattr(event, "trusted_runtime_principal", None),
+            run_id=run_workspace.workflow_id_for(event),
+            audience=_CODEX_EVIDENCE_AUDIENCE,
+        )
+        return state
+    except Exception as exc:
+        raise _codex_unavailable(
+            event, profile_home, f"single-actor spend snapshot is unavailable: {exc}"
+        ) from exc
+
+
+def _codex_budget_exhausted(event: Any) -> bool:
+    """A run that merely SPENT its budget is complete, not tampered with.
+
+    Every admitted request still completed with usage; only the (N+1)-th was
+    refused. Concurrency rejections keep failing closed, and so does the
+    single-request (non-local-harness) path, which has no budget to exhaust.
+    The gate and the user-facing notice MUST share this one predicate — a
+    looser second copy would hand a tampered run a reassuring notice.
+
+    Decided on the COUNTERS, not on the derived ``budget_exhausted`` flag: a
+    malformed or partially migrated audit (missing counters, a mismatched
+    ``rejected_requests`` total, a boundary that was never actually reached)
+    must fail closed rather than release unaudited output. The flag still has to
+    AGREE with them — the snapshot derives it as ``rejected_over_limit > 0``, so
+    disagreement is drift, and drift fails closed too.
+    """
+    from . import codex_provider_proxy
+
+    audit = getattr(event, "_trusted_codex_proxy_audit", None)
+    if not isinstance(audit, dict):
+        return False
+    limit = codex_provider_proxy.MAX_HARNESS_REQUESTS
+    if getattr(event, "_trusted_codex_proxy_request_limit", None) != limit:
+        return False
+    if audit.get("request_limit") != limit:
+        return False
+    if audit.get("budget_exhausted") is not True:
+        return False
+    over_limit = audit.get("rejected_over_limit")
+    concurrent = audit.get("rejected_concurrent")
+    rejected = audit.get("rejected_requests")
+    if type(over_limit) is not int or over_limit < 1:
+        return False
+    if type(concurrent) is not int or concurrent != 0:
+        return False
+    if type(rejected) is not int or rejected != over_limit + concurrent:
+        return False
+    # …and a boundary the proxy could actually have refused at. The token budget
+    # is off (``None``) since 2026-09-04, so only the request boundary counts;
+    # the branch stays for the day a total is put back.
+    request_count = audit.get("request_count")
+    total_tokens = audit.get("total_tokens")
+    token_budget = codex_provider_proxy.MAX_HARNESS_TOTAL_TOKENS
+    return (type(request_count) is int and request_count == limit) or (
+        token_budget is not None
+        and type(total_tokens) is int
+        and total_tokens >= token_budget
+    )
+
+
+async def _complete_codex_spend_receipt(event: Any, profile_home: Path) -> None:
+    """Accept mapped Codex output only after its proxy request and spend row verify."""
+    state = _require_codex_spend_state_for_event(event, profile_home)
+    if state is None:
+        return
+    from . import codex_provider_proxy
+    from .harness_webui_runtime import require_event_admission
+
+    request_limit = getattr(event, "_trusted_codex_proxy_request_limit", None)
+    proxy_audit = getattr(event, "_trusted_codex_proxy_audit", None)
+    request_count = proxy_audit.get("request_count") if isinstance(proxy_audit, dict) else None
+    budget_exhausted = _codex_budget_exhausted(event)
+    if (
+        not isinstance(proxy_audit, dict)
+        or request_limit not in {1, codex_provider_proxy.MAX_HARNESS_REQUESTS}
+        or type(request_count) is not int
+        or not 1 <= request_count <= request_limit
+        or proxy_audit.get("request_limit") != request_limit
+        or (proxy_audit.get("rejected_requests") != 0 and not budget_exhausted)
+        or type(proxy_audit.get("response_completed")) is not int
+        or proxy_audit.get("response_completed") != request_count
+        or proxy_audit.get("usage_response_count") != request_count
+        or proxy_audit.get("usage_present") is not True
+        or proxy_audit.get("store_forced") is not True
+    ):
+        raise _codex_unavailable(
+            event, profile_home, "mapped Codex provider proxy audit is incomplete"
+        )
+    if budget_exhausted:
+        logger.info(
+            "[multitenancy] mapped Codex run budget_exhausted requests=%s total_tokens=%s",
+            proxy_audit.get("request_count"),
+            proxy_audit.get("total_tokens"),
+        )
+    if request_limit == codex_provider_proxy.MAX_HARNESS_REQUESTS:
+        if require_event_admission(event, profile_home) is None:
+            raise _codex_unavailable(
+                event, profile_home, "Harness admission changed before usage release"
+            )
+        usage = dict(getattr(event, "_trusted_codex_usage", None) or {})
+        usage.update(
+            {
+                "api_calls": proxy_audit["request_count"],
+                "input_tokens": proxy_audit.get("input_tokens", 0),
+                "output_tokens": proxy_audit.get("output_tokens", 0),
+                "total_tokens": proxy_audit.get("total_tokens", 0),
+                "cache_read_tokens": proxy_audit.get("cache_read_tokens", 0),
+                "cache_write_tokens": 0,
+                "budget_exhausted": budget_exhausted,
+            }
+        )
+        _write_token_ledger_from_child(
+            event, profile_home, usage, verified_codex=True
+        )
+        return
+    try:
+        from ..single_actor_spend_receipt import finish_single_actor_spend_receipt
+        from . import run_workspace
+
+        receipt = await asyncio.to_thread(
+            finish_single_actor_spend_receipt,
+            state,
+            run_id=run_workspace.workflow_id_for(event),
+            audience=_CODEX_EVIDENCE_AUDIENCE,
+            now_ms=int(time.time() * 1000),
+        )
+    except Exception as exc:
+        raise _codex_unavailable(
+            event, profile_home, f"single-actor spend receipt failed: {exc}"
+        ) from exc
+    event.trusted_single_actor_spend_receipt = receipt
+    usage = dict(getattr(event, "_trusted_codex_usage", None) or {})
+    usage.update(
+        {
+            "api_calls": proxy_audit["request_count"],
+            "input_tokens": proxy_audit.get("input_tokens", 0),
+            "output_tokens": proxy_audit.get("output_tokens", 0),
+            "total_tokens": proxy_audit.get("total_tokens", 0),
+            "cache_read_tokens": proxy_audit.get("cache_read_tokens", 0),
+            "cache_write_tokens": 0,
+        }
+    )
+    _write_token_ledger_from_child(
+        event, profile_home, usage, verified_codex=True
+    )
+
+
+def _codex_budget_exhausted_notice(event: Any) -> str:
+    """Tell the employee the turn stopped on budget, not on a broken harness."""
+    from . import codex_provider_proxy
+
+    if not _codex_budget_exhausted(event):
+        return ""
+    return (
+        f"本轮已用满 {codex_provider_proxy.MAX_HARNESS_REQUESTS} 次模型调用，"
+        "请缩小问题或继续追问"
+    )
+
+
+def _append_codex_budget_notice(event: Any, buffered: list) -> None:
+    """Attach the notice WITHOUT eating stream_run_agent's done-only fallback.
+
+    ``stream_run_agent`` only surfaces the child's ``done`` text when no content
+    event arrived (``_core.py`` "if final_text and not content_text.strip()").
+    A blind ``content`` append makes that test false and swallows the whole
+    answer — exactly the lost-output bug this slug exists to fix. So: append to
+    the visible content when there is some, otherwise ride on the ``done`` text,
+    otherwise BE the terminal output. A budget stop always ends the turn.
+    """
+    notice = _codex_budget_exhausted_notice(event)
+    if not notice:
+        return
+    visible = _strip_empty_message_protocol_placeholder(
+        "".join(str(payload or "") for kind, payload in buffered if kind == "content")
+    )
+    if visible.strip():
+        buffered.append(("content", "\n\n" + notice))
+        return
+    for index in range(len(buffered) - 1, -1, -1):
+        if buffered[index][0] == "done":
+            done_text = str(buffered[index][1] or "")
+            buffered[index] = (
+                "done",
+                (done_text.rstrip() + "\n\n" + notice) if done_text.strip() else notice,
+            )
+            return
+    # Neither content nor done (tool/thinking events only, or a child that died
+    # on the 409 before its done): a budget stop must STILL end the turn. Saying
+    # nothing lets stream_run_agent fall through to the legacy ``_stream_loop``
+    # replay — a second, unmetered model run outside the spent proxy that can
+    # repeat write-capable tools. The notice is the terminal output.
+    buffered.append(("content", notice))
+
+
+async def _verified_codex_stream(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+):
+    """Buffer mapped output until the exact-key receipt passes; pass others through."""
+    from . import executor_map
+
+    mapped = (
+        executor_map.runtime_for_event(event, profile_home)
+        == executor_map.CODEX_APP_SERVER
+    )
+    from .harness_webui_runtime import (
+        plan_event_thread,
+        record_event_thread,
+        require_event_admission,
+        resolve_event_flow,
+    )
+
+    local_admission = require_event_admission(event, profile_home)
+    local_harness = local_admission is not None
+    session_store = None
+    thread_plan = None
+    if local_harness:
+        session_store, thread_plan = plan_event_thread(event, profile_home)
+        event._harness_resume_thread_id = thread_plan.resume_thread_id
+        from .harness_workflow import HarnessWorkflowStore
+
+        workflow_store = HarnessWorkflowStore(profile_home / "harness-runtime.db")
+        try:
+            flow = resolve_event_flow(event, profile_home)
+            workflow_store.start(
+                event.trusted_runtime_principal,
+                local_admission.workflow_id,
+                thread_plan.resume_thread_id or f"pending:{local_admission.workflow_id}",
+                flow,
+            )
+        finally:
+            workflow_store.close()
+    stream = (
+        _pkg._stream_aiagent_subprocess(event, profile_home, messages=messages)
+        if messages is not None
+        else _pkg._stream_aiagent_subprocess(event, profile_home)
+    )
+    if not mapped:
+        async for item in stream:
+            yield item
+        return
+    from . import codex_event_heartbeat
+
+    if local_harness:
+        try:
+            buffered: list[tuple[str, Any]] = []
+            control_events = {
+                "approval_required", "approval_resolved",
+                "gate_required", "gate_resolved",
+                "workflow_stage", "auth_required", "auth_resolved",
+                "clarify_required", "clarify_resolved",
+                "authorization_required", "authorization_resolved",
+            }
+            # A run whose budget dies BEFORE it emits any text reaches us as a
+            # terminal exception (the child's 409 becomes done.error, which
+            # streaming.py raises), skipping the receipt gate and the notice
+            # entirely — the employee still gets "Harness is unavailable" and
+            # the whole turn's output is thrown away (prod 2026-09-03). Hold the
+            # exception until the proxy teardown has published its audit, then
+            # drop it ONLY for a strictly validated clean budget stop.
+            terminal_error: Optional[BaseException] = None
+            try:
+                async for kind, payload in codex_event_heartbeat.wrap_with_heartbeat(
+                    stream, interval_ms=codex_event_heartbeat.DEFAULT_INTERVAL_MS
+                ):
+                    if kind == codex_event_heartbeat.HEARTBEAT_KIND:
+                        yield kind, payload
+                        continue
+                    if kind == "harness_thread_bound":
+                        thread_id = str(
+                            payload.get("thread_id") if isinstance(payload, dict) else ""
+                        ).strip()
+                        record_event_thread(session_store, thread_plan, thread_id)
+                        workflow_store = HarnessWorkflowStore(profile_home / "harness-runtime.db")
+                        try:
+                            workflow_store.start(
+                                event.trusted_runtime_principal,
+                                local_admission.workflow_id,
+                                thread_id,
+                                flow,
+                            )
+                        finally:
+                            workflow_store.close()
+                        continue
+                    if kind in control_events:
+                        yield kind, payload
+                        continue
+                    buffered.append((kind, payload))
+            except Exception as exc:
+                terminal_error = exc
+            if terminal_error is not None:
+                if not _codex_budget_exhausted(event):
+                    raise terminal_error
+                logger.info(
+                    "[multitenancy] mapped Codex terminal error absorbed as a budget "
+                    "stop: %s",
+                    terminal_error,
+                )
+            await _complete_codex_spend_receipt(event, profile_home)
+            _append_codex_budget_notice(event, buffered)
+        finally:
+            if hasattr(event, "_harness_resume_thread_id"):
+                delattr(event, "_harness_resume_thread_id")
+            if session_store is not None:
+                session_store.close()
+        for item in buffered:
+            yield item
+        return
+
+    try:
+        buffered: list[tuple[str, Any]] = []
+        async for kind, payload in codex_event_heartbeat.wrap_with_heartbeat(
+            stream, interval_ms=codex_event_heartbeat.DEFAULT_INTERVAL_MS
+        ):
+            if kind == codex_event_heartbeat.HEARTBEAT_KIND:
+                # Zero-model status ping (t02): bypass the buffer-then-release
+                # gate below -- it carries no content/spend implications, so
+                # it does not wait on the spend receipt like real output does.
+                yield kind, payload
+                continue
+            buffered.append((kind, payload))
+        await _complete_codex_spend_receipt(event, profile_home)
+        commit_state = getattr(event, "_trusted_codex_state_commit", None)
+        if callable(commit_state):
+            await asyncio.to_thread(commit_state)
+    finally:
+        if hasattr(event, "_trusted_codex_state_commit"):
+            delattr(event, "_trusted_codex_state_commit")
+    for item in buffered:
+        yield item
+
+
+def _bind_codex_run_workspace(event: Any, profile_home: Path) -> Optional[Any]:
+    """Point a codex run's cwd at its clone BEFORE the child payload is built.
+
+    ``TERMINAL_CWD`` alone is not enough: the child re-derives it from
+    ``raw_event["workspace"]`` (``run.py``), overwriting whatever the env scope
+    set. Setting the event field is the one point where both layers agree, and it
+    only works before ``_event_to_subprocess_payload`` snapshots the event
+    (PLAN C6).
+    """
+    workspace = _codex_run_workspace_for_event(event, profile_home)
+    if workspace is None:
+        return None
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        root = Path(profile_home).expanduser() / "workspace"
+        try:
+            relative = workspace.repo_dir.relative_to(root).as_posix()
+            # 默认工作区: repo_dir 就是 <profile>/workspace 根, relative_to 给 "." —
+            # 下游 resolve_profile_workspace 把 "." 当穿越拒掉 (prod 2026-09-02
+            # "Harness is unavailable"), 所以根工作区一律写 None.
+            raw_event["workspace"] = None if relative == "." else relative
+        except ValueError as exc:  # pragma: no cover - prepare() builds it under root
+            raise _codex_unavailable(
+                event, profile_home, f"run workspace escaped the profile: {exc}"
+            ) from exc
+    return workspace
+
+
+def _codex_runtime_env(
+    event: Any,
+    profile_home: Path,
+    workspace: Any,
+    runtime_key: str,
+    proxy_base_url: str,
+) -> dict[str, str]:
+    """Child-env additions for a codex-mapped run. Fails closed, never degrades."""
+    from . import codex_home, executor_map, run_workspace
+    from .harness_webui_runtime import require_event_admission, resolve_event_flow
+
+    local_admission = require_event_admission(event, profile_home)
+    if not runtime_key or not proxy_base_url:
+        raise _codex_unavailable(
+            event,
+            profile_home,
+            "no run-scoped Codex provider proxy credential",
+        )
+    expert_id = _expert_id_for_event(event)
+    plugin_dir = _codex_expert_plugin_dir(profile_home, expert_id)
+    if plugin_dir is None:
+        # Not a nicety: codex with no plugin boots as a generic assistant and
+        # answers plausibly, which is indistinguishable from a healthy run.
+        raise _codex_unavailable(
+            event,
+            profile_home,
+            f"expert {expert_id or '<none>'} has no managed plugin repo to load "
+            "into CODEX_HOME",
+        )
+    try:
+        model, _upstream_base_url = _codex_model_and_base_url(event, profile_home)
+        from ..plugin_script_policy import PLUGIN_SCRIPT_RUNTIME_GUIDANCE
+
+        # Resolve the trusted role first: universal guidance must not turn a
+        # missing expert identity into a non-empty, runnable prompt.
+        role_block = _broker_role_override_block_for_event(event, expert_id)
+        if not role_block:
+            raise ExpertUnavailableError()
+        developer_instructions = f"{role_block}\n\n{PLUGIN_SCRIPT_RUNTIME_GUIDANCE}"
+        plugin_source = plugin_dir.resolve(strict=True)
+        codex_home_dir = codex_home.materialize(
+            workspace.root,
+            base_url=proxy_base_url,
+            model=model,
+            plugin_dir=plugin_dir,
+            env_key=CODEX_RUNTIME_KEY_ENV,
+            developer_instructions=developer_instructions,
+        )
+    except executor_map.ExecutorUnavailable:
+        raise
+    except ExpertUnavailableError:
+        raise
+    except Exception as exc:
+        raise _codex_unavailable(
+            event, profile_home, f"CODEX_HOME could not be materialized: {exc}"
+        ) from exc
+
+    env = dict(run_workspace.env_for(workspace))
+    env.update(
+        {
+            "CODEX_HOME": str(codex_home_dir),
+            EXECUTOR_RUNTIME_ENV: executor_map.CODEX_APP_SERVER,
+            "HERMES_CODEX_HOST_TOOLS": "lark_cli",
+            "HERMES_CODEX_PLUGIN_SOURCE": str(plugin_source),
+            CODEX_RUNTIME_KEY_ENV: runtime_key,
+            CODEX_PROXY_BASE_URL_ENV: proxy_base_url,
+            "TERMINAL_CWD": str(workspace.repo_dir),
+            "_HERMES_FORCE_TERMINAL_CWD": str(workspace.repo_dir),
+        }
+    )
+    if local_admission is not None:
+        harness_home = workspace.root / "home"
+        harness_home.mkdir(exist_ok=True, mode=0o700)
+        os.chmod(harness_home, 0o700)
+        env.update(
+            {
+                "HOME": str(harness_home),
+                "_HERMES_FORCE_HOME": str(harness_home),
+                "HERMES_CODEX_BIN": str(local_admission.codex_bin),
+                "HERMES_LOCAL_HARNESS": "1",
+                "HERMES_HARNESS_WORKFLOW_ID": local_admission.workflow_id,
+                "HERMES_TERMINAL_SECURITY_MODE": "approval-required",
+                "HERMES_HARNESS_FLOW": resolve_event_flow(event, profile_home),
+                run_workspace.WORKSPACE_DIR_ENV: str(workspace.repo_dir),
+            }
+        )
+        resume_thread_id = str(
+            getattr(event, "_harness_resume_thread_id", "") or ""
+        ).strip()
+        if resume_thread_id:
+            env["HERMES_CODEX_RESUME_THREAD_ID"] = resume_thread_id
+    # The per-run KEP anchors must also beat the profile-level ones on the
+    # terminal/execute_code second scrub, which reads the _HERMES_FORCE_ mirror
+    # written by `_profile_anchor_env_layers_for_aiagent` — without this the
+    # model's own `echo $KEP_SPEC_HUB_DIR` would print the profile default.
+    # The key is deliberately NOT mirrored: codex reads it from its own spawn
+    # env, and the force channel exists to reach model-authored shell.
+    env.update(
+        _force_env_for_terminal_passthrough(
+            {
+                name: env[name]
+                for name in (
+                    run_workspace.SPEC_HUB_DIR_ENV,
+                    run_workspace.WORKSPACE_DIR_ENV,
+                )
+                if name in env
+            }
+        )
+    )
+    logger.info(
+        "[multitenancy] codex runtime env profile=%s expert=%s workflow=%s cwd=%s",
+        profile_home.name,
+        expert_id or "-",
+        workspace.root.name,
+        workspace.repo_dir,
+    )
+    return env
+
+
+@contextmanager
+def _aiagent_subprocess_env_scope(
+    event: Any,
+    profile_home: Path,
+    *,
+    approval_dir: Path,
+    event_stream: bool = False,
+    extra: Optional[dict[str, str]] = None,
+    codex_workspace: Any = None,
+) -> Iterator[dict[str, str]]:
+    """Build child env while keeping per-run broker lifetime scoped to spawn."""
+    raw_event = getattr(event, "raw_event", {})
+    workspace = raw_event.get("workspace") if isinstance(raw_event, dict) else None
+    _normalized_workspace, run_cwd = resolve_profile_workspace(profile_home, workspace)
+    from ..webui_broker_server import (
+        credential_broker_url,
+        register_credential_broker_token,
+        register_run_broker_scoped_token,
+        register_session_search_broker_token,
+        unregister_credential_broker_token,
+        unregister_run_broker_scoped_token,
+        unregister_session_search_broker_token,
+    )
+
+    trusted_identity = _trusted_feishu_runtime_identity(event)
+    sender_open_id = _resolve_subprocess_sender_open_id(event)
+    merged_extra = dict(extra or {})
+    from .harness_webui_runtime import require_event_admission
+
+    local_harness_admission = require_event_admission(event, profile_home)
+    local_harness = local_harness_admission is not None
+    if (
+        local_harness
+        and not sender_open_id
+        and local_harness_admission.actor_subject.startswith("ou_")
+    ):
+        sender_open_id = local_harness_admission.actor_subject
+    merged_extra["TERMINAL_CWD"] = str(run_cwd)
+    merged_extra["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
+    # Inline-authorization rendezvous: a directory this PARENT owns and creates,
+    # named from the run id alone, so the broker can derive the same path
+    # server-side and never has to trust a path the child sends up. Absent when
+    # the run has no authorization run id (Feishu / cron / untrusted), and the
+    # child then gets no bridge at all.
+    _authorization_run_id = str(
+        getattr(event, "trusted_authorization_run_id", "") or ""
+    ).strip()
+    if _authorization_run_id:
+        from ..webui_broker.periphery import _authorization_response_dir
+
+        _rendezvous = _authorization_response_dir(_authorization_run_id)
+        _rendezvous.mkdir(parents=True, exist_ok=True)
+        os.chmod(_rendezvous, 0o700)
+        merged_extra["HERMES_MULTITENANCY_AUTHORIZATION_DIR"] = str(_rendezvous)
+    merged_extra.update(_ingest_secret_env_from_event(event))
+    # Credential delegation, per run (NOT gated on strict context — the marker
+    # collision and the once-lease binding it fixes exist in every mode):
+    #   NONCE — names this run's auth-required marker file, so two concurrent
+    #           runs of the same group profile cannot steal each other's.
+    #   ID    — the grant this run replays; a once-lease only unlocks for it.
+    from ..credential_delegation import DELEGATION_ID_ENV, DELEGATION_NONCE_ENV
+
+    merged_extra.setdefault(DELEGATION_NONCE_ENV, secrets.token_urlsafe(16))
+    _delegation_id = _event_delegation_id(event)
+    if _delegation_id:
+        merged_extra.setdefault(DELEGATION_ID_ENV, _delegation_id)
+    from ..billing_identity import runtime_env_for_billing_metadata
+
+    billing_env = runtime_env_for_billing_metadata(_event_metadata(event))
+    if codex_workspace is None:
+        codex_workspace = _codex_run_workspace_for_event(event, profile_home)
+    codex_proxy_inputs: tuple[Any, str, str] | None = None
+    if codex_workspace is not None:
+        from ..billing_identity import RUNTIME_KEY_ENV, billing_endpoint_allowed
+        raw_key = str(billing_env.pop(RUNTIME_KEY_ENV, "") or "")
+        upstream_base_url = str(
+            billing_env.pop("HERMES_LITELLM_RUNTIME_BASE_URL", "") or ""
+        )
+        _model, configured_base_url = _codex_model_and_base_url(event, profile_home)
+        if not billing_endpoint_allowed(configured_base_url, upstream_base_url):
+            raise _codex_unavailable(
+                event,
+                profile_home,
+                "Billing-bound Codex run cannot use an unapproved LiteLLM endpoint",
+            )
+        billing_env.clear()
+        codex_proxy_inputs = (codex_workspace, upstream_base_url, raw_key)
+    elif codex_workspace is None:
+        # Native runs retain the established child-consumed billing credential.
+        merged_extra.update(billing_env)
+    else:
+        billing_env.clear()
+    if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
+        merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
+    trusted_tool_scope = ""
+    trusted_chat_type = ""
+    trusted_chat_id = ""
+    if trusted_identity is not None:
+        trusted_actor, _trusted_credential, trusted_tool_scope = trusted_identity
+        merged_extra["HERMES_TRUSTED_FEISHU_ACTOR"] = trusted_actor
+        metadata = _event_metadata(event)
+        trusted_chat_type = str(metadata.get("trusted_chat_type") or "").strip()
+        trusted_chat_id = str(metadata.get("trusted_chat_id") or "").strip()
+        if trusted_tool_scope and trusted_chat_type and trusted_chat_id:
+            merged_extra.update(
+                {
+                    "HERMES_TRUSTED_FEISHU_TOOL_SCOPE": trusted_tool_scope,
+                    "HERMES_TRUSTED_FEISHU_CHAT_TYPE": trusted_chat_type,
+                    "HERMES_TRUSTED_FEISHU_CHAT_FENCE": hashlib.sha256(
+                        trusted_chat_id.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+    share_context = _agent_share_context_from_event(event)
+    share_role = str(share_context.get("share_role") or "").strip()
+    shared_agent_run = share_role in _AGENT_SHARED_ROLES
+    share_actor_open_id = str(share_context.get("actor_open_id") or "").strip()
+    share_agent_id = str(share_context.get("agent_id") or "").strip()
+    if shared_agent_run:
+        if share_actor_open_id:
+            sender_open_id = share_actor_open_id
+            merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = share_actor_open_id
+            merged_extra["HERMES_AGENT_ACTOR_OPEN_ID"] = share_actor_open_id
+        if share_agent_id:
+            merged_extra["HERMES_AGENT_ID"] = share_agent_id
+        merged_extra["HERMES_AGENT_SHARE_ROLE"] = share_role
+    broker_token = ""
+    run_broker_scoped_token = ""
+    session_search_token = secrets.token_urlsafe(32)
+    session_search_run_id = secrets.token_urlsafe(24)
+    if strict_context_enabled():
+        scoped_open_id = str(
+            merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
+            or sender_open_id
+            or (
+                ""
+                if shared_agent_run or local_harness
+                else _profile_owner_open_id(profile_home)
+            )
+        ).strip()
+        if scoped_open_id:
+            run_id = secrets.token_urlsafe(24)
+            broker_token = secrets.token_urlsafe(32)
+            session_search_run_id = run_id
+            merged_extra.update(
+                {
+                    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": broker_token,
+                    "HERMES_MULTITENANCY_CRED_BROKER_URL": credential_broker_url(),
+                    "HERMES_MULTITENANCY_CRED_LEASE": mint_lease(
+                        profile_name=profile_home.name,
+                        open_id=scoped_open_id,
+                        run_id=run_id,
+                        secret=lease_signing_secret(),
+                    ),
+                    "HERMES_MULTITENANCY_RUN_ID": run_id,
+                }
+            )
+            register_credential_broker_token(
+                token=broker_token,
+                profile_name=profile_home.name,
+                open_id=scoped_open_id,
+                run_id=run_id,
+                agent_id=share_agent_id if shared_agent_run else "",
+                share_role=share_role if shared_agent_run else "",
+            )
+    scoped_open_id_for_search = str(
+        merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
+        or sender_open_id
+        or (
+            ""
+            if shared_agent_run or local_harness
+            else _profile_owner_open_id(profile_home)
+        )
+        or ""
+    ).strip()
+    merged_extra.update(
+        {
+            "HERMES_MULTITENANCY_SESSION_SEARCH_URL": credential_broker_url(),
+            "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN": session_search_token,
+        }
+    )
+    register_session_search_broker_token(
+        token=session_search_token,
+        profile_name=profile_home.name,
+        open_id=scoped_open_id_for_search,
+        run_id=session_search_run_id,
+        agent_id=share_agent_id if shared_agent_run else "",
+        share_role=share_role if shared_agent_run else "",
+    )
+    # RunBroker bearer for the child's native cronjob(action=run) tool. Minted
+    # OUTSIDE the strict-context branch on purpose: `_build_subprocess_env` now
+    # drops the master key unconditionally, so a non-strict deployment would
+    # otherwise lose cron triggering entirely. No resolvable owner → no token at
+    # all (fail-closed) rather than a shared credential.
+    if scoped_open_id_for_search:
+        run_broker_scoped_token = secrets.token_urlsafe(32)
+        merged_extra.update(
+            {
+                "HERMES_RUN_BROKER_URL": credential_broker_url(),
+                "HERMES_MULTITENANCY_RUN_BROKER_URL": credential_broker_url(),
+                "HERMES_RUN_BROKER_KEY": run_broker_scoped_token,
+                "HERMES_MULTITENANCY_RUN_BROKER_KEY": run_broker_scoped_token,
+            }
+        )
+        register_run_broker_scoped_token(
+            token=run_broker_scoped_token,
+            profile_name=profile_home.name,
+            open_id=scoped_open_id_for_search,
+            run_id=session_search_run_id,
+            agent_id=share_agent_id if shared_agent_run else "",
+            share_role=share_role if shared_agent_run else "",
+            workflow_id=(
+                local_harness_admission.workflow_id
+                if local_harness_admission is not None
+                else ""
+            ),
+        )
+    lark_actor = str(
+        merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id
+    ).strip()
+    lark_scope = (
+        nullcontext({})
+        if local_harness and not lark_actor.startswith("ou_")
+        else _lark_cli_auth_broker_scope(
+            profile_home,
+            lark_actor,
+            **(
+                {
+                    "tool_scope": trusted_tool_scope,
+                    "chat_type": trusted_chat_type,
+                    "chat_id": trusted_chat_id,
+                }
+                if trusted_tool_scope
+                else {}
+            ),
+        )
+    )
+    with lark_scope as lark_cli_env:
+        codex_proxy = None
+        try:
+            if codex_proxy_inputs is not None:
+                from . import codex_provider_proxy
+
+                codex_workspace, upstream_base_url, raw_key = codex_proxy_inputs
+                proxy_request_limit = (
+                    codex_provider_proxy.MAX_HARNESS_REQUESTS if local_harness else 1
+                )
+                codex_proxy = codex_provider_proxy.start(
+                    upstream_base_url=upstream_base_url,
+                    upstream_api_key=raw_key,
+                    max_requests=proxy_request_limit,
+                )
+                event._trusted_codex_proxy_request_limit = proxy_request_limit
+                merged_extra.update(
+                    _codex_runtime_env(
+                        event,
+                        profile_home,
+                        codex_workspace,
+                        codex_proxy.token,
+                        codex_proxy.base_url,
+                    )
+                )
+            merged_extra.update(lark_cli_env)
+            yield _build_subprocess_env(
+                profile_home,
+                approval_dir=approval_dir,
+                event_stream=event_stream,
+                extra=merged_extra,
+            )
+        finally:
+            if codex_proxy is not None:
+                codex_proxy.close()
+                event._trusted_codex_proxy_audit = codex_proxy.audit.snapshot()
+            if broker_token:
+                unregister_credential_broker_token(broker_token)
+            if run_broker_scoped_token:
+                unregister_run_broker_scoped_token(run_broker_scoped_token)
+            unregister_session_search_broker_token(session_search_token)
+
+
+async def _exit_aiagent_subprocess_env_scope(
+    env_scope: Any,
+    exc_info: tuple[Any, Any, Any],
+) -> None:
+    """Revoke run-scoped brokers/proxy without blocking the gateway loop."""
+    await asyncio.to_thread(env_scope.__exit__, *exc_info)
+
+
+def _profile_env_for_aiagent(
+    profile_home: Path,
+    *,
+    include_profile_secrets: bool = True,
+) -> dict[str, str]:
+    """Load profile-local env for the AIAgent process before sandboxing.
+
+    The bwrap policy masks ``.env`` and ``auth.json`` from tool-visible file
+    paths, so credentials needed by the provider/tool clients must be injected
+    into the AIAgent process environment instead. Terminal/code subprocesses
+    apply their own secret-name env filter before running model-generated code.
+    """
+    loaded: dict[str, str] = {}
+    profile_env = profile_home / ".env"
+    shared_env = _resolve_shared_hermes_home(profile_home) / ".env"
+    try:
+        if shared_env.exists():
+            loaded.update(_dotenv_values_for_aiagent(shared_env, allowed_keys=_SHARED_AIAGENT_ENV_ALLOWLIST))
+        if not include_profile_secrets:
+            return loaded
+
+        profile_allowed_keys: Optional[frozenset[str]] = None
+        try:
+            if (
+                profile_env != shared_env
+                and profile_env.exists()
+                and shared_env.exists()
+                and profile_env.resolve() == shared_env.resolve()
+            ):
+                profile_allowed_keys = _SHARED_AIAGENT_ENV_ALLOWLIST
+        except OSError:
+            pass
+        loaded.update(_dotenv_values_for_aiagent(profile_env, allowed_keys=profile_allowed_keys))
+    except Exception:
+        logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
+
+    try:
+        from ..provider_adapter import provider_env_for_aiagent
+
+        for key, value in provider_env_for_aiagent(profile_home, existing_env=loaded).items():
+            if key not in loaded:
+                loaded[key] = value
+    except Exception:
+        logger.debug("[multitenancy] failed to load provider adapter env for subprocess", exc_info=True)
+
+    try:
+        # Use the MERGED+normalized config (not profile-local only): provider may be
+        # inherited from shared config, and _load_profile_config self-heals a bare
+        # default so _split_model_spec below can never raise on it.
+        config = _load_profile_config(profile_home)
+        primary = ((config.get("model") or {}).get("default") or "").strip()
+        provider = _split_model_spec(primary)[0] if primary else ""
+        if provider:
+            env_names = _PROVIDER_ENV_KEYS.get(provider, ())
+            if env_names and not any(loaded.get(name) for name in env_names):
+                auth = _load_json(profile_home / "auth.json")
+                pool = auth.get("credential_pool", {}).get(provider)
+                if isinstance(pool, list):
+                    for cred in pool:
+                        if not isinstance(cred, dict):
+                            continue
+                        if cred.get("last_status") == "exhausted":
+                            continue
+                        token = cred.get("access_token")
+                        if token:
+                            loaded[env_names[0]] = str(token)
+                            break
+    except Exception:
+        logger.debug("[multitenancy] failed to load profile auth env for subprocess", exc_info=True)
+
+    for name in _BILLING_CONTROL_ENV_NAMES:
+        loaded.pop(name, None)
+    return loaded
+
+
+def _credential_env_for_aiagent(
+    profile_home: Path, *, provider: str = ""
+) -> dict[str, str]:
+    """Load configured profile credential env vars from the multitenancy vault.
+
+    ``credential-materialization.yaml`` can expose a credential as a file for
+    legacy tools and as an env var for skills that already expect conventional
+    names such as ``GITLAB_TOKEN``. The secret enters only the routed AIAgent
+    process; terminal/code subprocesses still require explicit passthrough
+    registration in the child runtime.
+    """
+    loaded: dict[str, str] = {}
+    gitlab_env_names: set[str] = set()
+    wanted_provider = str(provider or "").strip().lower()
+    try:
+        from ..credential_materializer import (
+            _payload_content,
+            _resolve_config_path,
+            _target_profiles,
+            git_auth_env,
+            git_identity_env,
+            resolve_runtime_secret,
+        )
+        from ..credentials import CredentialStore
+
+        # Commit identity is not a credential, but it rides the same env-only
+        # config channel (GIT_CONFIG_*) that git_auth_env extends below, so it
+        # must be seeded FIRST in this same dict — a separate producer would
+        # collide on GIT_CONFIG_COUNT/KEY_0 at merge time. Seeded before any
+        # early return so a profile with no credential config can still
+        # `git commit` (2026-08-26: agent stalled mid-commit asking the user
+        # for user.name/user.email the pivoted HOME never had).
+        loaded.update(git_identity_env(loaded, profile=profile_home.name))
+
+        shared_home = _resolve_shared_hermes_home(profile_home)
+        config = _resolve_config_path(shared_home, None)
+        if config is None:
+            return loaded
+        import yaml
+
+        raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+        entries = raw.get("credentials") or []
+        if not isinstance(entries, list):
+            return loaded
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_provider = str(entry.get("provider") or "").strip().lower()
+                if wanted_provider and entry_provider != wanted_provider:
+                    continue
+                env_name = str(entry.get("env") or entry.get("env_name") or "").strip()
+                if not env_name:
+                    continue
+                if not _CREDENTIAL_ENV_NAME_RE.match(env_name):
+                    logger.warning(
+                        "[multitenancy] skipped invalid credential env name %r",
+                        env_name,
+                    )
+                    continue
+                if profile_home.name not in _target_profiles(entry, shared_home=shared_home):
+                    continue
+                payload, _vault_profile = resolve_runtime_secret(
+                    store, entry, profile_name=profile_home.name
+                )
+                if payload is None:
+                    continue
+                loaded[env_name] = _payload_content(payload, entry.get("payload_key")).rstrip("\n")
+                if entry_provider == "gitlab":
+                    gitlab_env_names.add(env_name)
+                # Non-secret companion vars (e.g. GITLAB_HOST) that a CLI needs
+                # alongside the token. Injected only once the credential itself
+                # resolved, so a profile never carries half a connector's env.
+                extra = entry.get("env_extra")
+                if isinstance(extra, dict):
+                    for extra_name, extra_value in extra.items():
+                        extra_name = str(extra_name).strip()
+                        if _CREDENTIAL_ENV_NAME_RE.match(extra_name):
+                            loaded[extra_name] = str(extra_value)
+                        else:
+                            logger.warning(
+                                "[multitenancy] skipped invalid env_extra name %r", extra_name
+                            )
+        finally:
+            store.close()
+        # A GitLab token in the env drives `glab`, but bare `git` reads neither
+        # GITLAB_TOKEN nor GITLAB_HOST. The same helper serves the delegation
+        # producer (credential_delegation.owner_gitlab_env), so both lanes get
+        # identical git auth from one place.
+        # Canonical name first: with two gitlab entries git asks the helpers in
+        # config order and takes the first answer, so a legacy alias that merely
+        # sorts earlier must not outrank GITLAB_TOKEN.
+        for name in sorted(gitlab_env_names, key=lambda n: (n != "GITLAB_TOKEN", n)):
+            loaded.update(git_auth_env(loaded, token_env_name=name))
+    except Exception:
+        logger.debug("[multitenancy] failed to load credential env for subprocess", exc_info=True)
+    return loaded
+
+
+def _gitlab_credential_env_names_for_aiagent(profile_home: Path) -> frozenset[str]:
+    """Every env name produced by the profile's GitLab vault entry."""
+    env = _credential_env_for_aiagent(profile_home, provider="gitlab")
+    return frozenset(env) | frozenset(_force_env_for_terminal_passthrough(env))
+
+
+def _gitlab_runtime_env_names_for_aiagent(
+    profile_home: Path, environ: Mapping[str, str]
+) -> frozenset[str]:
+    """Every GitLab credential name that must stay out of mapped Codex."""
+    names = set(_gitlab_credential_env_names_for_aiagent(profile_home))
+    try:
+        from ..credential_delegation import gitlab_env_name
+
+        names.add(gitlab_env_name(_resolve_shared_hermes_home(profile_home)))
+    except Exception:
+        pass
+    names.update({"GITLAB_TOKEN", "GITLAB_HOST", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT"})
+    names.update(
+        name
+        for name in environ
+        if re.fullmatch(r"GIT_CONFIG_(?:KEY|VALUE)_\d+", str(name))
+    )
+    names.update(
+        f"_HERMES_FORCE_{name}"
+        for name in tuple(names)
+        if name and not name.startswith("_HERMES_FORCE_")
+    )
+    return frozenset(name for name in names if name)
+
+
+def _force_env_for_terminal_passthrough(env: dict[str, str]) -> dict[str, str]:
+    """Mirror credential env through Hermes' subprocess force-prefix channel.
+
+    Terminal/code tools apply a second secret-name scrub before spawning model
+    generated commands.  The force-prefix is consumed by Hermes' local
+    environment builder and emitted only as the real key name in the child
+    process, so the `_HERMES_FORCE_*` plumbing variable is not visible to the
+    shell command.
+    """
+    return {f"_HERMES_FORCE_{key}": value for key, value in env.items()}
+
+
+def _profile_anchor_env_layers_for_aiagent(
+    profile_home: Path,
+    *,
+    short_parent_tmp: Optional[bool] = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    child_anchors = _profile_anchor_env_for_aiagent(profile_home)
+    parent_anchors = dict(child_anchors)
+    if short_parent_tmp is None:
+        short_parent_tmp = (
+            sys.platform.startswith("linux")
+            and os.environ.get("HERMES_SANDBOX_HOST") == "1"
+        )
+    if short_parent_tmp:
+        parent_anchors["TMPDIR"] = "/tmp"
+    return parent_anchors, _force_env_for_terminal_passthrough(child_anchors)
+
+
+def _forced_profile_anchor_env_from(source_env: Mapping[str, str]) -> dict[str, str]:
+    forced: dict[str, str] = {}
+    for key in _PROFILE_ANCHOR_ENV_KEYS:
+        value = str(source_env.get(f"_HERMES_FORCE_{key}") or "").strip()
+        if value:
+            forced[key] = value
+    return forced
+
+
+def _install_execute_code_profile_child_env_patch(profile_home: Path):
+    """Force non-secret profile anchors into execute_code's sandbox child env."""
+    global _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS
+
+    with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS > 0:
+            _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS += 1
+
+            def _cleanup_existing() -> None:
+                _release_execute_code_profile_child_env_patch()
+
+            return _cleanup_existing
+
+        try:
+            from tools import code_execution_tool
+            if not hasattr(code_execution_tool, "_scrub_child_env"):
+                from tools import code_execution_env as code_execution_tool
+
+            if not hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+                original_scrub = code_execution_tool._scrub_child_env
+
+                def _hermes_mt_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+                    try:
+                        child_env = original_scrub(
+                            source_env,
+                            is_passthrough=is_passthrough,
+                            is_windows=is_windows,
+                        )
+                    except TypeError:
+                        child_env = original_scrub(source_env)
+                    child_env.update(_forced_profile_anchor_env_from(source_env))
+                    return child_env
+
+                code_execution_tool._hermes_mt_original_scrub_child_env = original_scrub
+                code_execution_tool._scrub_child_env = _hermes_mt_scrub_child_env
+        except Exception:
+            logger.debug("[multitenancy] execute_code child env scrub patch skipped", exc_info=True)
+
+        try:
+            import hermes_constants as hermes_constants_mod
+
+            if not hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
+                original_get_home = hermes_constants_mod.get_subprocess_home
+
+                def _hermes_mt_get_subprocess_home(env=None):
+                    source_env = os.environ if env is None else env
+                    forced = _forced_profile_anchor_env_from(source_env)
+                    if forced.get("TERMINAL_HOME_MODE") == "profile" and forced.get("HOME"):
+                        return forced["HOME"]
+                    if env is None:
+                        return original_get_home()
+                    try:
+                        return original_get_home(env)
+                    except TypeError:
+                        return original_get_home()
+
+                hermes_constants_mod._hermes_mt_original_get_subprocess_home = original_get_home
+                hermes_constants_mod.get_subprocess_home = _hermes_mt_get_subprocess_home
+        except Exception:
+            logger.debug("[multitenancy] execute_code subprocess HOME patch skipped", exc_info=True)
+
+        _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 1
+
+    def _cleanup() -> None:
+        _release_execute_code_profile_child_env_patch()
+
+    return _cleanup
+
+
+def _release_execute_code_profile_child_env_patch() -> None:
+    global _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS
+
+    with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS <= 0:
+            return
+        _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS -= 1
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS > 0:
+            return
+
+        for module_name in ("tools.code_execution_tool", "tools.code_execution_env"):
+            code_execution_tool = sys.modules.get(module_name)
+            if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+                code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
+                delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
+
+        hermes_constants_mod = sys.modules.get("hermes_constants")
+        if hermes_constants_mod is not None and hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
+            hermes_constants_mod.get_subprocess_home = hermes_constants_mod._hermes_mt_original_get_subprocess_home
+            delattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home")
+
+
+_KEEP_LOGIN_COMPAT_AGENT_DIRS = (".claude", ".agents", ".codex", ".cursor", ".codeium")
+_KEEP_LOGIN_COMPAT_MARKER = "HERMES_KEEP_LOGIN_COMPAT_SHIM=v1"
+_KEEP_LOGIN_COMPAT_NOTE_MARKER = "Hermes Keep Auth Compatibility"
+_KEEP_LOGIN_COMPAT_NOTE = """## Hermes Keep Auth Compatibility
+
+This runtime is Hermes multitenancy. If this skill mentions keep-login-skill,
+get_bearer_token.py, or ~/.keep-login, treat those as legacy desktop hints.
+Use the current routed profile instead:
+
+```bash
+PROFILE_ARGS=()
+if [ -n "${KEP_PROFILE:-}" ]; then PROFILE_ARGS=(--profile "$KEP_PROFILE"); fi
+KEP_NO_AUTO_LOGIN=1 kep-auth "${PROFILE_ARGS[@]}" --env pre status
+KEP_NO_AUTO_LOGIN=1 kep-auth "${PROFILE_ARGS[@]}" --env online status
+```
+
+Do not judge Hermes login state by ~/.keep-login/token*.enc, do not remove
+--profile, do not copy another profile's token, and do not print token values.
+If a Bearer token is required for a subprocess, use kep-auth with the same
+profile and env, or the Hermes-managed legacy wrapper under HOME.
+"""
+
+
+def _keep_login_compat_wrapper_source() -> Path:
+    return Path(__file__).resolve().parent.parent / "compat" / "keep_login_get_bearer_token.py"
+
+
+def _install_keep_login_compat(profile_home: Path) -> None:
+    """Expose legacy keep-login-skill probe paths inside the routed HOME.
+
+    Some upstream Keep skills/scripts search common agent homes for
+    ``keep-login-skill/scripts/get_bearer_token.py``.  Hermes owns the runtime
+    boundary, so we provide those legacy paths as symlinks to one canonical
+    compatibility wrapper instead of patching each upstream package.
+    """
+    try:
+        home = profile_home.expanduser() / "home"
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        wrapper = _keep_login_compat_wrapper_source()
+        if not wrapper.is_file():
+            logger.warning("[multitenancy] keep-login compat wrapper missing at %s", wrapper)
+            return
+
+        marker_dir = home / ".keep-login"
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = marker_dir / "README-HERMES.txt"
+        marker_text = (
+            "Hermes compatibility note: this directory is not the credential source of truth.\n"
+            "Use kep-auth --profile \"$KEP_PROFILE\" --env <online|pre> status/token.\n"
+        )
+        if not marker.exists() or marker.read_text(encoding="utf-8", errors="ignore") != marker_text:
+            marker.write_text(marker_text, encoding="utf-8")
+            marker.chmod(0o600)
+
+        for agent_dir in _KEEP_LOGIN_COMPAT_AGENT_DIRS:
+            scripts_dir = home / agent_dir / "skills" / "keep-login-skill" / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target = scripts_dir / "get_bearer_token.py"
+            if target.is_symlink():
+                try:
+                    if target.resolve() == wrapper:
+                        continue
+                except OSError:
+                    pass
+                target.unlink()
+            elif target.exists():
+                try:
+                    existing = target.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    existing = ""
+                if _KEEP_LOGIN_COMPAT_MARKER not in existing:
+                    logger.warning(
+                        "[multitenancy] keep-login compat path exists and is not managed; leaving in place: %s",
+                        target,
+                    )
+                    continue
+                target.unlink()
+            target.symlink_to(wrapper)
+    except Exception:
+        logger.debug("[multitenancy] keep-login compatibility install skipped", exc_info=True)
+
+
+def _needs_keep_login_runtime_note(rendered: str, skill_dir: Any) -> bool:
+    haystack = f"{rendered}\n{skill_dir or ''}".lower()
+    return any(
+        needle in haystack
+        for needle in ("keep-login-skill", "get_bearer_token.py", ".keep-login")
+    )
+
+
+def _inject_keep_login_runtime_note(rendered: str, skill_dir: Any) -> str:
+    if _KEEP_LOGIN_COMPAT_NOTE_MARKER in rendered:
+        return rendered
+    if not _needs_keep_login_runtime_note(rendered, skill_dir):
+        return rendered
+    return f"{_KEEP_LOGIN_COMPAT_NOTE}\n\n{rendered}"
+
+
+def _run_level_gitlab_env_names(profile_home: Path) -> set[str]:
+    """Names of a RUN-level GitLab credential env this process actually carries.
+
+    A group profile borrows the initiator's token per run: the parent injects it
+    into this process env, but the group's own materialization config has no
+    entry for it, so the config-derived list below would leave it out — and
+    execute_code's scrub drops every unregistered ``GITLAB_TOKEN`` /
+    ``GIT_CONFIG_KEY_n`` (secret-substring ``TOKEN``/``KEY``) and the rest of the
+    GIT_* set (no safe prefix). The borrowed token then reaches the terminal
+    tool but not execute_code, i.e. `git clone` from a group agent stays
+    unauthenticated. Bounded on purpose: only the configured token name, its
+    host companion, and the keys this runtime itself renders.
+    """
+    try:
+        from ..credential_delegation import gitlab_env_name, is_delegatable_profile
+
+        # ONLY the borrow lane. A personal profile's token comes from its own
+        # materialization config (already registered below), so reading the
+        # ambient env there would widen the registration on evidence that is not
+        # this profile's — the group lane is the one whose token exists only as
+        # this run's injection.
+        if not is_delegatable_profile(profile_home.name):
+            return set()
+        shared_home = _resolve_shared_hermes_home(profile_home)
+        token_name = gitlab_env_name(shared_home)
+        if not token_name or not str(os.environ.get(token_name) or "").strip():
+            return set()
+        names = {token_name, "GITLAB_HOST", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT"}
+        try:
+            count = int(str(os.environ.get("GIT_CONFIG_COUNT") or "0").strip())
+        except (TypeError, ValueError):
+            count = 0
+        for index in range(max(0, min(count, 64))):  # bounded: a bogus count is not a licence
+            names.add(f"GIT_CONFIG_KEY_{index}")
+            names.add(f"GIT_CONFIG_VALUE_{index}")
+        # Only names this process actually carries — never widen speculatively.
+        return {name for name in names if name in os.environ}
+    except Exception:
+        logger.debug("[multitenancy] run-level gitlab env name probe failed", exc_info=True)
+        return set()
+
+
+def _install_credential_env_passthrough(profile_home: Path) -> None:
+    """Allow configured credential env vars through terminal/code sandboxes."""
+    env_names = sorted(
+        set(_credential_env_for_aiagent(profile_home))
+        | _run_level_gitlab_env_names(profile_home)
+    )
+    if not env_names:
+        return
+    try:
+        _register_env_passthrough_process_wide(env_names)
+        logger.info(
+            "[multitenancy] registered credential env passthrough profile=%s count=%d",
+            profile_home.name,
+            len(env_names),
+        )
+    except Exception:
+        logger.debug("[multitenancy] credential env passthrough skipped", exc_info=True)
+
+
+def _register_env_passthrough_process_wide(env_names: list[str]) -> None:
+    """Register env passthrough for current ContextVar and worker threads."""
+    if not env_names:
+        return
+    from tools import env_passthrough as env_passthrough_mod
+
+    env_passthrough_mod.register_env_passthrough(env_names)
+    _merge_process_wide_env_passthrough(env_passthrough_mod, env_names)
+
+
+def _passthrough_names_accepted_by_core(
+    env_passthrough_mod: Any, env_names: list[str]
+) -> set[str]:
+    """Names core's ``register_env_passthrough`` accepted; fails closed.
+
+    The process-wide cache must never be wider than the per-context registry,
+    which rejects Hermes provider credentials. Prefer core's own predicate,
+    then the post-registration context set; with neither, still drop every
+    model provider key/base-url name we know of.
+    """
+    is_provider_credential = getattr(
+        env_passthrough_mod, "_is_hermes_provider_credential", None
+    )
+    if callable(is_provider_credential):
+        return {name for name in env_names if not is_provider_credential(name)}
+    candidates = {name for name in env_names if name not in _MODEL_ENV_ALLOWLIST}
+    get_allowed = getattr(env_passthrough_mod, "_get_allowed", None)
+    if callable(get_allowed):
+        try:
+            allowed = set(get_allowed())
+        except Exception:
+            return set()
+        candidates &= allowed
+    return candidates
+
+
+def _merge_process_wide_env_passthrough(env_passthrough_mod: Any, env_names: list[str]) -> None:
+    """Extend Hermes' worker-thread fallback without changing its cache shape.
+
+    Hermes <=0.21.2 exposed a single ``frozenset`` here. Newer releases cache
+    one frozenset per HERMES_HOME. Replacing the newer dict with a frozenset
+    makes every terminal/execute_code spawn fail at ``.get(home_key)``.
+    """
+    # Hermes' passthrough registry is ContextVar-backed. Tool execution can hop
+    # into worker threads, where that context is not always inherited, so these
+    # broker-managed handle env vars also need a process-level allowlist entry.
+    config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
+    if isinstance(config_passthrough, dict):
+        # Official 0.21.3+ scopes this cache by Hermes home, including worker
+        # threads. Transitional builds (GitHub #19) may have the dict without
+        # hermes_home_key() or the config/credential helpers.
+        try:
+            from hermes_constants import hermes_home_key
+
+            home_key = hermes_home_key()
+        except ImportError:
+            from hermes_constants import get_hermes_home
+
+            home_key = os.path.normcase(
+                str(get_hermes_home().expanduser().resolve(strict=False))
+            )
+        except (RuntimeError, OSError):
+            home_key = ""
+        load_config = getattr(env_passthrough_mod, "_load_config_passthrough", None)
+        if callable(load_config):
+            merged = set(load_config())
+        else:
+            merged = set(config_passthrough.get(home_key) or ())
+        merged.update(_passthrough_names_accepted_by_core(env_passthrough_mod, env_names))
+        config_passthrough[home_key] = frozenset(merged)
+        return
+    merged = set(config_passthrough or ())
+    merged.update(env_names)
+    setattr(env_passthrough_mod, "_config_passthrough", frozenset(merged))
+
+
+def _install_ingest_secret_env_passthrough(env: Optional[Mapping[str, str]] = None) -> None:
+    """Allow per-run ingest secret handles through execute_code env scrubbing."""
+    source = os.environ if env is None else env
+    env_names = [
+        name
+        for name in (
+            "HERMES_INGEST_SECRET_DIR",
+            "HERMES_INGEST_SECRET_MANIFEST",
+        )
+        if str(source.get(name) or "").strip()
+    ]
+    if not env_names:
+        return
+    try:
+        _register_env_passthrough_process_wide(env_names)
+        logger.info(
+            "[multitenancy] registered ingest secret env passthrough count=%d",
+            len(env_names),
+        )
+    except Exception:
+        logger.debug("[multitenancy] ingest secret env passthrough skipped", exc_info=True)
+
+
+def _apply_runtime_env_for_aiagent(
+    profile_home: Path,
+    extra_env: Optional[dict[str, str]] = None,
+    *,
+    blocked_env_names: frozenset[str] = frozenset(),
+):
+    """Temporarily expose profile/credential env for in-process AIAgent runs."""
+    runtime_env = _profile_env_for_aiagent(profile_home)
+    profile_anchor_env, forced_profile_anchor_env = (
+        _profile_anchor_env_layers_for_aiagent(profile_home)
+    )
+    runtime_env.update(profile_anchor_env)
+    runtime_env.update(forced_profile_anchor_env)
+    try:
+        _register_env_passthrough_process_wide(sorted(profile_anchor_env))
+    except Exception:
+        logger.debug("[multitenancy] profile anchor env passthrough skipped", exc_info=True)
+    execute_code_child_env_cleanup = _install_execute_code_profile_child_env_patch(profile_home)
+    credential_env = _credential_env_for_aiagent(profile_home)
+    runtime_env.update(credential_env)
+    runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
+    runtime_env.update(_browser_env_for_aiagent(profile_home))
+    # Builder-owned worker controls never come from the profile-derived layers:
+    # a tenant-writable .env could flip STRICT back on (activating the dormant
+    # write regime _build_subprocess_env pinned off) or blank/redirect the audit
+    # sink back to /var/log, where bwrap events evaporate. The sealed values in
+    # os.environ stay authoritative; only an explicit extra_env may override.
+    for _builder_owned in (
+        "HERMES_MULTITENANCY_STRICT_CONTEXT",
+        "HERMES_MT_SECURITY_AUDIT_PATH",
+        "HERMES_MT_SECURITY_AUDIT_ENABLED",
+    ):
+        runtime_env.pop(_builder_owned, None)
+    runtime_env.update({str(k): str(v) for k, v in (extra_env or {}).items() if str(k).strip()})
+    for name in blocked_env_names:
+        runtime_env.pop(name, None)
+    if not runtime_env:
+        return lambda: None
+    old_env = {key: os.environ.get(key) for key in runtime_env}
+    os.environ.update(runtime_env)
+
+    def _cleanup() -> None:
+        execute_code_child_env_cleanup()
+        for key, old_value in old_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+    return _cleanup
+
+
+def _apply_vod_image_model_override_for_aiagent(user_text: str):
+    """Expose a one-run VOD image model override parsed from natural language."""
+    try:
+        from ..tencent_vod_image_gen import VOD_MODEL_OVERRIDE_ENV, detect_vod_model_override
+    except Exception:
+        return lambda: None
+
+    model = detect_vod_model_override(user_text)
+    if not model:
+        return lambda: None
+    old_value = os.environ.get(VOD_MODEL_OVERRIDE_ENV)
+    os.environ[VOD_MODEL_OVERRIDE_ENV] = model
+
+    def _cleanup() -> None:
+        if old_value is None:
+            os.environ.pop(VOD_MODEL_OVERRIDE_ENV, None)
+        else:
+            os.environ[VOD_MODEL_OVERRIDE_ENV] = old_value
+
+    return _cleanup
+
+
+def _sync_auxiliary_runtime_main_for_aiagent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key: Any,
+    api_mode: str | None = None,
+    request_overrides: Optional[dict[str, Any]] = None,
+    request_overrides_base_url: str | None = None,
+    enforce_credentials: bool = False,
+):
+    """Tell Hermes core auxiliary calls which live main model this run uses."""
+    try:
+        from agent import auxiliary_client
+    except Exception as exc:
+        if enforce_credentials:
+            raise RuntimeError("Hermes auxiliary billing runtime is unavailable") from exc
+        return lambda: None
+
+    set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
+    if callable(set_runtime_main):
+        try:
+            set_runtime_main(
+                provider,
+                model,
+                base_url=base_url or "",
+                api_key=api_key if isinstance(api_key, str) else "",
+                api_mode=api_mode or "",
+                request_overrides=request_overrides or {},
+                request_overrides_base_url=request_overrides_base_url or "",
+            )
+        except TypeError:
+            try:
+                set_runtime_main(provider, model)
+            except Exception:
+                logger.debug(
+                    "[multitenancy] auxiliary runtime main sync skipped",
+                    exc_info=True,
+                )
+        except Exception:
+            logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
+
+    billing_cleanup = lambda: None
+    if enforce_credentials:
+        from .billing_auxiliary import install_billing_auxiliary_runtime
+
+        try:
+            billing_cleanup = install_billing_auxiliary_runtime(
+                auxiliary_client,
+                model=model,
+                base_url=base_url or "",
+                api_key=api_key if isinstance(api_key, str) else "",
+                api_mode=api_mode or "",
+            )
+        except Exception:
+            clear = getattr(auxiliary_client, "clear_runtime_main", None)
+            if callable(clear):
+                clear()
+            raise
+
+    clear_runtime_main = getattr(auxiliary_client, "clear_runtime_main", None)
+
+    def _cleanup() -> None:
+        billing_cleanup()
+        if callable(clear_runtime_main):
+            clear_runtime_main()
+            return
+        if not callable(set_runtime_main):
+            return
+        try:
+            set_runtime_main("", "", base_url="", api_key="", api_mode="")
+        except TypeError:
+            try:
+                set_runtime_main("", "")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    return _cleanup
+
+
+def _register_aiagent_process_image_gen_providers() -> None:
+    """Register multitenancy image providers inside routed AIAgent children."""
+
+    class _ImageGenRegistryContext:
+        def register_image_gen_provider(self, provider: Any) -> None:
+            from agent.image_gen_registry import register_provider
+
+            register_provider(provider)
+
+    try:
+        from ..tencent_vod_image_gen import register_vod_image_gen_provider
+
+        registered = register_vod_image_gen_provider(_ImageGenRegistryContext())
+        if registered:
+            logger.info("[multitenancy] registered AIAgent image_gen provider: tencent-vod")
+    except Exception:
+        logger.debug("[multitenancy] AIAgent image_gen provider registration skipped", exc_info=True)
+
+
+def _install_skill_runtime_compat(profile_home: Path) -> None:
+    """Install profile-scoped skill template compatibility in the AIAgent child.
+
+    Some OpenClaw/ClawHub-style skills use ``{baseDir}`` to refer to the skill
+    root. Upstream hermes-agent uses ``${HERMES_SKILL_DIR}``. Keep this bridge
+    inside the multitenancy-routed runtime so shared skills and hermes-agent do
+    not need local compatibility patches.
+    """
+    try:
+        import agent.skill_preprocessing as skill_preprocessing
+    except Exception:
+        logger.debug("[multitenancy] skill runtime compat skipped", exc_info=True)
+        return
+
+    original = getattr(skill_preprocessing, "substitute_template_vars", None)
+    if not callable(original):
+        return
+    if getattr(original, "_hermes_multitenancy_base_dir_compat", False):
+        return
+
+    def _substitute_with_base_dir(content, skill_dir, session_id=None):
+        rendered = original(content, skill_dir, session_id)
+        if not isinstance(rendered, str):
+            return rendered
+        if "{baseDir}" in rendered and skill_dir:
+            rendered = rendered.replace("{baseDir}", str(Path(skill_dir).expanduser()))
+        return _inject_keep_login_runtime_note(rendered, skill_dir)
+
+    _substitute_with_base_dir._hermes_multitenancy_base_dir_compat = True
+    skill_preprocessing.substitute_template_vars = _substitute_with_base_dir
+
+    skill_commands = sys.modules.get("agent.skill_commands")
+    if skill_commands is not None and hasattr(skill_commands, "_substitute_template_vars"):
+        skill_commands._substitute_template_vars = _substitute_with_base_dir
+
+    logger.info(
+        "[multitenancy] installed skill runtime compatibility for profile=%s",
+        profile_home.name,
+    )
+
+
+def _dotenv_values_for_aiagent(
+    path: Path,
+    *,
+    allowed_keys: Optional[frozenset[str]] = None,
+) -> dict[str, str]:
+    """Read an env file for AIAgent-only injection with explicit secret filtering."""
+    values: dict[str, str] = {}
+    try:
+        from dotenv import dotenv_values
+        for key, value in dotenv_values(path).items():
+            if not key or value is None:
+                continue
+            key = str(key)
+            if key in _FEISHU_ENV_BLOCKLIST:
+                continue
+            if allowed_keys is not None and key not in allowed_keys:
+                continue
+            values[key] = str(value)
+    except Exception:
+        logger.debug("[multitenancy] failed to load env file for subprocess: %s", path, exc_info=True)
+    return values
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 档 B — sandbox-exec wrapper (kernel-level filesystem + network deny)
+# ─────────────────────────────────────────────────────────────────────────
+
+_SANDBOX_POLICY_FILE = Path(__file__).parent.parent / "sandbox" / "profile-default.sb"
+_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+# Linux backend — bubblewrap. Policy is a sibling file written one bwrap arg
+# per line, with ${KEY} placeholders substituted at runtime. Kept parallel to
+# the macOS .sb file rather than compiled from a shared DSL (see
+# sandbox-cross-platform-design.md §6 for the trade-off).
+_BWRAP_EXEC = "/usr/bin/bwrap"
+_BWRAP_ARGS_FILE = Path(__file__).parent.parent / "sandbox" / "bwrap-default.args"
+_SANDBOX_SKILL_IGNORED_DIRS = {".git", ".github", ".hub", ".archive", "__pycache__"}
+_SANDBOX_SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
+_SANDBOX_SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
+_SANDBOX_SKILL_SOURCE_FILE_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".rb",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".php",
+    ".pl",
+    ".lua",
+    ".md",
+    ".txt",
+)
+
+
+def _resolve_hermes_agent_repo() -> Path:
+    """Best-effort resolution of the hermes-agent source repo path.
+
+    Used to grant the sandboxed subprocess file-read* on the agent source
+    tree. Falls back to the venv's site-packages parent if not findable.
+    """
+    explicit = os.getenv("HERMES_AGENT_REPO")
+    if explicit:
+        return Path(explicit).expanduser()
+    # gateway typically runs with cwd == hermes-agent repo root (see plist
+    # WorkingDirectory). os.getcwd() is the most reliable signal when
+    # HERMES_AGENT_REPO is unset.
+    cwd = Path(os.getcwd()).resolve()
+    if (cwd / "hermes_cli").is_dir() or (cwd / "gateway").is_dir():
+        return cwd
+    # Fallback: walk up from sys.prefix (venv root → repo root)
+    venv_parent = Path(sys.prefix).parent
+    if (venv_parent / "hermes_cli").is_dir() or (venv_parent / "gateway").is_dir():
+        return venv_parent
+    return cwd  # Best guess; sandbox will deny if wrong, easy to spot.
+
+
+def _wrap_with_sandbox(
+    cmd: list[str],
+    profile_home: Path,
+    *,
+    local_harness: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> list[str]:
+    """Wrap ``cmd`` with ``sandbox-exec`` when ``HERMES_USE_SANDBOX=1``.
+
+    When the toggle is off (default for now), returns ``cmd`` unchanged so
+    docker-style isolation can be rolled out gradually. When on, builds
+    the parameterised invocation for ``hermes_multitenancy/sandbox/
+    profile-default.sb``.
+
+    Falls back to unsandboxed exec with a loud WARNING if the policy
+    file is missing — better to keep the bot working than to fail closed
+    in a way that masks the cause.
+
+    ``env`` is the exact environment the caller will spawn the wrapped command
+    with. The bwrap/sandbox-exec backends ignore it (their argv is unchanged);
+    the Linux desktop-container backend needs it to forward the worker env into
+    ``podman exec`` by name.
+    """
+    # Desktop-enabled profiles (multitenancy.desktop.enabled) run inside their
+    # own podman container on Linux. The container IS the sandbox, so it is
+    # decided before the HERMES_USE_SANDBOX gate: a profile that asked for a
+    # desktop never runs computer_use on the gateway host. Everything else
+    # below is byte-for-byte the pre-desktop behaviour.
+    if sys.platform.startswith("linux"):
+        desktop = _desktop_decision_for_profile(profile_home)
+        if desktop.enabled:
+            # argv only: a desktop profile must be SPAWNED via _sandbox_spawn,
+            # whose env is not the worker env.
+            return _wrap_linux_container(cmd, profile_home, desktop, env=env)[0]
+    # Per-profile gate. If HERMES_SANDBOX_PROFILES is set, the sandbox only
+    # wraps subprocesses for profiles named in that comma-separated list.
+    # Unset → all profiles are sandboxed (when the master toggle is on).
+    # This lets operators dial sandboxing up gradually:
+    #
+    #   HERMES_USE_SANDBOX=1 HERMES_SANDBOX_PROFILES=spike_test
+    #     → only spike_test routes get sandbox-exec; production profiles
+    #       (feishu_g41a5b5g etc.) continue unsandboxed during pilot.
+    #
+    #   HERMES_USE_SANDBOX=1
+    #     → every routed profile is sandboxed (final state after pilot).
+    allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
+    if not sandbox_profile_enabled(profile_home.name):
+        gated_out = os.environ.get("HERMES_USE_SANDBOX") == "1" and allowlist_raw
+        # The two platform backends already honour HERMES_MULTITENANCY_REQUIRE_SANDBOX
+        # for their own preflight failures; this gate was the last path that could
+        # still hand back a bare, unsandboxed command. An operator who asked for
+        # fail-closed gets it here too — including for a profile deliberately left
+        # out of the pilot allowlist, which is exactly the cross-tenant exposure
+        # the allowlist is meant to be retired from.
+        if require_sandbox_enabled():
+            reason = "profile_not_in_allowlist" if gated_out else "sandbox_toggle_off"
+            msg = (
+                f"[multitenancy] HERMES_MULTITENANCY_REQUIRE_SANDBOX is set but "
+                f"profile {profile_home.name} would run unsandboxed ({reason}) — "
+                f"refusing to spawn."
+            )
+            logger.error(msg)
+            append_security_event(event_type="sandbox.denied", reason=reason)
+            raise RuntimeError(msg)
+        if gated_out:
+            logger.debug(
+                "[multitenancy] sandbox gated: profile=%s not in HERMES_SANDBOX_PROFILES=%s",
+                profile_home.name, allowlist_raw,
+            )
+        return cmd
+
+    if cmd and cmd[0] and Path(cmd[0]).is_absolute():
+        executable = Path(cmd[0])
+        cmd = [str(executable.parent.resolve() / executable.name), *cmd[1:]]
+
+    # Platform dispatch. Each backend owns its own preflight checks and
+    # failure semantics (macOS keeps a pilot-era WARNING+fallback; Linux is
+    # post-pilot and raises on missing bwrap so systemd surfaces it).
+    if sys.platform == "darwin":
+        return _wrap_macos_sandbox(cmd, profile_home, local_harness=local_harness)
+    if sys.platform.startswith("linux"):
+        return _wrap_linux_bwrap(cmd, profile_home, local_harness=local_harness)
+    if require_sandbox_enabled():
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but platform {sys.platform} "
+            f"has no sandbox backend — refusing to spawn unsandboxed."
+        )
+        logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason=f"unsupported_platform:{sys.platform}",
+        )
+        raise RuntimeError(msg)
+    logger.info(
+        "[multitenancy] HERMES_USE_SANDBOX=1 but platform %s has no sandbox "
+        "backend — spawning subprocess unsandboxed.",
+        sys.platform,
+    )
+    return cmd
+
+
+def _wrap_macos_sandbox(
+    cmd: list[str], profile_home: Path, *, local_harness: bool = False
+) -> list[str]:
+    """macOS backend: wrap with /usr/bin/sandbox-exec + profile-default.sb.
+
+    Installed shared skill targets append read-only grants to the base policy;
+    profiles without such targets retain the file-based policy invocation.
+    """
+    if not _SANDBOX_POLICY_FILE.is_file():
+        if require_sandbox_enabled():
+            msg = (
+                f"[multitenancy] HERMES_USE_SANDBOX=1 but policy "
+                f"{_SANDBOX_POLICY_FILE} is missing — refusing to spawn unsandboxed."
+            )
+            logger.error(msg)
+            append_security_event(
+                event_type="sandbox.denied",
+                reason="macos_policy_missing",
+                path=str(_SANDBOX_POLICY_FILE),
+            )
+            raise RuntimeError(msg)
+        logger.warning(
+            "[multitenancy] HERMES_USE_SANDBOX=1 but policy %s is missing — "
+            "spawning subprocess unsandboxed. Investigate the deployment.",
+            _SANDBOX_POLICY_FILE,
+        )
+        return cmd
+    if not os.access(_SANDBOX_EXEC, os.X_OK):
+        if require_sandbox_enabled():
+            msg = (
+                f"[multitenancy] HERMES_USE_SANDBOX=1 but {_SANDBOX_EXEC} is not "
+                f"executable on this platform — refusing to spawn unsandboxed."
+            )
+            logger.error(msg)
+            append_security_event(
+                event_type="sandbox.denied",
+                reason="macos_sandbox_exec_not_executable",
+                path=str(_SANDBOX_EXEC),
+            )
+            raise RuntimeError(msg)
+        logger.warning(
+            "[multitenancy] HERMES_USE_SANDBOX=1 but %s is not executable on "
+            "this platform — spawning subprocess unsandboxed.",
+            _SANDBOX_EXEC,
+        )
+        return cmd
+
+    venv = Path(sys.prefix).resolve()
+    # venv is typically installed as <agent_install>/venv/, with the
+    # hermes-agent source tree (run_agent.py, gateway/, tools/) living
+    # one directory up. Editable installs (`pip install -e .`) cause
+    # `import run_agent` to resolve to that source path, so the sandbox
+    # must allow reads on the install root, not just venv/.
+    agent_install = venv.parent
+    shared_home = _resolve_shared_hermes_home(profile_home).resolve()
+    agent_repo = _resolve_hermes_agent_repo().resolve()
+    mt_repo = Path(__file__).resolve().parent.parent.parent
+    # HOME is profile-virtualized in local/UAT launches. sandbox-exec checks the
+    # resolved uv interpreter path, so use the OS account home named by uid.
+    import pwd
+
+    user_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    codex_bin = Path(shutil.which("codex") or "/usr/bin/false").resolve()
+    codex_code_mode_host = codex_bin.with_name("codex-code-mode-host")
+    if not codex_code_mode_host.is_file():
+        codex_code_mode_host = Path("/usr/bin/false")
+    profile_home_resolved = profile_home.expanduser().resolve()
+    hidden = profile_home_resolved if local_harness else Path("/private/tmp/hermes-harness-no-secret")
+
+    # Reuse the Linux admission checks; only this profile's installed, non-secret
+    # shared skill targets become readable. Ancestors allow metadata, not listing.
+    skill_args = _shared_skill_symlink_bwrap_args(profile_home, shared_home)
+    skill_rules: list[str] = []
+    for index, arg in enumerate(skill_args):
+        if arg == "--dir":
+            skill_rules.append(f"(allow file-read-metadata (literal {json.dumps(skill_args[index + 1], ensure_ascii=False)}))")
+        elif arg == "--ro-bind":
+            target = Path(skill_args[index + 1])
+            selector = "subpath" if target.is_dir() else "literal"
+            skill_rules.append(f"(allow file-read* ({selector} {json.dumps(str(target), ensure_ascii=False)}))")
+    policy_args = (
+        ["-p", _SANDBOX_POLICY_FILE.read_text(encoding="utf-8") + "\n" + "\n".join(skill_rules)]
+        if skill_rules else ["-f", str(_SANDBOX_POLICY_FILE)]
+    )
+    wrapped = [
+        _SANDBOX_EXEC,
+        *policy_args,
+        "-D", f"PROFILE_HOME={profile_home_resolved}",
+        "-D", f"SHARED_HOME={shared_home}",
+        "-D", f"USER_HOME={user_home}",
+        "-D", f"HERMES_VENV={venv}",
+        "-D", f"HERMES_AGENT_INSTALL={agent_install}",
+        "-D", f"HERMES_AGENT_REPO={agent_repo}",
+        "-D", f"HERMES_MT_REPO={mt_repo}",
+        "-D", f"CODEX_BIN={codex_bin}",
+        "-D", f"CODEX_CODE_MODE_HOST={codex_code_mode_host}",
+        "-D", f"HARNESS_PROFILE_ENV={hidden / '.env'}",
+        "-D", f"HARNESS_PROFILE_AUTH={hidden / 'auth.json'}",
+        "-D", f"HARNESS_PROFILE_UAT={hidden / 'feishu_uat'}",
+        "-D", f"HARNESS_PROFILE_TOKENS={hidden / 'tokens'}",
+        "-D", f"HARNESS_PROFILE_CREDENTIALS={hidden / 'workspace' / 'credentials'}",
+        "-D", f"HARNESS_PROFILE_USER_HOME={hidden / 'home'}",
+        "-D", f"HARNESS_SHARED_ENV={(shared_home if local_harness else hidden) / '.env'}",
+        "-D", f"HARNESS_SHARED_AUTH={(shared_home if local_harness else hidden) / 'auth.json'}",
+        "-D", f"HARNESS_SHARED_UAT={(shared_home if local_harness else hidden) / 'feishu_uat'}",
+        "-D", f"HARNESS_USER_KEP={(user_home if local_harness else hidden) / '.kep-cli'}",
+        "-D", f"HARNESS_USER_LARK={(user_home if local_harness else hidden) / '.lark-cli-work'}",
+    ] + list(cmd)
+    logger.info(
+        "[multitenancy] sandbox-exec wrap: policy=%s profile=%s agent_repo=%s",
+        _SANDBOX_POLICY_FILE.name, profile_home_resolved.name, agent_repo,
+    )
+    return wrapped
+
+
+def _render_bwrap_args(text: str, substitutions: dict[str, str]) -> list[str]:
+    """Render bwrap-default.args text into a list of CLI tokens.
+
+    Strips '#'-led comments and blank lines, then substitutes ${KEY} with
+    values from ``substitutions``. Each remaining line is split on
+    whitespace so a single line can carry multiple tokens
+    (e.g. ``--ro-bind /usr /usr``).
+    """
+    tokens: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for key, value in substitutions.items():
+            line = line.replace(f"${{{key}}}", value)
+        tokens.extend(line.split())
+    return tokens
+
+
+def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> list[str]:
+    """Expose only installed shared-skill symlink targets inside bwrap.
+
+    Profile skills are often stable symlinks to shared managed skill releases.
+    The base bwrap policy deliberately does not mount ``SHARED_HOME`` wholesale,
+    so those symlinks otherwise resolve to missing targets inside the sandbox.
+    We bind only symlink targets that the current profile already references,
+    and only when the target remains under approved shared skill roots.
+    """
+    skills_root = profile_home.expanduser().resolve(strict=False) / "skills"
+    if not skills_root.is_dir():
+        return []
+    shared = shared_home.expanduser().resolve(strict=False)
+    allowed_roots = [
+        _absolute_path_without_following_final_symlink(shared / "skills"),
+        _absolute_path_without_following_final_symlink(shared / "skill-releases"),
+        # AiDock SkillHub canonical releases (skillhub_installer materializes
+        # under _managed/<_SKILL_DISTRIBUTION_ORIGIN> and symlinks profile
+        # skills there); without this root those links dangle in-sandbox and
+        # skill attachments (scripts/) are unreadable.
+        _absolute_path_without_following_final_symlink(shared / "_managed" / "aidock-skillhub"),
+        # Expert plugins expose their bundled skills through profile symlinks
+        # into this managed source tree.
+        _absolute_path_without_following_final_symlink(shared / ".hermes-plugin-managed" / ".sources"),
+    ]
+    bindings: set[tuple[Path, Path]] = set()
+
+    for root, dirs, files in os.walk(skills_root, followlinks=False):
+        root_path = Path(root)
+        entries = list(dirs) + list(files)
+        for name in entries:
+            item = root_path / name
+            if not item.is_symlink():
+                continue
+            try:
+                resolved = item.resolve(strict=True)
+            except OSError:
+                continue
+            mount_path = _shared_skill_symlink_mount_path(item, allowed_roots)
+            if mount_path is None:
+                continue
+            # Both the installed path and its final source must remain inside
+            # a real trusted root; a shared symlink cannot grant peer access.
+            if not any(
+                root.resolve(strict=False) == root
+                and (resolved == root or root in resolved.parents)
+                for root in allowed_roots
+            ):
+                continue
+            if resolved.is_dir() and not (resolved / "SKILL.md").is_file():
+                continue
+            if resolved.is_dir() and _sandbox_skill_tree_has_secret_files(resolved):
+                logger.warning(
+                    "[multitenancy] skipping shared skill sandbox bind with secret-like files: %s",
+                    resolved,
+                )
+                continue
+            if resolved.is_file() and _is_sandbox_secret_skill_file(resolved.name):
+                logger.warning(
+                    "[multitenancy] skipping shared skill sandbox bind for secret-like file: %s",
+                    resolved,
+                )
+                continue
+            bindings.add((resolved, mount_path))
+        dirs[:] = [
+            name
+            for name in dirs
+            if not (root_path / name).is_symlink()
+            and name not in _SANDBOX_SKILL_IGNORED_DIRS
+        ]
+
+    args: list[str] = []
+    created_dirs: set[Path] = set()
+    for source, mount_path in sorted(bindings, key=lambda pair: (str(pair[1]), str(pair[0]))):
+        for parent in _shared_skill_target_parent_dirs(mount_path, shared):
+            if parent in created_dirs:
+                continue
+            args.extend(["--dir", str(parent)])
+            created_dirs.add(parent)
+        args.extend(["--ro-bind", str(source), str(mount_path)])
+    return args
+
+
+def _shared_skill_symlink_mount_path(item: Path, allowed_roots: list[Path]) -> Path | None:
+    try:
+        raw_target = Path(os.readlink(item))
+    except OSError:
+        return None
+    if raw_target.is_absolute():
+        target = raw_target
+    else:
+        target = item.parent / raw_target
+    target = _absolute_path_without_following_final_symlink(target)
+    if _is_safe_shared_skill_symlink_target(target, allowed_roots):
+        return target
+    return None
+
+
+def _absolute_path_without_following_final_symlink(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _is_safe_shared_skill_symlink_target(target: Path, allowed_roots: list[Path]) -> bool:
+    try:
+        resolved = _absolute_path_without_following_final_symlink(target)
+    except OSError:
+        return False
+    for root in allowed_roots:
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def _shared_skill_target_parent_dirs(target: Path, shared_home: Path) -> list[Path]:
+    dirs: list[Path] = []
+    parent = target.parent if target.is_file() else target.parent
+    try:
+        rel = parent.relative_to(shared_home)
+    except ValueError:
+        return dirs
+    current = shared_home
+    for part in rel.parts:
+        current = current / part
+        dirs.append(current)
+    return dirs
+
+
+def _sandbox_skill_tree_has_secret_files(src: Path) -> bool:
+    for root, dirs, files in os.walk(src, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = [
+            dirname
+            for dirname in dirs
+            if not (root_path / dirname).is_symlink()
+        ]
+        for filename in files:
+            item = root_path / filename
+            if item.is_symlink():
+                continue
+            rel = item.relative_to(src)
+            if _is_sandbox_secret_skill_file(rel):
+                return True
+    return False
+
+
+def _is_sandbox_secret_skill_file(rel_path: str | Path) -> bool:
+    path = Path(rel_path)
+    name = path.name.lower()
+    if name in _SANDBOX_SKILL_SECRET_FILE_NAMES:
+        return True
+    if name.endswith((".token", ".secret", ".key")):
+        return True
+    if name.endswith(_SANDBOX_SKILL_SOURCE_FILE_SUFFIXES):
+        return False
+    return any(part in name for part in _SANDBOX_SKILL_SECRET_NAME_PARTS)
+
+
+def _interpreter_runtime_bwrap_args(
+    launcher: str, covered_roots: list[Path], forbidden_ancestors: list[Path]
+) -> list[str]:
+    """Expose the launcher's real interpreter runtime inside bwrap.
+
+    uv-managed venvs symlink ``bin/python`` to a runtime that can live outside
+    every mounted tree (prod 2026-08-10: a sibling agent release's
+    ``.hermes-runtime``, so every spawn died at ``execvp: No such file or
+    directory`` before the model ran). Bind the resolved runtime root
+    read-only unless an existing mount already covers it. ``pyvenv.cfg``
+    ``home`` points into the same runtime root, so one bind covers both
+    execvp and stdlib resolution.
+
+    Fail-closed upper bound (review finding runtime-root-trust-boundary):
+    a shallow launcher like ``$HOME/bin/python`` would derive ``$HOME`` as
+    runtime root and mount every tenant profile read-only. Never bind a root
+    that contains any forbidden ancestor (user home, shared home, profile
+    home) or ``/`` — skipping means at worst the pre-fix ENOENT, never a
+    tenant-isolation break.
+    """
+    try:
+        real = Path(launcher).resolve(strict=True)
+    except OSError:
+        return []
+    runtime_root = real.parent.parent if real.parent.name == "bin" else real.parent
+    if runtime_root == Path("/"):
+        return []
+    for root in covered_roots:
+        try:
+            if runtime_root == root or runtime_root.is_relative_to(root):
+                return []
+        except (TypeError, ValueError):
+            continue
+    for sensitive in forbidden_ancestors:
+        try:
+            if sensitive == runtime_root or sensitive.is_relative_to(runtime_root):
+                return []
+        except (TypeError, ValueError):
+            continue
+    return ["--ro-bind", str(runtime_root), str(runtime_root)]
+
+
+def _wrap_linux_bwrap(
+    cmd: list[str], profile_home: Path, *, local_harness: bool = False
+) -> list[str]:
+    """Linux backend: wrap with /usr/bin/bwrap + bwrap-default.args.
+
+    Fail-closed: missing policy or binary raises RuntimeError. Rationale:
+    Linux rollout is post-pilot, operator intent is "must be sandboxed".
+    Silently falling back to unsandboxed would mask the misconfiguration.
+    systemd Restart=on-failure will surface the crash for ops.
+    """
+    if not _BWRAP_ARGS_FILE.is_file():
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but bwrap policy "
+            f"{_BWRAP_ARGS_FILE} is missing — refusing to spawn unsandboxed."
+        )
+        logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason="linux_bwrap_policy_missing",
+            path=str(_BWRAP_ARGS_FILE),
+        )
+        raise RuntimeError(msg)
+    if not os.access(_BWRAP_EXEC, os.X_OK):
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but bwrap is not "
+            f"executable at {_BWRAP_EXEC} — install via "
+            f"`dnf install -y bubblewrap` (or apt equivalent)."
+        )
+        logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason="linux_bwrap_not_executable",
+            path=str(_BWRAP_EXEC),
+        )
+        raise RuntimeError(msg)
+
+    venv = Path(sys.prefix).resolve()
+    agent_install = venv.parent
+    shared_home = _resolve_shared_hermes_home(profile_home).resolve()
+    agent_repo = _resolve_hermes_agent_repo().resolve()
+    mt_repo = Path(__file__).resolve().parent.parent.parent
+    user_home = Path.home().resolve()
+    profile_home_resolved = profile_home.expanduser().resolve()
+
+    substitutions = {
+        "PROFILE_HOME": str(profile_home_resolved),
+        "SHARED_HOME": str(shared_home),
+        "USER_HOME": str(user_home),
+        "HERMES_VENV": str(venv),
+        "HERMES_AGENT_INSTALL": str(agent_install),
+        "HERMES_AGENT_REPO": str(agent_repo),
+        "HERMES_MT_REPO": str(mt_repo),
+    }
+    bwrap_args = _render_bwrap_args(_BWRAP_ARGS_FILE.read_text(), substitutions)
+    if local_harness:
+        bwrap_args.extend([
+            "--ro-bind-try", "/dev/null", str(profile_home_resolved / ".env"),
+            "--ro-bind-try", str(mt_repo / "hermes_multitenancy/sandbox/empty-auth.json"),
+            str(profile_home_resolved / "auth.json"),
+            "--tmpfs", str(profile_home_resolved / "feishu_uat"),
+            "--tmpfs", str(profile_home_resolved / "tokens"),
+            "--tmpfs", str(profile_home_resolved / "workspace/credentials"),
+            "--tmpfs", str(profile_home_resolved / "home"),
+        ])
+    bwrap_args.extend(_shared_skill_symlink_bwrap_args(profile_home_resolved, shared_home))
+    if cmd:
+        bwrap_args.extend(
+            _interpreter_runtime_bwrap_args(
+                cmd[0],
+                [
+                    venv,
+                    agent_install,
+                    agent_repo,
+                    mt_repo,
+                    Path("/usr"),
+                    user_home / ".local" / "share" / "uv",
+                ],
+                [user_home, shared_home, profile_home_resolved],
+            )
+        )
+    wrapped = [_BWRAP_EXEC, *bwrap_args, "--", *cmd]
+    logger.info(
+        "[multitenancy] bwrap wrap: policy=%s profile=%s agent_repo=%s",
+        _BWRAP_ARGS_FILE.name, profile_home_resolved.name, agent_repo,
+    )
+    return wrapped
+
+
+def _desktop_decision_for_profile(profile_home: Path) -> "desktop_sandbox.DesktopDecision":
+    """Resolve the shared and the profile config SEPARATELY into a desktop decision.
+
+    They are deliberately not merged first: the profile's ``config.yaml`` sits in
+    the tenant-writable tree, so only the shared file may name the podman
+    binary, image, network, quotas and id maps the gateway runs with.
+    """
+    from .. import desktop_sandbox
+
+    try:
+        shared = _load_yaml(_resolve_shared_hermes_home(profile_home) / "config.yaml")
+        profile = _load_yaml(profile_home / "config.yaml")
+    except Exception as exc:
+        # Unreadable config cannot grant a desktop; it must not break the bwrap
+        # path either, which never needed the config to wrap a command.
+        logger.warning(
+            "[multitenancy] desktop decision: config unreadable for %s (%s); treating as disabled",
+            profile_home.name, exc,
+        )
+        shared, profile = {}, {}
+    return desktop_sandbox.desktop_decision(shared, profile_home, profile_config=profile)
+
+
+@contextmanager
+def _desktop_turn_scope(profile_home: Path):
+    """Hold one active-turn lease for a desktop profile while its worker runs.
+
+    The idle sweep counts these leases (gateway-owned ``turns.json``) instead
+    of podman ``ExecIDs``, because a warm worker is itself a permanent exec and
+    would otherwise keep the container "busy" forever. No-op for bwrap/sandbox
+    profiles and off Linux. A bookkeeping failure is logged, never fatal: the
+    worst case is one idle-stop landing during a run, not a refused turn.
+    """
+    if not sys.platform.startswith("linux"):
+        yield
+        return
+    from .. import desktop_sandbox
+
+    decision = _desktop_decision_for_profile(profile_home)
+    if not decision.enabled:
+        yield
+        return
+    token = None
+    try:
+        token = desktop_sandbox.begin_turn(decision.state_dir)
+    except Exception:
+        logger.exception("[multitenancy] desktop turn lease could not be taken for %s", decision.profile_name)
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                desktop_sandbox.end_turn(decision.state_dir, token)
+            except Exception:
+                logger.exception("[multitenancy] desktop turn lease could not be released for %s", decision.profile_name)
+
+
+def _sandbox_spawn(
+    cmd: list[str],
+    profile_home: Path,
+    *,
+    local_harness: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[list[str], Optional[Mapping[str, str]]]:
+    """Wrapped argv AND the env to spawn it with. Every production spawn uses this.
+
+    For a desktop profile the env is the host-podman spawn env from
+    :func:`desktop_sandbox.exec_args` — never the worker env, which carries the
+    tenant's profile ``.env`` (``LD_PRELOAD`` there would run on the host).
+    Every other backend spawns with ``env`` unchanged, exactly as before.
+    """
+    if sys.platform.startswith("linux"):
+        desktop = _desktop_decision_for_profile(profile_home)
+        if desktop.enabled:
+            return _wrap_linux_container(cmd, profile_home, desktop, env=env)
+    return _wrap_with_sandbox(cmd, profile_home, local_harness=local_harness, env=env), env
+
+
+def _wrap_linux_container(
+    cmd: list[str],
+    profile_home: Path,
+    decision: "desktop_sandbox.DesktopDecision",
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Linux desktop backend: run ``cmd`` inside the profile's podman container.
+
+    Returns ``(argv, spawn_env)``; the caller must spawn podman with
+    ``spawn_env``, never with the worker ``env``.
+
+    Fail-closed like bwrap: podman missing, the container not coming up, the
+    screen not publishing, an unmappable interpreter, or a missing env all raise
+    RuntimeError after a ``sandbox.denied`` security event. There is no bare
+    fallback — a desktop profile either runs in its container or not at all.
+    """
+    from .. import desktop_sandbox
+
+    # Same-path mounting means every path the worker sees must be the canonical
+    # host path (bwrap resolves too). An unresolved alias would be mounted under
+    # one name and addressed under another inside the container.
+    profile_home = profile_home.expanduser().resolve()
+
+    def _deny(reason: str, msg: str) -> RuntimeError:
+        logger.error("[multitenancy] desktop container denied profile=%s reason=%s: %s",
+                     profile_home.name, reason, msg)
+        append_security_event(
+            event_type="sandbox.denied", reason=reason, profile=profile_home.name
+        )
+        return RuntimeError(f"[multitenancy] desktop sandbox unavailable ({reason}): {msg}")
+
+    if env is None:
+        raise _deny(
+            "desktop_exec_env_missing",
+            "caller did not pass the worker env; podman exec cannot inherit it",
+        )
+    if not cmd:
+        raise _deny("desktop_exec_path_unmapped", "empty command")
+    mapped = desktop_sandbox.map_executable(decision, cmd[0])
+    if mapped is None:
+        raise _deny(
+            "desktop_exec_path_unmapped",
+            f"{cmd[0]!r} has no container-side equivalent (desktop.container_python)",
+        )
+    try:
+        handle = desktop_sandbox.ensure(decision)
+    except desktop_sandbox.DesktopSandboxError as exc:
+        err = _deny(exc.reason, str(exc))
+        if exc.user_message:
+            err = RuntimeError(f"{exc.user_message}（{exc.reason}）")
+        raise err from exc
+    workdir = Path(_aiagent_subprocess_cwd(profile_home))
+    wrapped, spawn_env = desktop_sandbox.exec_args(
+        decision, handle, [mapped, *cmd[1:]], env, workdir=workdir
+    )
+    logger.info(
+        "[multitenancy] desktop container wrap: profile=%s container=%s image=%s started=%s",
+        profile_home.name, handle.name, decision.image, handle.started,
+    )
+    return wrapped, spawn_env
+
+
+def _aiagent_subprocess_cwd(profile_home: Path) -> str:
+    """Start child processes from the routed workspace so sandbox getcwd is allowed."""
+    workspace = profile_home.expanduser() / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return str(workspace)
+
+
+def _install_session_search_proxy_for_aiagent() -> None:
+    """Route session_search through the multitenancy parent process when present."""
+    base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+    token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+    if not base_url or not token:
+        return
+
+    try:
+        import urllib.error
+        import urllib.request
+        from tools import session_search_tool
+    except Exception:
+        logger.debug("[multitenancy] session_search proxy install skipped", exc_info=True)
+        return
+
+    current = getattr(session_search_tool, "session_search", None)
+    tool_already_proxied = getattr(current, "_hermes_multitenancy_proxy", False)
+
+    if not tool_already_proxied:
+        def _proxy_session_search(
+            query: str = "",
+            role_filter: str = None,
+            limit: int = 3,
+            db=None,
+            current_session_id: str = None,
+            session_id: str = None,
+            around_message_id: int = None,
+            window: int = 5,
+            sort: str = None,
+            profile: str = None,
+            detail: str = "adaptive",
+            after: str = None,
+            before: str = None,
+            exclude_session_ids: list[str] = None,
+        ) -> str:
+            payload = {
+                "query": query,
+                "role_filter": role_filter,
+                "limit": limit,
+                "current_session_id": current_session_id,
+                "session_id": session_id,
+                "around_message_id": around_message_id,
+                "window": window,
+                "sort": sort,
+                "profile": profile,
+                "detail": detail,
+                "after": after,
+                "before": before,
+                "exclude_session_ids": exclude_session_ids,
+            }
+            current_base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+            current_token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+            if not current_base_url or not current_token:
+                return json.dumps({
+                    "success": False,
+                    "error": "Session search proxy env unavailable",
+                }, ensure_ascii=False)
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{current_base_url}/api/run-broker/internal/session-search",
+                data=data,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {current_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            timeout = float(os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TIMEOUT", "15") or "15")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = json.loads(exc.read().decode("utf-8"))
+                    error = body.get("error") or str(exc)
+                except Exception:
+                    error = str(exc)
+                return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+            except Exception as exc:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Session search proxy unavailable: {type(exc).__name__}: {exc}",
+                }, ensure_ascii=False)
+
+            if isinstance(body, dict) and body.get("ok") and isinstance(body.get("result"), str):
+                return body["result"]
+            error = body.get("error") if isinstance(body, dict) else None
+            return json.dumps({"success": False, "error": error or "Session search proxy failed"}, ensure_ascii=False)
+
+        _proxy_session_search._hermes_multitenancy_proxy = True  # type: ignore[attr-defined]
+        session_search_tool.session_search = _proxy_session_search
+
+
+def _install_session_search_recall_db_proxy(aiagent_cls: Any) -> None:
+    base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+    token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+    if not base_url or not token:
+        return
+
+    current_getter = getattr(aiagent_cls, "_get_session_db_for_recall", None)
+    if getattr(current_getter, "_hermes_multitenancy_proxy", False):
+        return
+
+    proxy_db = object()
+
+    def _get_session_db_for_recall(_self):
+        return proxy_db
+
+    _get_session_db_for_recall._hermes_multitenancy_proxy = True  # type: ignore[attr-defined]
+    aiagent_cls._get_session_db_for_recall = _get_session_db_for_recall
+
+
+def _bump_expert_usage_from_event(event: Any) -> None:
+    """专家使用计数(所有渠道每 run 一次, sunke 2026-07-30 口径) — 父进程 best-effort."""
+    try:
+        expert_id = _expert_id_for_event(event)
+        if not expert_id:
+            return
+        from ..expert_usage import bump
+
+        bump(expert_id)
+    except Exception:
+        logger.debug("[multitenancy] expert usage bump failed", exc_info=True)
+
+
+def _write_token_ledger_from_child(
+    event: Any,
+    profile_home: Path,
+    usage: Any,
+    *,
+    verified_codex: bool = False,
+) -> None:
+    """工件1a：父进程侧写 token 台账（子进程沙箱不能写 /var/log/hermes）。
+
+    ``usage`` 是子进程透传上来的 {model, input/output/total_tokens}；触发人身份与平台
+    维度在父进程从 ``event`` 解析（与 conversation_audit 同源）。整段 best-effort，
+    任何失败只 debug、绝不影响回复。开关关闭时 append_token_usage 内部直接 no-op。
+    """
+    if not isinstance(usage, dict):
+        return
+    if not verified_codex:
+        try:
+            from . import executor_map
+
+            if (
+                executor_map.runtime_for_event(event, profile_home)
+                == executor_map.CODEX_APP_SERVER
+            ):
+                return
+        except Exception:
+            pass
+    try:
+        from ..token_usage_ledger import append_token_usage, token_usage_ledger_enabled
+
+        if not token_usage_ledger_enabled():
+            return
+        source = getattr(event, "source", None)
+        # Use the router's canonical chat_type/chat_id extraction (same fallback
+        # chain feishu.py/routing use), so the recorded chat_id matches the key
+        # routing.lookup_by_chat_id expects — covers 'topic' groups and the
+        # parent_chat_id / chat_id_alt / event.message.chat_id variants that a
+        # bare source.chat_id read would miss (would mis-bill group turns).
+        from ..router import _extract_chat_id, _extract_chat_type
+
+        append_token_usage(
+            sender_open_id=_resolve_subprocess_sender_open_id(event),
+            profile=profile_home.name,
+            platform=_resolve_token_ledger_platform(source),
+            chat_type=_extract_chat_type(event),
+            chat_id=_extract_chat_id(event),
+            model=usage.get("model"),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            cache_read_tokens=usage.get("cache_read_tokens"),
+            cache_write_tokens=usage.get("cache_write_tokens"),
+            api_calls=usage.get("api_calls"),
+            budget_exhausted=bool(usage.get("budget_exhausted")),
+        )
+    except Exception:
+        logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
+
+
+
+
+async def _run_aiagent_subprocess(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> str:
+    """Run the sync AIAgent body in a fresh Python process.
+
+    The gateway stays fully async while the child process owns the synchronous
+    AIAgent/tool loop. This avoids the gateway event-loop deadlock observed
+    when ``_run_with_aiagent`` runs through ``asyncio.to_thread``.
+    """
+    import asyncio
+
+    # Before the payload snapshot: a codex-mapped run's cwd only reaches the
+    # child through `raw_event["workspace"]` (PLAN C6).
+    codex_workspace = await asyncio.to_thread(
+        _bind_codex_run_workspace, event, profile_home
+    )
+    payload = json.dumps(
+        _event_to_subprocess_payload(event, profile_home, messages=messages),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
+    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
+    env_scope_kwargs: dict[str, Any] = {"approval_dir": approval_dir}
+    if codex_workspace is not None:
+        env_scope_kwargs["codex_workspace"] = codex_workspace
+    env_scope = _aiagent_subprocess_env_scope(
+        event,
+        profile_home,
+        **env_scope_kwargs,
+    )
+    env_scope_entered = False
+    env = env_scope.__enter__()
+    env_scope_entered = True
+    # Resolve symlinks so sandbox-exec's path-based allow rules match.
+    # The plugin is typically loaded via a profile-local symlink
+    # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
+    # but the sandbox policy only whitelists the resolved repo path.
+    # Without .resolve() the child python sees an [Errno 1] Operation not
+    # permitted when trying to open aiagent_subprocess.py through the symlink.
+    child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
+    from .harness_webui_runtime import require_event_admission
+
+    # The desktop backend may create/start a container (podman + waits): run the
+    # wrapper off the event loop so a slow ensure() never stalls other profiles.
+    cmd, spawn_env = await asyncio.to_thread(
+        _sandbox_spawn,
+        [sys.executable, str(child_script)],
+        profile_home,
+        local_harness=require_event_admission(event, profile_home) is not None,
+        env=env,
+    )
+
+    proc = None
+    turn_scope = _desktop_turn_scope(profile_home)
+    turn_scope.__enter__()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=spawn_env,
+            cwd=_aiagent_subprocess_cwd(profile_home),
+            limit=_AIAGENT_STREAM_LIMIT,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout_s)
+    except asyncio.TimeoutError as exc:
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
+        raise RuntimeError(f"AIAgent subprocess timed out after {timeout_s:g}s") from exc
+    except asyncio.CancelledError:
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
+        raise
+    finally:
+        turn_scope.__exit__(None, None, None)
+        if env_scope_entered:
+            await _exit_aiagent_subprocess_env_scope(env_scope, sys.exc_info())
+        try:
+            import shutil
+
+            shutil.rmtree(approval_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    stdout_text = stdout.decode("utf-8", errors="replace").strip()
+    redacted_stderr_text = _redact_billing_runtime_text(stderr_text, event, env)
+    redacted_stdout_text = _redact_billing_runtime_text(stdout_text, event, env)
+    if stderr_text:
+        logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
+
+    # Killed by signal → the gateway went down mid-run: systemd SIGTERMs the
+    # whole process group on deploy/restart and every in-flight child dies with
+    # it (we spawn without start_new_session, so the child shares our group). A
+    # *sandboxed* child killed by a signal surfaces as bwrap's 128+N, i.e.
+    # positive — a negative code really is our own direct child being signalled.
+    # Same classification, same reason as streaming.py's raise site: the stderr
+    # tail is unrelated output from seconds earlier, so splicing it into the
+    # user-facing message lies about the cause (2026-07-30: a stale "Encrypted
+    # reasoning replay was rejected" warning sent everyone chasing a model-compat
+    # bug that did not exist). Full stderr stays in the log.
+    signal_death = proc.returncode is not None and proc.returncode < 0
+
+    def _warn_signal_death(what: str) -> None:
+        logger.warning(
+            "[multitenancy] AIAgent subprocess killed by signal %s %s (gateway "
+            "restart/shutdown kills in-flight runs); the full stderr below is "
+            "stale output, NOT the cause of death: %s",
+            -proc.returncode,
+            what,
+            redacted_stderr_text or "<empty>",
+        )
+
+    try:
+        data = json.loads(stdout_text)
+    except json.JSONDecodeError as exc:
+        if signal_death:
+            # This is the common shape: the child dies before writing its result
+            # JSON, so stdout is empty and the invalid-JSON diagnostic below used
+            # to fire first — blaming the child's protocol for a death it had no
+            # part in, stale stderr quoted as evidence.
+            _warn_signal_death("before delivering its result")
+            raise _gateway_restart_interrupted(-proc.returncode) from exc
+        raise RuntimeError(
+            "AIAgent subprocess returned invalid JSON "
+            f"(exit={proc.returncode}, stdout={redacted_stdout_text[-1000:]!r}, stderr={redacted_stderr_text[-1000:]!r})"
+        ) from exc
+
+    if signal_death and not isinstance(data, dict):
+        # Valid JSON that isn't an object (``null`` / ``[]`` / a bare string) is
+        # not a result report either — a half-written stdout can still parse.
+        # Without this guard every ``.get`` below raises AttributeError, and
+        # real_run_agent's catch-all turns that into a legacy re-run: double
+        # tool side effects, double spend, restart hidden. Same honest error as
+        # the empty-stdout shape above.
+        _warn_signal_death(
+            f"leaving a non-object result payload ({type(data).__name__})"
+        )
+        raise _gateway_restart_interrupted(-proc.returncode)
+
+    failure_subsystem = data.get("failure_subsystem")
+    error_code = data.get("error_code")
+    retryable = data.get("retryable")
+    if failure_subsystem and error_code and isinstance(retryable, bool):
+        from ..run_broker import record_current_run_failure
+
+        record_current_run_failure(
+            failure_subsystem=str(failure_subsystem),
+            error_code=str(error_code),
+            retryable=retryable,
+        )
+    if signal_death:
+        # The result JSON is this path's terminal outcome report — the exact
+        # analogue of the streaming ``done`` event. If it arrived with a real
+        # answer the turn finished and the later signal is teardown noise:
+        # keep the answer rather than throwing it away for an exit code. If it
+        # arrived empty (or the run failed), the signal is still the honest
+        # cause — never the stderr tail the branch below would quote.
+        _warn_signal_death(
+            "AFTER delivering its result JSON "
+            f"(result={len(str(data.get('result') or ''))} chars, "
+            f"carried_error={bool(data.get('error'))})"
+        )
+        if not str(data.get("result") or "").strip():
+            raise _gateway_restart_interrupted(-proc.returncode)
+    elif proc.returncode != 0:
+        child_error = _redact_billing_runtime_text(data.get("error") or "", event, env)
+        raise _subprocess_failure(
+            f"AIAgent subprocess exited {proc.returncode}: "
+            f"{child_error or redacted_stderr_text or redacted_stdout_text}",
+            retry_safe=data.get("billing_retry_safe") is True,
+            error_code=data.get("error_code"),
+            failure_subsystem=data.get("failure_subsystem"),
+            retryable=data.get("retryable"),
+        )
+    if data.get("error"):
+        error_text = str(data.get("error") or "")
+        raise _subprocess_failure(
+            "AIAgent subprocess failed: "
+            f"{_redact_billing_runtime_text(error_text, event, env)}",
+            retry_safe=data.get("billing_retry_safe") is True,
+            error_code=data.get("error_code"),
+            failure_subsystem=data.get("failure_subsystem"),
+            retryable=data.get("retryable"),
+        )
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        event._trusted_codex_usage = dict(usage)
+    _write_token_ledger_from_child(event, profile_home, usage)
+    try:  # shim injects the name (agent_real/__init__ step-2); guard even NameError
+        _bump_expert_usage_from_event(event)
+    except Exception:
+        logger.debug("[multitenancy] expert usage bump call failed", exc_info=True)
+    return str(data.get("result") or "")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — real AIAgent runner with tool-loop (replaces the spike one-shot)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_sender_open_id(event: Any) -> str:
+    """Pick the real Feishu open_id (ou_*) from the event source for UAT lookup.
+
+    Prefer source.user_id (typical Feishu open_id); fall back to user_id_alt
+    when the former is a union_id (on_*). Returns "" if nothing usable is found.
+    """
+    source = getattr(event, "source", None)
+    event_sender = getattr(event, "sender_open_id", None)
+    if event_sender and str(event_sender).startswith("ou_"):
+        return str(event_sender)
+    if source is None:
+        return ""
+    for candidate in (
+        getattr(source, "open_id", None),
+        getattr(source, "user_id", None),
+        getattr(source, "user_id_alt", None),
+    ):
+        if candidate and str(candidate).startswith("ou_"):
+            return str(candidate)
+    # Fallback: any non-empty user_id, even if not ou_-prefixed
+    return str(getattr(source, "user_id", "") or "")
+
+
+def _session_part(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip() or default
+    safe = "".join(ch if (ch.isalnum() or ch in "._:-") else "_" for ch in text)
+    return safe[:160] or default
+
+
+def _resolve_token_ledger_platform(source: Any) -> str:
+    """台账专用的 platform 解析：定时任务回合记 ``"cron"``，其余沿用通用解析。
+
+    ``HERMES_CRON_JOB`` 由 ``cron/execution._run_job_for_profile_subprocess`` 为每个 cron
+    job 的独立子进程设置，所以「本进程 = cron 回合」无歧义。只在台账这一条路径上覆盖，
+    不动 ``_resolve_platform_value`` 本身——它还被投递/展示逻辑用着（streaming 用它判
+    是否保留 reasoning），改默认值会波及回复行为。
+    """
+    if os.getenv("HERMES_CRON_JOB", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "cron"
+    return _resolve_platform_value(source)
+
+
+def _resolve_platform_value(source: Any, default: str = "feishu") -> str:
+    if source is None:
+        return default
+    platform = getattr(source, "platform", None)
+    return str(getattr(platform, "value", None) or platform or default)
+
+
+def _resolve_aiagent_session_id(
+    event: Any,
+    profile_home: Path,
+    sender_open_id: str = "",
+) -> str:
+    """Build a stable, per-profile/per-user AIAgent session id.
+
+    Feishu ``message_id`` changes every turn, so it must only be a last-ditch
+    fallback. Keeping profile and sender in the key prevents cross-tenant or
+    cross-user history bleed when multiple Feishu users hit the same bot.
+    """
+    source = getattr(event, "source", None)
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        channel = str(raw_event.get("channel") or "").strip()
+        webui_session_id = str(raw_event.get("session_id") or "").strip()
+        if channel == "webui" and webui_session_id:
+            parts = [
+                "agent",
+                "profile",
+                profile_home.name,
+                "platform",
+                "webui",
+                "session",
+                webui_session_id,
+            ]
+            return ":".join(_session_part(part) for part in parts)
+
+    platform = _resolve_platform_value(source)
+    chat_type = getattr(source, "chat_type", "") if source else ""
+    chat_id = (
+        getattr(source, "chat_id", None)
+        or getattr(source, "parent_chat_id", None)
+        or getattr(source, "chat_id_alt", None)
+        if source
+        else ""
+    )
+    transport_thread_id = (
+        getattr(source, "thread_id", None)
+        or getattr(source, "chat_topic", None)
+        if source
+        else ""
+    )
+    from ..feishu_group_topic_session import (
+        group_topic_conversation_id,
+        is_shared_group_topic_event,
+    )
+
+    shared_group_topic = is_shared_group_topic_event(event)
+    thread_id = (
+        group_topic_conversation_id(event)
+        if shared_group_topic
+        else transport_thread_id
+    )
+    user_id = (
+        sender_open_id
+        or (getattr(source, "user_id", None) if source else "")
+        or (getattr(source, "user_id_alt", None) if source else "")
+    )
+    message_id = (
+        getattr(event, "message_id", None)
+        or (getattr(source, "message_id", None) if source else "")
+    )
+
+    parts = [
+        "agent",
+        "profile",
+        profile_home.name,
+        "platform",
+        platform,
+        "chat_type",
+        chat_type or "unknown",
+    ]
+    if chat_id:
+        parts.extend(["chat", chat_id])
+    if thread_id:
+        parts.extend(["thread", thread_id])
+    if user_id and not shared_group_topic:
+        parts.extend(["user", user_id])
+    elif message_id and not shared_group_topic:
+        parts.extend(["message", message_id])
+    elif not shared_group_topic:
+        parts.append("fallback")
+
+    session_id = ":".join(_session_part(part) for part in parts)
+    if len(session_id) <= 220:
+        return session_id
+    digest = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:12]
+    return f"{session_id[:200]}:{digest}"
+
+
+def _resolve_multitenant_gateway_session_key(
+    event: Any,
+    profile_home: Path,
+    sender_open_id: str = "",
+) -> str:
+    """Return the parent gateway session key used by multitenancy slash commands."""
+    source = getattr(event, "source", None)
+    platform = _resolve_platform_value(source)
+    chat_id = ""
+    if source is not None:
+        chat_id = str(
+            getattr(source, "chat_id", None)
+            or getattr(source, "parent_chat_id", None)
+            or getattr(source, "chat_id_alt", None)
+            or ""
+        )
+    user_key = str(
+        sender_open_id
+        or (getattr(source, "user_id", None) if source is not None else "")
+        or (getattr(source, "user_id_alt", None) if source is not None else "")
+        or "unknown"
+    )
+    return f"multitenancy:{platform}:{profile_home.name}:{chat_id or 'unknown'}:{user_key}"
+
+
+def _conversation_history_for_aiagent(
+    messages: Optional[list[dict]],
+    user_text: str,
+) -> Optional[list[dict]]:
+    if not messages:
+        return None
+    history = [dict(message) for message in messages if isinstance(message, dict)]
+    if (
+        history
+        and history[-1].get("role") == "user"
+        and str(history[-1].get("content") or "") == user_text
+    ):
+        history = history[:-1]
+    return history or None
+
+
+def _approval_bridge_timeout() -> float:
+    raw = os.getenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT")
+    if raw is None:
+        raw = os.getenv("HERMES_APPROVAL_GATEWAY_TIMEOUT", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _approval_bridge_dir() -> Path:
+    raw = os.getenv("HERMES_MULTITENANCY_APPROVAL_DIR")
+    if raw:
+        root = Path(raw).expanduser()
+    else:
+        root = Path(tempfile.gettempdir()) / "hermes-multitenancy-approvals"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _read_approval_choice(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] approval decision read failed: %s", exc)
+        return "deny"
+    choice = str(data.get("choice") or "").strip().lower()
+    return choice if choice in {"once", "session", "always", "deny"} else "deny"
+
+
+def _clarify_bridge_timeout() -> float:
+    raw = os.getenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT")
+    if raw is None:
+        raw = os.getenv("HERMES_CLARIFY_TIMEOUT", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _clarify_timeout_response(timeout_s: float) -> str:
+    return (
+        f"The user did not provide a response within {timeout_s:g}s. "
+        "Use your best judgement to make the choice and proceed."
+    )
+
+
+def _clarify_bridge_dir() -> Path:
+    raw = os.getenv("HERMES_MULTITENANCY_CLARIFY_DIR")
+    if raw:
+        root = Path(raw).expanduser()
+    else:
+        root = Path(tempfile.gettempdir()) / "hermes-multitenancy-clarify"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _read_clarify_response(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] clarify response read failed: %s", exc)
+        return ""
+    return str(data.get("response") or data.get("answer") or "").strip()
+
+
+def _configure_webui_clarify_bridge(event_sink, session_key: str):
+    """Return an AIAgent clarify callback for WebUI-scoped runs."""
+    if event_sink is None:
+        return None
+
+    clarify_dir = _clarify_bridge_dir()
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] clarify bridge event emit failed", exc_info=True)
+
+    def _clarify_callback(question: Any, choices: Any = None) -> str:
+        clarify_id = f"clarify_{uuid.uuid4().hex}"
+        response_path = clarify_dir / f"{clarify_id}.json"
+        normalized_choices = []
+        if isinstance(choices, list):
+            normalized_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+        question_text = str(question or "").strip()
+        _emit_bridge_event(
+            "clarify_required",
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question=question_text,
+            choices=normalized_choices,
+            response_path=str(response_path),
+        )
+
+        timeout_s = _clarify_bridge_timeout()
+        deadline = time.monotonic() + timeout_s
+        response: Optional[str] = None
+        timed_out = False
+        while True:
+            response = _read_clarify_response(response_path)
+            if response is not None:
+                break
+            if time.monotonic() >= deadline:
+                response = _clarify_timeout_response(timeout_s)
+                timed_out = True
+                break
+            time.sleep(0.1)
+
+        _emit_bridge_event(
+            "clarify_resolved",
+            clarify_id=clarify_id,
+            session_key=session_key,
+            response=str(response or ""),
+            timed_out=timed_out,
+        )
+        return str(response or "")
+
+    return _clarify_callback
+
+
+def _authorization_bridge_dir() -> Optional[Path]:
+    """The per-run rendezvous directory the PARENT pinned, or None.
+
+    No fallback and no ``mkdir``. The old fallback was a shared
+    ``$TMPDIR/hermes-multitenancy-authorization`` that this child could create
+    and write, which made "write my own success file" a one-write
+    self-authorization; the child now only ever READS a directory the parent
+    created for this run (and that the Linux/macOS sandbox mounts read-only).
+    Missing pin ⇒ no bridge ⇒ the tool fails closed and tells the user to use
+    the credential hub.
+    """
+    raw = str(os.getenv("HERMES_MULTITENANCY_AUTHORIZATION_DIR") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _authorization_bridge_timeout() -> float:
+    """How long the tool call may block. 600s = the inline-authorization window."""
+    raw = os.getenv("HERMES_MULTITENANCY_AUTHORIZATION_TIMEOUT", "600")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 600.0
+
+
+_AUTHORIZATION_TERMINAL_STATES = frozenset({"success", "cancelled", "expired", "failed"})
+
+
+def _read_authorization_response(path: Path) -> Optional[dict[str, str]]:
+    """None = still waiting. Anything unreadable/unknown is a terminal failure."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] authorization response read failed: %s", exc)
+        return {"state": "failed", "reason": "the authorization response was unreadable"}
+    if not isinstance(data, dict):
+        return {"state": "failed", "reason": "the authorization response was malformed"}
+    state = str(data.get("state") or "").strip().lower()
+    if state not in _AUTHORIZATION_TERMINAL_STATES:
+        return {"state": "failed", "reason": "the authorization response had no usable state"}
+    return {"state": state, "reason": str(data.get("reason") or "").strip()}
+
+
+def _configure_webui_authorization_bridge(event_sink, session_key: str):
+    """Return ``(callback, cleanup)`` for the inline ``request_authorization`` tool.
+
+    Same shape as ``_configure_webui_clarify_bridge``: the callback emits a
+    child-local ``pending_ref`` plus the response path it will poll, then BLOCKS
+    inside the tool call until the parent writes a terminal state or the window
+    closes. The child never learns the server-issued ``authorization_id``, the
+    owner, or the authorization URL — it only ever sees a state.
+    """
+    if event_sink is None:
+        return None, (lambda: None)
+
+    authorization_dir = _authorization_bridge_dir()
+    if authorization_dir is None:
+        return None, (lambda: None)
+    response_paths: list[Path] = []
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] authorization bridge event emit failed", exc_info=True)
+
+    def _authorization_callback(
+        *, service: str, scopes: Any = None, tool_call_id: str = ""
+    ) -> dict[str, str]:
+        # The ONLY thing this side decides about the rendezvous. The parent
+        # derives the very same path from (run_id, pending_ref) and ignores
+        # anything we might claim about it, so the shape here must stay exactly
+        # `authreq_<32 lowercase hex>`.
+        pending_ref = f"authreq_{uuid.uuid4().hex}"
+        response_path = authorization_dir / f"{pending_ref}.json"
+        response_paths.append(response_path)
+        normalized_scopes = [
+            str(scope).strip() for scope in (scopes or []) if str(scope).strip()
+        ]
+        _emit_bridge_event(
+            "authorization_required",
+            pending_ref=pending_ref,
+            session_key=session_key,
+            service=str(service or "").strip(),
+            scopes=normalized_scopes,
+            # Binds the request to THIS tool call. ``pending_ref`` is already
+            # per-call (minted fresh on every invocation), so it is the
+            # fallback when core does not expose a tool-call id.
+            tool_call_id=str(tool_call_id or "").strip() or pending_ref,
+        )
+
+        timeout_s = _authorization_bridge_timeout()
+        deadline = time.monotonic() + timeout_s
+        outcome: Optional[dict[str, str]] = None
+        while True:
+            outcome = _read_authorization_response(response_path)
+            if outcome is not None:
+                break
+            if time.monotonic() >= deadline:
+                outcome = {
+                    "state": "expired",
+                    "reason": f"no authorization within {timeout_s:g}s",
+                }
+                break
+            time.sleep(0.1)
+
+        _emit_bridge_event(
+            "authorization_resolved",
+            pending_ref=pending_ref,
+            session_key=session_key,
+            state=outcome["state"],
+            reason=outcome.get("reason", ""),
+        )
+        return dict(outcome)
+
+    def _cleanup() -> None:
+        # Best-effort only: the rendezvous directory is read-only to this
+        # process under the sandbox, and the PARENT removes the whole per-run
+        # directory in its run-teardown finally-block. This just keeps the
+        # unsandboxed local-dev case tidy.
+        for path in response_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except Exception:
+                logger.debug("[multitenancy] authorization response cleanup failed", exc_info=True)
+        response_paths.clear()
+
+    return _authorization_callback, _cleanup
+
+
+def _harness_run_broker_action(action: str, **payload: Any) -> dict[str, Any]:
+    """Call the owner-bound workflow seam; no identity comes from the child."""
+    base = os.environ.get("HERMES_RUN_BROKER_URL", "").strip().rstrip("/")
+    token = os.environ.get("HERMES_RUN_BROKER_KEY", "").strip()
+    workflow_id = os.environ.get("HERMES_HARNESS_WORKFLOW_ID", "").strip()
+    if not base or not token or not workflow_id:
+        raise RuntimeError("Harness workflow broker unavailable")
+    body = json.dumps({"action": action, **payload}).encode("utf-8")
+    req = urllib_request.Request(
+        f"{base}/api/run-broker/harness/workflows/{workflow_id}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(req, timeout=10) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError("Harness workflow broker rejected the action")
+    return result
+
+
+def _configure_gateway_approval_bridge(event_sink, session_key: str):
+    """Register child-process approval notify and return a cleanup callback."""
+    try:
+        from tools.approval import (
+            register_gateway_notify,
+            resolve_gateway_approval,
+            unregister_gateway_notify,
+        )
+        try:
+            approval_context = importlib.import_module("tools.approval_context")
+        except ModuleNotFoundError as exc:
+            if exc.name != "tools.approval_context":
+                raise
+            approval_context = None
+        if approval_context is None or not (
+            hasattr(approval_context, "set_current_session_key")
+            and hasattr(approval_context, "reset_current_session_key")
+        ):
+            # Hermes 0.14 kept the session context helpers on the approval
+            # facade (GitHub #16): fall back when the split module is absent
+            # or does not carry them.
+            approval_context = importlib.import_module("tools.approval")
+        set_current_session_key = approval_context.set_current_session_key
+        reset_current_session_key = approval_context.reset_current_session_key
+    except Exception as exc:
+        if os.environ.get("HERMES_LOCAL_HARNESS") == "1":
+            raise RuntimeError("Harness approval bridge unavailable") from exc
+        logger.debug("[multitenancy] approval bridge unavailable: %s", exc)
+        return lambda: None
+
+    token = set_current_session_key(session_key)
+    old_env = {
+        "HERMES_SESSION_KEY": os.environ.get("HERMES_SESSION_KEY"),
+        "HERMES_GATEWAY_SESSION": os.environ.get("HERMES_GATEWAY_SESSION"),
+        "HERMES_EXEC_ASK": os.environ.get("HERMES_EXEC_ASK"),
+    }
+    # Terminal/process guards may execute in worker threads that do not inherit
+    # contextvars. The child subprocess is single-turn, so process-local env is
+    # the safest compatibility bridge for those thread-local tool paths.
+    os.environ["HERMES_SESSION_KEY"] = session_key
+    os.environ["HERMES_GATEWAY_SESSION"] = "1"
+    os.environ["HERMES_EXEC_ASK"] = "1"
+    registered = False
+    previous_approval_callback = None
+    callback_installed = False
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        if event_sink is None:
+            return
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] approval bridge event emit failed", exc_info=True)
+
+    if event_sink is not None:
+        approval_dir = _approval_bridge_dir()
+
+        def _wait_for_webui_approval(approval_data: dict) -> str:
+            approval_id = f"approval_{uuid.uuid4().hex}"
+            decision_path = approval_dir / f"{approval_id}.json"
+            command = str(approval_data.get("command") or "")
+            description = str(approval_data.get("description") or "dangerous command")
+            _emit_bridge_event(
+                "approval_required",
+                approval_id=approval_id,
+                session_key=session_key,
+                command=command,
+                description=description,
+                pattern_keys=approval_data.get("pattern_keys") or [],
+                decision_path=str(decision_path),
+                # Carry the routed requester so the parent's approval.requested
+                # audit can hash a real open_id (env is set per-child by
+                # _build_subprocess_env). Without this the prod payload had no
+                # requester attribution.
+                open_id=str(os.environ.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip(),
+            )
+
+            timeout_s = _approval_bridge_timeout()
+            deadline = time.monotonic() + timeout_s
+            choice: Optional[str] = None
+            timed_out = False
+            while True:
+                choice = _read_approval_choice(decision_path)
+                if choice is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    choice = "deny"
+                    timed_out = True
+                    break
+                time.sleep(0.1)
+
+            _emit_bridge_event(
+                "approval_resolved",
+                approval_id=approval_id,
+                session_key=session_key,
+                choice=choice,
+                timed_out=timed_out,
+            )
+            return str(choice or "deny")
+
+        def _approval_notify_sync(approval_data: dict) -> None:
+            choice = _wait_for_webui_approval(approval_data)
+            try:
+                resolve_gateway_approval(session_key, choice)
+            except Exception as exc:
+                logger.debug("[multitenancy] child approval resolve failed: %s", exc)
+
+        register_gateway_notify(session_key, _approval_notify_sync)
+        registered = True
+        if os.environ.get("HERMES_LOCAL_HARNESS") == "1":
+            try:
+                from tools.terminal_tool import _get_approval_callback, set_approval_callback
+
+                previous_approval_callback = _get_approval_callback()
+
+                def _codex_approval_callback(command, description, **_kwargs):
+                    from .harness_webui_runtime import harness_approval_command_allowed
+
+                    if not harness_approval_command_allowed(command):
+                        return "deny"
+                    return _wait_for_webui_approval(
+                        {
+                            "command": str(command or ""),
+                            "description": str(description or "Harness workspace action"),
+                            "pattern_keys": [],
+                        }
+                    )
+
+                set_approval_callback(_codex_approval_callback)
+                callback_installed = True
+            except Exception as exc:
+                if registered:
+                    try:
+                        unregister_gateway_notify(session_key)
+                    except Exception:
+                        pass
+                try:
+                    reset_current_session_key(token)
+                except Exception:
+                    pass
+                for key, old_value in old_env.items():
+                    if old_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old_value
+                raise RuntimeError("Harness approval callback unavailable") from exc
+
+    def _cleanup() -> None:
+        if callback_installed:
+            try:
+                from tools.terminal_tool import set_approval_callback
+
+                set_approval_callback(previous_approval_callback)
+            except Exception:
+                pass
+        if registered:
+            try:
+                unregister_gateway_notify(session_key)
+            except Exception:
+                pass
+        try:
+            reset_current_session_key(token)
+        except Exception:
+            pass
+        for key, old_value in old_env.items():
+            try:
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+            except Exception:
+                pass
+
+    return _cleanup
+
+
+def _finalize_aiagent_result(result: Optional[dict], *, redact: Any | None = None) -> str:
+    """Turn the core conversation result into the user-facing reply string.
+
+    Dead-air fix: core's conversation_loop returns ``{failed:True, error:...}``
+    (and ``final_response=None``) on a non-retryable failure, e.g. a provider
+    HTTP 400. Silently flattening that to ``""`` hid the failure, so
+    ``real_run_agent``'s legacy fallback and the router's "⚠️ 模型暂时不可用"
+    message could never fire — the user got complete silence in Feishu.
+
+    Raise on a failed/empty turn so those existing fallbacks activate; return
+    the text on success. A genuine empty-but-successful turn (``final_response``
+    is ``""`` with no ``failed`` flag) still returns ``""`` unchanged.
+
+    Exception — output-length truncation is RECOVERABLE, not a provider failure:
+    core rolls back to the last complete state (``partial:True``) and, in
+    streaming, the user has usually already seen the partial text. Raising would
+    fire the "⚠️ 模型暂时不可用" fallback + a legacy-spike retry that just truncates
+    again, turning a long answer into a hard failure. So on truncation we return a
+    graceful notice instead. Genuine failures (provider 400 etc.) still raise.
+    """
+    redact_text = redact if callable(redact) else (lambda value: str(value or ""))
+    res = result or {}
+    final_response = res.get("final_response")
+    err = redact_text(res.get("error") or "")
+    text = _strip_empty_message_protocol_placeholder(
+        final_response if isinstance(final_response, str) else ""
+    )
+    is_truncation = _is_output_truncation_error(err)
+
+    # Genuine success (incl. a legitimately empty turn): final_response present,
+    # no failure/partial/error flags. Return protocol-sanitized text ("" stays "").
+    if final_response is not None and not res.get("failed") and not res.get("partial") and not err:
+        return text
+
+    # CONTENT-PRESERVING FIRST: if the turn produced ANY answer text, never drop
+    # it — not even when ``failed``/``partial`` is set alongside it (a
+    # length-truncated turn can carry both a rolled-back ``final_response`` AND
+    # ``failed:True``; the old ``not res.get("failed")`` gate discarded that text
+    # and returned the notice alone — a real content-loss bug).
+    if text.strip():
+        if is_truncation:
+            # Genuine output-length truncation with salvageable text: hand the
+            # partial answer back WITH the continue hint, never the notice alone.
+            return text.rstrip() + "\n\n" + _TRUNCATION_NOTICE
+        if not res.get("failed"):
+            # A non-failed turn that produced text (e.g. a non-truncation partial):
+            # return what we have.
+            return text
+        # failed=True, non-truncation, but some text leaked: this is a HARD failure
+        # (provider 400, tool crash). Don't surface possibly-garbage partial text —
+        # fall through to raise so the "模型暂时不可用" fallback / retry fires.
+
+    # No answer text at all. The "回复太长，回复『继续』" notice is meaningless here —
+    # there is nothing to continue — so we never emit it on a textless turn.
+    # Crucially, a genuine answer-length truncation almost always leaves rolled-back
+    # partial text (handled above), so a TEXTLESS turn whose error mentions
+    # "output length" is the core's #2 case (a truncated TOOL-CALL argument), NOT a
+    # long answer — exactly the class that must retry, not show "太长". So for every
+    # textless turn we RAISE, letting real_run_agent / stream_run_agent fall back to
+    # the legacy retry that still produces an answer (pre-1f2974a behavior). The
+    # error string (logged below; also surfaced by the callers' fallback warnings)
+    # distinguishes #1 ("invalid tool call") from #2 ("Response truncated …") in the
+    # journal — the diagnostic the SPEC asked for. (finish_reason is not in the core
+    # result dict; the error string is the available discriminator.)
+    err = err or "agent turn failed without a final response"
+    logger.warning(
+        "[multitenancy][finalize-diag] no usable answer (textless or hard-failed) -> "
+        "raising for legacy retry: partial=%s failed=%s completed=%s truncation=%s error=%r",
+        res.get("partial"), res.get("failed"), res.get("completed"), is_truncation, err,
+    )
+    raise RuntimeError(f"AIAgent turn failed: {err}")
+
+
+_TRUNCATION_NOTICE = (
+    "⚠️ 这次回复内容太长，超出了单条输出的长度上限被截断了。\n"
+    "你可以回复「继续」让我接着往下说，或把问题拆小一点、分几次问，我就能完整回答。"
+)
+
+# Shown only in the streaming path when partial content was ALREADY streamed into
+# the card and the turn then failed (so we cannot cleanly retry without dupes).
+# Distinct from _TRUNCATION_NOTICE: this is "the turn broke", not "answer too long".
+_PARTIAL_FAILURE_NOTICE = "⚠️ 这次回答中途出错了，没能说完。麻烦再发一次试试。"
+
+_WEBUI_IMAGE_LOCAL_PATH_RE = re.compile(r"(?im)^\s*Local image path for tools:\s*(?P<path>.+?)\s*$")
+_WEBUI_IMAGE_ANALYSIS_PROMPT = (
+    "Describe everything visible in this uploaded WebUI image. Include all visible "
+    "text, UI labels, numbers, objects, layout, colors, and any notable visual "
+    "details. Do not infer content that is not visible."
+)
+_WEBUI_IMAGE_PREFLIGHT_MAX_BYTES = 20 * 1024 * 1024
+_WEBUI_IMAGE_PREFLIGHT_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
+
+
+class _WebUIVisionAdmissionRejected(RuntimeError):
+    """Stop a WebUI image turn before the model when vision cannot verify it."""
+
+
+_WEBUI_VISION_UNAVAILABLE_REPLY = (
+    "视觉能力暂不可用：无法可靠读取这张图片。请稍后重试，或联系管理员检查 vision provider。"
+)
+
+
+def _is_output_truncation_error(err: Any) -> bool:
+    text = str(err or "").lower()
+    return "truncat" in text and "output length" in text
+
+
+def _profile_workspace_root(profile_home: Path, config: Mapping[str, Any] | None = None) -> Path:
+    del config
+    return (profile_home / "workspace").resolve(strict=False)
+
+
+def _normalize_webui_uploaded_image_path(raw_path: str) -> str:
+    value = str(raw_path or "").strip().strip("\"'`")
+    value = value.replace("\\", "/")
+    if value == "/workspace" or value == "workspace":
+        return "."
+    if value.startswith("/workspace/"):
+        return value[len("/workspace/"):]
+    if value.startswith("workspace/"):
+        return value[len("workspace/"):]
+    return value
+
+
+def _resolve_webui_uploaded_image_path(
+    raw_path: str,
+    *,
+    workspace_root: Path,
+) -> tuple[Path | None, str | None]:
+    normalized = _normalize_webui_uploaded_image_path(raw_path)
+    if not normalized:
+        return None, "empty path"
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", normalized):
+        return None, "not a local profile-workspace path"
+    candidate = Path(normalized).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError:
+            return None, "outside profile workspace"
+        try:
+            resolved.relative_to((workspace_root / "uploads").resolve(strict=False))
+        except ValueError:
+            return None, "not a WebUI upload image"
+        if not resolved.exists() or not resolved.is_file():
+            return None, "file not found"
+    except OSError:
+        return None, "file not readable"
+    if resolved.suffix.lower() not in _WEBUI_IMAGE_PREFLIGHT_EXTENSIONS:
+        return None, "not a supported image file"
+    try:
+        if resolved.stat().st_size > _WEBUI_IMAGE_PREFLIGHT_MAX_BYTES:
+            return None, "file too large"
+    except OSError:
+        return None, "file not readable"
+    return resolved, None
+
+
+def _webui_image_attachment_paths(user_text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _WEBUI_IMAGE_LOCAL_PATH_RE.finditer(str(user_text or "")):
+        raw_path = match.group("path")
+        normalized = _normalize_webui_uploaded_image_path(raw_path)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        paths.append(raw_path)
+    return paths
+
+
+def _image_file_to_data_url(path: Path) -> str:
+    import base64
+    import mimetypes
+
+    mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+    return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _extract_openai_message_text(response: Any) -> str:
+    if isinstance(response, Mapping):
+        choices = response.get("choices") or []
+        if choices:
+            message = (choices[0] or {}).get("message") or {}
+            return str(message.get("content") or "").strip()
+        return ""
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if isinstance(message, Mapping):
+        return str(message.get("content") or "").strip()
+    return str(getattr(message, "content", "") or "").strip()
+
+
+def _analyze_webui_image_with_openai_compatible_model(
+    path: Path,
+    *,
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
+) -> str | None:
+    if not api_key or not model:
+        return None
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url=base_url or None)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _WEBUI_IMAGE_ANALYSIS_PROMPT},
+                        {"type": "image_url", "image_url": {"url": _image_file_to_data_url(path)}},
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        return _extract_openai_message_text(response) or None
+    except Exception:
+        logger.warning(
+            "[multitenancy] WebUI vision preflight reason=custom_provider_exception"
+        )
+        return None
+
+
+def _analyze_webui_uploaded_image(
+    path: Path,
+    *,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
+) -> tuple[bool, str]:
+    import asyncio
+
+    analysis = ""
+    try:
+        from tools.vision_tools import vision_analyze_tool
+
+        try:
+            timeout_s = max(
+                0.01,
+                float(os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_TIMEOUT_S", "30")),
+            )
+        except ValueError:
+            timeout_s = 30.0
+
+        async def analyze_with_timeout():
+            return await asyncio.wait_for(
+                vision_analyze_tool(
+                    image_url=str(path),
+                    user_prompt=_WEBUI_IMAGE_ANALYSIS_PROMPT,
+                ),
+                timeout=timeout_s,
+            )
+
+        result_json = asyncio.run(analyze_with_timeout())
+        result = json.loads(result_json) if isinstance(result_json, str) else {}
+        analysis = str(result.get("analysis") or "").strip()
+        success = bool(result.get("success")) and bool(analysis)
+        if success:
+            return success, analysis
+        if not analysis:
+            analysis = "vision_analyze returned no analysis."
+    except Exception:
+        logger.warning("[multitenancy] WebUI vision preflight reason=vision_tool_exception")
+        analysis = "vision_analyze failed."
+
+    fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
+        path,
+        api_key=fallback_api_key,
+        base_url=fallback_base_url,
+        model=fallback_model,
+    )
+    if fallback_analysis:
+        return True, fallback_analysis
+    return False, analysis
+
+
+def _enrich_webui_image_attachments_for_aiagent(
+    user_text: str,
+    *,
+    platform_key: str,
+    profile_home: Path,
+    config: Mapping[str, Any] | None = None,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
+    metadata_source: str | None = None,
+) -> str:
+    if (
+        platform_key != "webui"
+        or str(metadata_source or "").strip().lower() == "ingest"
+        or "Local image path for tools:" not in str(user_text or "")
+    ):
+        return user_text
+
+    workspace_root = _profile_workspace_root(profile_home, config)
+    analysis_blocks: list[str] = []
+    for raw_path in _webui_image_attachment_paths(user_text):
+        normalized = _normalize_webui_uploaded_image_path(raw_path)
+        resolved, skip_reason = _resolve_webui_uploaded_image_path(
+            raw_path,
+            workspace_root=workspace_root,
+        )
+        if resolved is None:
+            logger.info(
+                "[multitenancy] WebUI vision admission rejected profile=%s reason=%s",
+                profile_home.name,
+                skip_reason or "path_unavailable",
+            )
+            raise _WebUIVisionAdmissionRejected(_WEBUI_VISION_UNAVAILABLE_REPLY)
+
+        try:
+            success, analysis = _analyze_webui_uploaded_image(
+                resolved,
+                fallback_api_key=fallback_api_key,
+                fallback_base_url=fallback_base_url,
+                fallback_model=fallback_model,
+            )
+        except Exception as exc:
+            reason = "analysis_timeout" if isinstance(exc, TimeoutError) else "analysis_exception"
+            logger.warning(
+                "[multitenancy] WebUI vision admission rejected profile=%s reason=%s",
+                profile_home.name,
+                reason,
+            )
+            raise _WebUIVisionAdmissionRejected(_WEBUI_VISION_UNAVAILABLE_REPLY) from exc
+        if not success:
+            logger.info(
+                "[multitenancy] WebUI vision admission rejected profile=%s reason=analysis_unavailable",
+                profile_home.name,
+            )
+            raise _WebUIVisionAdmissionRejected(_WEBUI_VISION_UNAVAILABLE_REPLY)
+        analysis_blocks.append(
+            "\n".join([
+                "[WebUI image attachment analysis]",
+                f"Image path: {normalized}",
+                f"Resolved file: {resolved}",
+                "Source: WebUI image preflight on the uploaded profile-workspace file.",
+                "Status: success",
+                "Analysis:",
+                analysis,
+                "[End WebUI image attachment analysis]",
+            ])
+        )
+
+    if not analysis_blocks:
+        return user_text
+    return "\n\n".join(analysis_blocks + [user_text])
+
+
+
+
+def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
+    """Re-tag every ``source='api_server'`` row in this profile to ``'feishu'``.
+
+    Hermes-agent always writes ``sessions.source = 'api_server'`` for
+    AIAgent.run_conversation() (even with ``platform='feishu'``), and the
+    SQLite row id is unrelated to the AIAgent session_id we hold in this
+    scope, so we can't target one row. The per-user Feishu profile only
+    ever receives Feishu-routed traffic from the multitenancy router, so
+    it is safe to rewrite the whole api_server bucket in this profile.
+
+    ``session_id`` is kept in the signature for future per-row targeting
+    (e.g. via a session-id ↔ row-id mapping table). For now it's unused.
+    """
+    import sqlite3
+
+    db_path = profile_home / "state.db"
+    if not db_path.exists():
+        return
+    with sqlite3.connect(str(db_path)) as conn:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone() is None:
+            return
+        cur = conn.execute(
+            "UPDATE sessions SET source = 'feishu' WHERE source = 'api_server'"
+        )
+        if cur.rowcount:
+            logger.info(
+                "[multitenancy] rewrote %d session(s) source=api_server -> feishu in %s",
+                cur.rowcount, db_path,
+            )
+        conn.commit()
+
+
+
+
+def _fallback_default_toolsets(platform_key: str) -> list[str]:
+    """Core toolsets to preserve when Hermes' platform resolver is unavailable."""
+    if platform_key in {"api_server", "webui"}:
+        return ["file", "terminal", "web"]
+    return []
+
+
+def _normalize_toolset_list(value: Any) -> list[str]:
+    """Return a sorted list of non-empty string toolset names."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, (set, tuple)):
+        items = list(value)
+    else:
+        return []
+    return sorted({str(item).strip() for item in items if str(item).strip()})
+
+
+def _resolve_disabled_toolsets(config: dict[str, Any]) -> list[str]:
+    """Return profile/global toolsets that Hermes core should subtract."""
+    agent_cfg = config.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        disabled: list[str] = []
+    else:
+        disabled = _normalize_toolset_list(agent_cfg.get("disabled_toolsets"))
+    try:
+        from ..expert_bot_route import READONLY_DISABLED_TOOLSETS, feishu_expert_readonly_enabled
+
+        readonly = feishu_expert_readonly_enabled()
+        readonly_disabled_toolsets = READONLY_DISABLED_TOOLSETS
+    except Exception:
+        readonly = False
+        readonly_disabled_toolsets = frozenset()
+    if readonly:
+        return sorted(set(disabled) | set(readonly_disabled_toolsets))
+    return disabled
+
+
+def _toolsets_mode(config: dict[str, Any], platform_key: str | None = None) -> str:
+    """Return multitenancy toolset resolution mode."""
+    env_mode = os.getenv("HERMES_MULTITENANCY_TOOLSETS_MODE")
+    if env_mode:
+        return env_mode.strip().lower()
+    plugin_cfg = config.get("multitenancy") or {}
+    if isinstance(plugin_cfg, dict):
+        if platform_key:
+            platform_modes = plugin_cfg.get("platform_toolsets_mode")
+            if isinstance(platform_modes, dict):
+                mode = platform_modes.get(platform_key)
+                if mode:
+                    return str(mode).strip().lower()
+        mode = plugin_cfg.get("toolsets_mode")
+        if mode:
+            return str(mode).strip().lower()
+    return "merge_default"

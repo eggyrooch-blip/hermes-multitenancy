@@ -1,0 +1,13 @@
+# 每小时触发 hermes-token-uploader.service。
+[Unit]
+Description=Run Hermes token usage uploader hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+# 随机错峰，避免整点齐打收集端。
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

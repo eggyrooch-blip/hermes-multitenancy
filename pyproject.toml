@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-multitenancy"
+version = "0.1.0"
+description = "Multi-tenant Feishu routing for hermes-agent — one bot, N users, N profiles"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Hermes Multitenancy Contributors"}]
+requires-python = ">=3.11"
+keywords = ["hermes", "feishu", "lark", "multi-tenant", "agent", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    # hermes-agent provides the plugin host (PluginContext / pre_gateway_dispatch hook)
+    # plus all the FeishuAdapter/MessageEvent/RoutingTable types we extend. Keep
+    # this aligned with the published Hermes Agent line; local development is
+    # verified against 0.21.5 while retaining the existing host version range.
+    "hermes-agent>=0.14,<1.0",
+    "aiohttp>=3.9",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+    "mcp>=1.26,<3",
+    "cryptography>=43.0",
+    "tencentcloud-sdk-python-vod>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/eggyrooch-blip/hermes-multitenancy"
+Repository = "https://github.com/eggyrooch-blip/hermes-multitenancy"
+Issues = "https://github.com/eggyrooch-blip/hermes-multitenancy/issues"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "pytest-xdist>=3.5",
+    "aiohttp>=3.9",
+    "openpyxl>=3.1",
+    "Pillow>=10",
+    "python-docx>=1.1",
+    "reportlab>=4.0",
+]
+
+[project.scripts]
+hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
+hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:main"
+hermes-multitenancy-analytics = "hermes_multitenancy.analytics.cli:main"
+hermes-multitenancy-doctor = "hermes_multitenancy.doctor:main"
+hermes-multitenancy-ingest = "hermes_multitenancy.ingest_key_admin_cli:main"
+hermes-multitenancy-update-center = "hermes_multitenancy.update_center_cli:main"
+hermes-multitenancy-billing-shadow = "hermes_multitenancy.billing_shadow:main"
+hermes-multitenancy-billing-refresh = "hermes_multitenancy.billing_employee_key:refresh_main"
+hermes-multitenancy-account-ledger-export = "hermes_multitenancy.account_ledger_export:main"
+hermes-agent-relay = "hermes_multitenancy.agent_relay:main"
+hermes-multitenancy-mcp = "hermes_multitenancy.connector_mcp_http:main"
+hermes-multitenancy-mcp-config = "hermes_multitenancy.connector_client_adapters:main"
+hermes-multitenancy-connector-conformance = "hermes_multitenancy.connector_catalog_conformance:main"
+hermes-multitenancy-connector-icon-import = "hermes_multitenancy.connector_icon_import:main"
+hermes-multitenancy-connector-probe = "hermes_multitenancy.connector_remote_probe:main"
+hermes-multitenancy-connector-remote-sweep = "hermes_multitenancy.connector_remote_sweep:main"
+hermes-multitenancy-connector-stdio-admission = "hermes_multitenancy.connector_stdio_admission:main"
+hermes-multitenancy-connector-credential-schema = "hermes_multitenancy.connector_credential_schema:main"
+hermes-multitenancy-connector-report = "hermes_multitenancy.connector_conformance_report:main"
+hermes-multitenancy-connector-stdio-sandbox = "hermes_multitenancy.connector_stdio_sandbox:main"
+
+[project.entry-points."hermes_agent.plugins"]
+multitenancy = "hermes_multitenancy"
+
+# hermes-agent comes from the production core line (tag prod-core-v0215-d4c7a42567,
+# hermes-agent 0.21.5), published as a wheel to this project's GitLab PyPI
+# registry — the fork is never on public PyPI. Only `uv lock` needs credentials for
+# the simple index (UV_INDEX_HERMES_CORE_USERNAME / _PASSWORD, e.g. any user + a
+# read_api token); installing from uv.lock downloads the sha256-addressed file URL
+# and needs none. Production does not use this: hermes-release.sh installs MT with
+# `uv pip install --no-deps -e` into the separately released core venv.
+[[tool.uv.index]]
+name = "hermes-core"
+url = "https://gitlab.example.com/api/v4/projects/2765/packages/pypi/simple"
+explicit = true
+
+[tool.uv.sources]
+hermes-agent = { index = "hermes-core" }
+
+[tool.uv]
+constraint-dependencies = ["hermes-agent==0.21.5"]
+
+[tool.setuptools]
+packages = ["hermes_multitenancy", "hermes_multitenancy.agent_real", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.compat", "hermes_multitenancy.connectors", "hermes_multitenancy.cron", "hermes_multitenancy.credential_hub", "hermes_multitenancy.credential_hub.readers", "hermes_multitenancy.router", "hermes_multitenancy.sync", "hermes_multitenancy.webui_broker"]
+
+[tool.setuptools.package-data]
+hermes_multitenancy = ["plugin.yaml", "connector_catalog_data/*.jsonl", "connector_catalog_data/icons/*"]

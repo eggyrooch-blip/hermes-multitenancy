@@ -1,0 +1,12 @@
+# 每日 03:00 触发备份（低峰；与 kep-sync 的 04:30 错开，避免同时抢 IO）。
+[Unit]
+Description=Run Hermes local backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=10min
+# 关机/重启错过的那次开机后补跑——备份漏一天比晚一小时严重得多。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

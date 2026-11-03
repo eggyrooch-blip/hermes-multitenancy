@@ -1,0 +1,11 @@
+# 每月 1 号 05:30 演练。避开 03:00 备份与 04:30 kep-sync 两个窗口。
+[Unit]
+Description=Run Hermes restore drill monthly
+
+[Timer]
+OnCalendar=*-*-01 05:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

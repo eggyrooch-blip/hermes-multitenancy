@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# hermes-backup.sh — hermes-1 每日本机备份（两层数据）
+#
+#   第一层 状态核心 (~126MB)：6 个 sqlite + config + 凭证。每日全量，保留 30 份。
+#   第二层 用户数据 (~40GB)：profiles/。每日硬链增量快照，保留 7 份。
+#
+# 重要：本机备份不是灾备。它能救误删/误改/发布搞砸，救不了盘坏和机器炸。
+#       异地那一步做完之前，不要把这套描述成“备份已完成”。
+#
+# 所有路径都可用环境变量覆盖，这样测试能在临时目录里跑真逻辑。
+set -euo pipefail
+
+HERMES_HOME_DIR="${HERMES_HOME_DIR:-$HOME/.hermes}"
+HERMES_WEBUI_DIR="${HERMES_WEBUI_DIR:-$HOME/.hermes-web-ui}"
+BACKUP_ROOT="${BACKUP_ROOT:-$HOME/backups/daily}"
+MIN_FREE_GB="${MIN_FREE_GB:-30}"
+KEEP_STATE="${KEEP_STATE:-30}"
+KEEP_PROFILES="${KEEP_PROFILES:-7}"
+SKIP_PROFILES="${SKIP_PROFILES:-0}"   # 测试用：跳过 40G 那一层
+# 首次全量 profiles 需要额外空间（生产实测排除缓存后约 18G，留余量按 25G 记）。
+# 有上一份快照时走硬链增量，只需要变化量，不再吃这一笔。
+FIRST_FULL_GB="${FIRST_FULL_GB:-25}"
+# profiles 下有读不到的文件时是否允许继续。默认不允许 —— 备份静默漏数据是最坏的失败模式。
+ALLOW_UNREADABLE="${ALLOW_UNREADABLE:-0}"
+# 排除清单默认跟脚本放在一起（部署后是 deploy/hermes-backup-excludes.txt）
+EXCLUDE_FILE="${EXCLUDE_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-backup-excludes.txt}"
+LOCK_FILE="${LOCK_FILE:-$BACKUP_ROOT/.lock}"
+RSYNC_BWLIMIT_KBPS="${RSYNC_BWLIMIT_KBPS:-1024}"
+# ionice 的可执行名。生产（util-linux）有，macOS 没有，所以必须能退化。
+# 留成变量只为一件事：让测试能确定性地跑「机器上没有 ionice」那条分支。
+IONICE_BIN="${IONICE_BIN:-ionice}"
+
+TS="$(date +%Y%m%dT%H%M%S)"
+STATE_ROOT="$BACKUP_ROOT/state"
+PROFILES_ROOT="$BACKUP_ROOT/profiles"
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# 共享盘的补备写入曾阻塞 gateway heartbeat；优先级不能代替吞吐上限。
+# ponytail: 仅限制 rsync 传输，目录扫描/校验仍由既有 IO 优先级控制。
+[[ "$RSYNC_BWLIMIT_KBPS" =~ ^[1-9][0-9]*$ ]] \
+  || die "RSYNC_BWLIMIT_KBPS 必须为正整数 KiB/s（0 会关闭限速，拒绝）"
+
+# ── 重 IO 一律降到 idle 类 ──────────────────────────────────────────
+# 2026-09-18 与 2026-09-21 两次发布的「发布前回滚包」各把 gateway 卡死 13 分钟：
+# 两个库共 230MB 的 sqlite .backup + integrity_check 无限速地打在机械盘上，
+# 而这条路径 SKIP_PROFILES=1，RSYNC_BWLIMIT_KBPS 根本轮不到生效。
+# unit 级 IOSchedulingClass=best-effort prio 7 在 wbt 把队列深度压到 1 时没有意义 ——
+# 只有 idle 类（-c3）才会在别人要 IO 时彻底让路。CPU 侧顺手压到最低。
+# nice/ionice 的设置会被子进程继承，所以包住 xargs 就等于包住 sha256sum。
+if command -v "$IONICE_BIN" >/dev/null 2>&1; then
+  run_io() { "$IONICE_BIN" -c3 nice -n19 "$@"; }
+else
+  log "ionice 不可用，退化为 nice"
+  run_io() { nice -n19 "$@"; }
+fi
+
+# ── 单实例：备份自己不能并发跑 ───────────────────────────────────────
+mkdir -p "$BACKUP_ROOT"
+if command -v flock >/dev/null 2>&1; then
+  # Linux(生产)走这条:进程被 kill 时内核自动释放,不会留死锁
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "另一个备份正在运行（$LOCK_FILE 被占用），本次退出"
+else
+  # macOS 没有 flock(只在本地跑测试时走这条)。mkdir 是 POSIX 原子操作。
+  # 加个陈旧锁自动清理,免得一次硬崩就让备份永久停摆 —— 静默停摆是备份系统最坏的失败模式。
+  LOCK_DIR="$LOCK_FILE.d"
+  if [ -d "$LOCK_DIR" ] && [ -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin -360 2>/dev/null)" ]; then
+    rm -rf "$LOCK_DIR"
+  fi
+  mkdir "$LOCK_DIR" 2>/dev/null || die "另一个备份正在运行（$LOCK_DIR 存在），本次退出"
+  # 注意：这里不单独挂 EXIT trap —— 下面 cleanup_all 是唯一的 EXIT 处理者，
+  # 多挂一次会把前一个覆盖掉（bash 的 trap 是覆盖不是叠加）。
+fi
+
+# ── 磁盘前置检查:宁可不备,也不能把盘写满造成真故障 ──────────────────
+# df -Pk 是 POSIX 的，Linux 和 macOS 都认 —— 测试才能在两边都跑
+free_kb=$(df -Pk "$BACKUP_ROOT" | awk 'NR==2{print $4}')
+[ -n "$free_kb" ] || die "无法读取 $BACKUP_ROOT 的可用空间"
+free_gb=$((free_kb / 1024 / 1024))
+# 门槛要随本次真正会写多少而变：首次 profiles 全量要吃掉一整份（~18G 实测），
+# 之后走硬链增量只写变化量。用固定 30G 门槛去挡一次 25G 的写入是挡不住的。
+need_gb="$MIN_FREE_GB"
+if [ "$SKIP_PROFILES" != "1" ] && [ -d "$HERMES_HOME_DIR/profiles" ] \
+   && [ -z "$(ls -1d "$PROFILES_ROOT"/*/ 2>/dev/null | head -1)" ]; then
+  need_gb=$((MIN_FREE_GB + FIRST_FULL_GB))
+  log "本次是 profiles 首次全量，磁盘门槛提高到 ${need_gb}G"
+fi
+if [ "$free_gb" -lt "$need_gb" ]; then
+  die "可用空间 ${free_gb}G < 下限 ${need_gb}G —— 拒绝执行，未产生任何备份目录"
+fi
+log "磁盘检查通过：可用 ${free_gb}G ≥ ${need_gb}G"
+
+# ── 第一层:状态核心 ─────────────────────────────────────────────────
+# 先写 staging，全部校验通过才原子改名 —— 保证目录里不会出现半份备份。
+STAGING="$STATE_ROOT/.staging-$TS"
+rm -rf "$STAGING"
+mkdir -p "$STAGING/db" "$STAGING/config"
+# .env / auth.json / token 都在里面，目录必须自己就是 700
+chmod 700 "$STAGING"
+
+# staging 必须在任何退出路径上清干净：报错、被 kill、被 systemd 停都算。
+# 只挂 ERR 的话，SIGTERM/SIGINT 会留下半份 staging，下次跑还可能把它当成"上一份"。
+# 两层各有各的 staging，都要收。
+STAGING_PROF=""
+cleanup_all() {
+  rm -rf "${STAGING:-}" ${STAGING_PROF:+"$STAGING_PROF"}
+  # 已落地但还没拿到哨兵的 state 目录 = 半份备份，同样要收走，
+  # 否则它会一直躺在那里冒充"最新一份"。
+  if [ -n "${STATE_DEST:-}" ] && [ -d "$STATE_DEST" ] && [ ! -f "$STATE_DEST/COMPLETE" ]; then
+    rm -rf "$STATE_DEST"
+    # 配套的 profiles 也要一起收：留下一个"更新的"孤儿 profiles 目录，
+    # 会被下次演练配到更老的 state 上，凑成一个从未同时产出的组合。
+    [ -n "${PROF_DEST:-}" ] && [ -d "$PROF_DEST" ] && rm -rf "$PROF_DEST"
+  fi
+  [ -n "${LOCK_DIR:-}" ] && rm -rf "$LOCK_DIR"
+  return 0
+}
+trap cleanup_all EXIT
+trap 'cleanup_all; exit 143' TERM
+trap 'cleanup_all; exit 130' INT
+
+DBS=(
+  "$HERMES_HOME_DIR/multitenancy.db"
+  "$HERMES_HOME_DIR/state.db"
+  "$HERMES_HOME_DIR/kanban.db"
+  "$HERMES_HOME_DIR/multitenancy_routing.db"
+  "$HERMES_WEBUI_DIR/hermes-web-ui.db"
+  "$HERMES_WEBUI_DIR/web-ui.db"
+)
+
+backed_up=0
+missing=""
+empty=""
+for src in "${DBS[@]}"; do
+  name="$(basename "$src")"
+  if [ ! -f "$src" ]; then
+    # 这 6 个库是写死的已知清单，缺一个就是异常，不能像"可选文件"那样悄悄跳过。
+    # 记进 MANIFEST 并在结尾大声报，让人能看见"这次没备到什么"。
+    # 花括号是必须的:变量后紧跟中文时,老 bash(3.2,macOS 自带)会把多字节首字节
+    # 当成变量名的一部分,报 unbound variable。生产的 bash 5 没这问题,但两边都要能跑。
+    log "⚠️  ${name} 不存在 —— 未纳入本次备份"
+    missing="${missing}${name},"
+    continue
+  fi
+  if [ ! -s "$src" ]; then
+    # 0 字节的"库"（生产上 multitenancy_routing.db / web-ui.db 就是）。
+    # 关键：绝不能对它执行 sqlite3 打开 —— sqlite 会给空文件写入头部，
+    # 那就违反了"备份只读生产、绝不写"这条硬约束。直接记账跳过。
+    log "  ${name} 是 0 字节，跳过（避免 sqlite 初始化它 = 写生产）"
+    empty="${empty}${name},"
+    continue
+  fi
+  dst="$STAGING/db/$name"
+  # .backup 是 sqlite 的在线备份：不阻塞写入者，且能正确带走 WAL 里的内容。
+  # 绝不能用 cp —— WAL 模式下热拷贝会拷出损坏的库。
+  # .timeout 让它在热写入下重试而不是直接放弃。
+  #
+  # 为什么不用评审建议的 `file:...?immutable=1`：immutable 是在向 sqlite 断言
+  # "这个文件不会变"。生产库一直在写，这个断言是假的，sqlite 会因此忽略 WAL，
+  # 读出撕裂或过期的镜像 —— 那是比"可能写一个字节"严重得多的正确性问题。
+  # 真正的风险（对空文件写头部）已在上面用 `! -s` 挡掉了。
+  run_io sqlite3 -cmd ".timeout 60000" "$src" ".backup '$dst'" \
+    || die "$name .backup 失败"
+
+  # 副本落地时会继承 WAL 模式，于是旁边多出 -wal/-shm。实测主文件本身已自足，
+  # 但把副本切回 delete 模式能 checkpoint 并删掉旁文件 —— 恢复时“只拷 .db”就绝不会漏数据，
+  # 也不会有易变的旁文件混进 SHA256SUMS。
+  run_io sqlite3 "$dst" "pragma journal_mode=delete;" >/dev/null 2>&1 || true
+
+  # 校验副本本身。未经校验的备份比没有备份更危险 —— 风险模型正压在它身上。
+  chk="$(run_io sqlite3 "$dst" "pragma integrity_check;" 2>&1 | head -1)"
+  [ "$chk" = "ok" ] || die "$name 副本校验失败：$chk"
+  # 副本已是 delete 模式，旁文件此刻只是打开时留下的空壳，删掉让备份目录里只剩纯 .db
+  rm -f "$dst-wal" "$dst-shm"
+  log "  $name integrity_check: ok"
+  backed_up=$((backed_up + 1))
+done
+[ "$backed_up" -gt 0 ] || die "一个库都没备份到，检查 HERMES_HOME_DIR/HERMES_WEBUI_DIR"
+
+# 配置与凭证属于恢复关键资产；缺失时不能产出“完整”哨兵。
+for f in "$HERMES_HOME_DIR/config.yaml" "$HERMES_HOME_DIR/.env" "$HERMES_HOME_DIR/auth.json"; do
+  [ -s "$f" ] || die "关键配置缺失或为空：$(basename "$f")"
+  run_io cp -p "$f" "$STAGING/config/"
+done
+[ -d "$HERMES_HOME_DIR/feishu_uat" ] \
+  && [ -n "$(find "$HERMES_HOME_DIR/feishu_uat" -type f -print -quit 2>/dev/null)" ] \
+  || die "关键凭证目录 feishu_uat 缺失或为空"
+run_io cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/"
+
+# MANIFEST + 校验和：演练时靠它判断“恢复出来的是不是当初那份”
+{
+  echo "backup_ts=$TS"
+  echo "host=$(hostname)"
+  echo "source_home=$HERMES_HOME_DIR"
+  echo "source_webui=$HERMES_WEBUI_DIR"
+  echo "db_count=$backed_up"
+  # 没备到什么必须写在案上，跟 profiles_excludes 同理
+  echo "db_missing=${missing:-(none)}"
+  echo "db_empty_skipped=${empty:-(none)}"
+  echo "kind=local-only  # 本机备份，非灾备：异地未做"
+  # 排除了什么必须写在案上。静默排除是备份系统最阴险的失败模式——
+  # 等真要恢复时才发现某个目录从来没被备过。
+  if [ -f "$EXCLUDE_FILE" ]; then
+    echo "profiles_excludes=$(grep -v '^#' "$EXCLUDE_FILE" | grep -v '^$' | tr '\n' ',' | sed 's/,$//')"
+  else
+    echo "profiles_excludes=(none)"
+  fi
+  # 逐表行数。演练靠它判断“还原出来的和当初备下来的是不是一模一样”。
+  # 注意不能拿它跟“当下的生产”比 —— 生产一直在写，几小时前的快照必然落后。
+  # 能且只能要求：还原结果 == 备份时刻记录的行数，差 0。
+  for d in "$STAGING"/db/*.db; do
+    dbn="$(basename "$d")"
+    echo "table_count ${dbn}=$(run_io sqlite3 "$d" 'select count(*) from sqlite_master where type="table";')"
+    run_io sqlite3 "$d" "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name;" \
+    | while read -r t; do
+        [ -n "$t" ] || continue
+        echo "rows ${dbn}.${t}=$(run_io sqlite3 "$d" "select count(*) from \"$t\";")"
+      done
+  done
+} > "$STAGING/MANIFEST.txt"
+# Linux 是 sha256sum，macOS 只有 shasum。生产走前者，本地测试走后者。
+if command -v sha256sum >/dev/null 2>&1; then SUM=(sha256sum); else SUM=(shasum -a 256); fi
+( cd "$STAGING" && find . -type f ! -name SHA256SUMS -print0 | run_io xargs -0 "${SUM[@]}" > SHA256SUMS )
+
+trap - ERR
+# 时间戳只精确到秒。同一秒内跑两次(手动触发撞上定时器、或发布前备份紧跟日备)时目标已存在，
+# 而 `mv A B` 在 B 是已存在目录时会把 A 塞进 B 里，产生嵌套的烂摊子。加序号避开。
+uniq_dest() {
+  # 后缀必须用 `_` 不能用 `-`：prune 是按名字 sort 找最老的，
+  # 而 '-'(0x2D) < '/'(0x2F)，`...618-2/` 会排在 `...618/` 前面被当成更老的先删，
+  # 于是刚做好的那一份反而被裁掉。'_'(0x5F) > '/'，排序才是对的。
+  local base="$1" n=1 dest="$1"
+  while [ -e "$dest" ]; do n=$((n + 1)); dest="$(printf '%s_%02d' "$base" "$n")"; done
+  printf '%s' "$dest"
+}
+STATE_DEST="$(uniq_dest "$STATE_ROOT/$TS")"
+mv "$STAGING" "$STATE_DEST"
+STAGING=""   # 已落地，别让 cleanup 再去动它
+# 注意：哨兵不在这里落。两层都成功才算一份完整备份 —— 见文件末尾。
+# 评审 round 2 抓到的：如果在这里就标 COMPLETE，随后 profiles 失败，
+# 演练会挑中这份"完整"的状态核心、再自己去配一份更老的 profiles 快照，
+# 然后对一份两层从未同时完成的备份报"通过"。假绿比没有备份更危险。
+log "状态核心完成 → ${STATE_DEST}（${backed_up} 个库）"
+
+# ── 第二层:profiles 硬链增量 ────────────────────────────────────────
+# --link-dest 让没变过的文件在新快照里只是一个硬链接，不占额外空间。
+# 首次全量约 40G，之后每天只增加变化量。
+if [ "$SKIP_PROFILES" = "1" ]; then
+  log "按 SKIP_PROFILES=1 跳过 profiles 层（仅测试用）"
+elif [ ! -d "$HERMES_HOME_DIR/profiles" ]; then
+  # profiles 是 sunke 明确要求必须备的那 40G。目录不在 = 环境不对，
+  # 不能像"可选项"一样静默跳过，否则会天天产出"成功"的半份备份。
+  die "profiles 目录不存在：$HERMES_HOME_DIR/profiles —— 拒绝产出只有状态核心的半份备份"
+else
+  mkdir -p "$PROFILES_ROOT"
+  prev="$(ls -1d "$PROFILES_ROOT"/*/ 2>/dev/null | sort | tail -1 || true)"
+  link_arg=()
+  [ -n "$prev" ] && link_arg=(--link-dest="${prev%/}")
+  # 排除清单:只排"机器能重新生成"的(npm/pip 缓存、tmp、编译产物),员工文件一个不落。
+  # 放在独立文件里,以后要调整不用改脚本。
+  excl_arg=()
+  [ -f "$EXCLUDE_FILE" ] && excl_arg=(--exclude-from="$EXCLUDE_FILE")
+
+  # ${a[@]+"${a[@]}"} 而不是 "${a[@]}":bash<4.4(含 macOS 自带的 3.2)在 set -u 下
+  # 会把空数组当成未绑定变量直接报错。生产 bash 5 无所谓,但测试要两边都能跑。
+  # 备份进程读不到的文件会被 rsync 悄悄跳过 —— 这是备份系统最阴险的漏数据方式。
+  # 这台机器上历史反复出现 root 跑出来的文件落在 profiles 里（2026-08-01 修过 276 个），
+  # 所以每次都先数一遍，有就大声报出来，绝不让它静默通过。
+  # 权限判断用 POSIX `-exec sh -c ... {} +` 批量交给 shell 内建 test，Linux/macOS
+  # 行为一致；不能在开发机因 BSD find 缺少 GNU 的 -readable 就跳过这条门禁。
+  # 不能写成 `-exec test -r {} \;`：那会每个文件起一个进程，hermes-1 的 execve
+  # 全量审计因此每天多出 6-7G 日志，2026-09-29 写满根盘、auditd 停记 9 天。
+  set +e
+  unreadable_items="$(find "$HERMES_HOME_DIR/profiles" \( -type f -o -type d \) \
+    -exec sh -c '
+      for p do
+        if [ -d "$p" ]; then
+          { [ -r "$p" ] && [ -x "$p" ]; } || printf "%s\n" "$p"
+        else
+          [ -r "$p" ] || printf "%s\n" "$p"
+        fi
+      done
+      exit 0' sh {} + 2>/dev/null)"
+  scan_rc=$?
+  set -e
+  unreadable=0
+  [ -z "$unreadable_items" ] || unreadable="$(printf '%s\n' "$unreadable_items" | wc -l | tr -d ' ')"
+  if [ "$scan_rc" -ne 0 ] || [ "$unreadable" -gt 0 ]; then
+    log "⚠️  profiles 下有 ${unreadable} 个项目当前用户读不到，它们不会进备份："
+    [ "$scan_rc" -eq 0 ] || log "    reason=traversal_incomplete"
+    locator_map="$(mktemp "$BACKUP_ROOT/unreadable-items-$TS.XXXXXX")"
+    chmod 600 "$locator_map"
+    shown=0
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      case "$path" in
+        "$HERMES_HOME_DIR/profiles") rel="." ;;
+        "$HERMES_HOME_DIR/profiles"/*) rel="${path#"$HERMES_HOME_DIR/profiles/"}" ;;
+        *) continue ;;
+      esac
+      handle="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+      python3 - "$locator_map" "$handle" "$rel" <<'PY'
+import json, sys
+with open(sys.argv[1], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"handle": sys.argv[2], "relative_path": sys.argv[3]}, ensure_ascii=False) + "\n")
+PY
+      log "    safe_locator=unreadable:${handle} reason=not_readable"
+      shown=$((shown + 1))
+      [ "$shown" -ge 5 ] && break
+    done <<< "$unreadable_items"
+    log "    locator_map=$locator_map mode=0600"
+    log "    仅修对应单文件的属主/读权限；禁止对 profiles 递归 chown"
+    # 只警告不拦是不够的：一份"成功"但静默漏了几百个文件的备份，
+    # 会在真要恢复的那天才暴露。默认硬拦；确实要带病跑就显式 ALLOW_UNREADABLE=1。
+    [ "$ALLOW_UNREADABLE" = "1" ] \
+      || die "拒绝产出会静默漏数据的备份（如确认可接受，用 ALLOW_UNREADABLE=1 显式放行）"
+  fi
+
+  STAGING_PROF="$PROFILES_ROOT/.staging-$TS"
+  set +e
+  rsync -a --delete --bwlimit="$RSYNC_BWLIMIT_KBPS" ${link_arg[@]+"${link_arg[@]}"} ${excl_arg[@]+"${excl_arg[@]}"} \
+    "$HERMES_HOME_DIR/profiles/" "$STAGING_PROF/" >/dev/null 2>&1
+  rc=$?
+  set -e
+  # rsync 退出码：0=全好；24=传输中有文件消失（agent 在跑，属正常）；其余都当失败。
+  case "$rc" in
+    0) ;;
+    24) log "  （有文件在传输中消失，属正常：agent 一直在写）" ;;
+    *) die "profiles 增量快照失败，rsync 退出码 $rc" ;;
+  esac
+  PROF_DEST="$(uniq_dest "$PROFILES_ROOT/$TS")"
+  mv "$STAGING_PROF" "$PROF_DEST"
+  STAGING_PROF=""   # 已落地，别让 cleanup 再去动它
+  # 同 pipefail 坑:统计命令不参与 -e 判定(生产上演练脚本已被这个坑咬过一次)
+  set +e +o pipefail
+  nprof=$(find "$PROF_DEST" -type f 2>/dev/null | wc -l | tr -d ' ')
+  set -e -o pipefail
+  [ "$nprof" -gt 0 ] || die "profiles 快照产出 0 个文件 —— 空备份不算成功"
+  # 内容清单必须在备份时刻固化。恢复时若快照后来被改坏，不能拿“坏后的源”跟
+  # “刚从坏源复制出的副本”互相比较后假绿。
+  ( cd "$PROF_DEST" && find . -type f -print0 | run_io xargs -0 "${SUM[@]}" ) \
+    > "$STATE_DEST/PROFILE_SHA256SUMS"
+  python3 - "$PROF_DEST" > "$STATE_DEST/PROFILE_SYMLINKS.json" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+links = []
+for base, dirs, files in os.walk(root, followlinks=False):
+    for name in dirs + files:
+        path = os.path.join(base, name)
+        if os.path.islink(path):
+            links.append([os.path.relpath(path, root), os.readlink(path)])
+json.dump(sorted(links), sys.stdout, ensure_ascii=False, separators=(",", ":"))
+PY
+  ( cd "$STATE_DEST" && run_io "${SUM[@]}" PROFILE_SHA256SUMS PROFILE_SYMLINKS.json >> SHA256SUMS )
+  log "profiles 快照完成 → ${PROF_DEST}（${nprof} 个文件$([ -n "$prev" ] && echo "，增量，基于 $(basename "${prev%/}")" || echo "，首次全量")）"
+fi
+
+# ── 完成哨兵：走到这里才算两层都成功 ────────────────────────────────
+# 内容里带上本次配套的 profiles 快照名，演练据此确认两层是同一次产出的。
+# 先写 .tmp 再 rename —— 哨兵本身必须原子出现，不能被读到写了一半的版本
+{
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "profiles_snapshot=${PROF_DEST:-(skipped)}"
+} > "$STATE_DEST/.COMPLETE.tmp"
+mv "$STATE_DEST/.COMPLETE.tmp" "$STATE_DEST/COMPLETE"
+
+# ── 保留策略:安全机制不能自己把盘撑爆 ───────────────────────────────
+# 顺序：先落哨兵再裁剪。反过来的话，裁剪可能把本次刚落地、还没标完成的目录删掉。
+prune() {
+  local root="$1" keep="$2"
+  [ -d "$root" ] || return 0
+  local n; n=$(ls -1d "$root"/*/ 2>/dev/null | wc -l)
+  if [ "$n" -gt "$keep" ]; then
+    ls -1d "$root"/*/ | sort | head -n "$((n - keep))" | while read -r old; do
+      # profiles 快照里有用户 home 的 Go modules 等只读文件（go mod cache 的
+      # 文件权限是 0444），rm -rf 会 permission denied 导致整个备份退出码 1。
+      # 先 chmod -R u+w 解除只读位再删（生产 #backup-fail-20260806）。
+      chmod -R u+w "$old" 2>/dev/null || true
+      rm -rf "$old"; log "  裁剪 $(basename "${old%/}")"
+    done
+  fi
+}
+prune "$STATE_ROOT" "$KEEP_STATE"
+prune "$PROFILES_ROOT" "$KEEP_PROFILES"
+
+[ -z "$missing" ] || log "⚠️  本次未备到的库：${missing%,}"
+[ -z "$empty" ] || log "  （0 字节跳过：${empty%,}）"
+log "备份完成。提醒：这是本机备份，不是灾备 —— 异地尚未建立。"

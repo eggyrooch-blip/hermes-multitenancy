@@ -1,0 +1,10555 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import logging
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import asyncio
+import contextvars
+import types
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from tests._sync import SYNC_TIMEOUT
+
+
+def _jwt_with_exp(exp_seconds: int) -> str:
+    def _b64(payload: dict[str, object]) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    return f"{_b64({'alg': 'HS256', 'typ': 'JWT'})}.{_b64({'exp': exp_seconds})}.signature"
+
+
+def _event() -> SimpleNamespace:
+    return SimpleNamespace(
+        text="hello",
+        message_id="om_test",
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="feishu"),
+            chat_id="oc_test",
+            chat_name="chat",
+            chat_type="dm",
+            user_id="ou_test",
+            user_name="tester",
+            user_id_alt="on_test",
+            message_id="om_source",
+        ),
+    )
+
+
+def test_lark_cli_tool_call_persistence_keeps_only_non_sensitive_shape() -> None:
+    from hermes_multitenancy.agent_real.streaming import _persistable_tool_call
+
+    payload = _persistable_tool_call(
+        "lark_cli",
+        "lark_cli im +messages-send --text secret-message",
+        {
+            "mode": "shortcut",
+            "argv": [
+                "im",
+                "+messages-send",
+                "--chat-id",
+                "oc_private",
+                "--text",
+                "secret-message",
+            ],
+            "risk": "write",
+        },
+    )
+
+    assert payload == {
+        "name": "lark_cli",
+        "args": {"redacted": True},
+        "preview": "lark_cli",
+    }
+    assert "secret-message" not in json.dumps(payload)
+    assert "oc_private" not in json.dumps(payload)
+
+
+def _install_fake_feishu_oapi(monkeypatch) -> None:
+    current_sender_open_id = contextvars.ContextVar("current_sender_open_id", default=None)
+
+    @contextmanager
+    def sender_open_id_scope(value):
+        token = current_sender_open_id.set(value)
+        try:
+            yield
+        finally:
+            current_sender_open_id.reset(token)
+
+    fake_feishu_oapi = SimpleNamespace(
+        current_sender_open_id=current_sender_open_id,
+        sender_open_id_scope=sender_open_id_scope,
+        FEISHU_UAT_PATH=None,
+        FEISHU_UAT_DIR=None,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.feishu_oapi_client = fake_feishu_oapi
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.feishu_oapi_client", fake_feishu_oapi)
+
+
+def _install_fake_gateway_session_context(monkeypatch) -> None:
+    session_env = contextvars.ContextVar("session_env", default={})
+
+    def set_session_vars(**kwargs):
+        env = {
+            "HERMES_SESSION_PLATFORM": kwargs.get("platform", ""),
+            "HERMES_SESSION_CHAT_ID": kwargs.get("chat_id", ""),
+            "HERMES_SESSION_CHAT_NAME": kwargs.get("chat_name", ""),
+            "HERMES_SESSION_THREAD_ID": kwargs.get("thread_id", ""),
+            "HERMES_SESSION_USER_ID": kwargs.get("user_id", ""),
+            "HERMES_SESSION_USER_NAME": kwargs.get("user_name", ""),
+            "HERMES_SESSION_KEY": kwargs.get("session_key", ""),
+        }
+        return session_env.set(env)
+
+    def clear_session_vars(token):
+        session_env.reset(token)
+
+    def get_session_env(name):
+        return session_env.get({}).get(name)
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=clear_session_vars,
+        get_session_env=get_session_env,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+
+def _install_fake_approval(monkeypatch):
+    registered: dict[str, object] = {}
+    resolved: list[tuple[str, str]] = []
+    current_session = contextvars.ContextVar("approval_session", default="")
+
+    def set_current_session_key(session_key: str):
+        return current_session.set(session_key)
+
+    def reset_current_session_key(token):
+        current_session.reset(token)
+
+    def register_gateway_notify(session_key: str, cb):
+        registered[session_key] = cb
+
+    def unregister_gateway_notify(session_key: str):
+        registered.pop(session_key, None)
+
+    def resolve_gateway_approval(session_key: str, choice: str, resolve_all=False):
+        resolved.append((session_key, choice))
+        return 1
+
+    fake_approval = SimpleNamespace(
+        set_current_session_key=set_current_session_key,
+        reset_current_session_key=reset_current_session_key,
+        register_gateway_notify=register_gateway_notify,
+        unregister_gateway_notify=unregister_gateway_notify,
+        resolve_gateway_approval=resolve_gateway_approval,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.approval = fake_approval
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.approval", fake_approval)
+    return registered, resolved
+
+
+def test_trusted_sender_uses_sealed_actor_when_ambient_context_is_absent(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    _install_fake_feishu_oapi(monkeypatch)
+    event = _event()
+    event.raw_event = {"metadata": {
+        "sender_open_id": "ou_test",
+        "trusted_actor_subject": "ou_test",
+        "trusted_chat_id": "oc_test",
+        "trusted_chat_type": "p2p",
+        "trusted_credential_subject": "ou_test",
+        "trusted_profile_name": "profile_test",
+        "trusted_ticket_fingerprint": "fingerprint",
+        "feishu_tool_scope": "feishu:user",
+    }}
+
+    assert agent_real._resolve_subprocess_sender_open_id(event) == "ou_test"
+
+    from tools.feishu_oapi_client import sender_open_id_scope
+
+    with sender_open_id_scope("ou_other"):
+        with pytest.raises(RuntimeError, match="ambient identity does not match"):
+            agent_real._resolve_subprocess_sender_open_id(event)
+
+
+@pytest.mark.asyncio
+async def test_real_run_agent_uses_subprocess_runner(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    calls: list[tuple[str, Path]] = []
+
+    async def fake_subprocess(event, profile_home):
+        calls.append((event.text, profile_home))
+        return "subprocess reply"
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not be used on subprocess success")
+
+    monkeypatch.setattr(agent_real, "_run_aiagent_subprocess", fake_subprocess)
+    monkeypatch.setattr(agent_real, "_legacy_real_run_agent", fail_legacy)
+
+    response = await agent_real.real_run_agent(_event(), tmp_path)
+
+    assert response == "subprocess reply"
+    assert calls == [("hello", tmp_path)]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_yields_subprocess_event_stream(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    async def fake_stream(event, profile_home):
+        assert event.text == "hello"
+        assert profile_home == tmp_path
+        yield ("tool_started", {"name": "feishu_task_tasklist", "preview": "rename"})
+        yield ("thinking", "正在调用飞书任务工具")
+        yield ("content", "streamed ")
+        yield ("content", "subprocess reply")
+        yield ("done", "streamed subprocess reply")
+
+    async def fail_subprocess(*_args, **_kwargs):
+        raise AssertionError("stream_run_agent should consume the event-stream subprocess")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", fake_stream, raising=False)
+    monkeypatch.setattr(agent_real, "_run_aiagent_subprocess", fail_subprocess)
+
+    chunks = [chunk async for chunk in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    assert chunks == [
+        ("tool_started", {"name": "feishu_task_tasklist", "preview": "rename"}),
+        ("thinking", "正在调用飞书任务工具"),
+        ("content", "streamed "),
+        ("content", "subprocess reply"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_does_not_replay_after_tool_started(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    legacy_calls = 0
+
+    async def failing_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "close_alert"})
+        raise RuntimeError("tool run failed")
+
+    async def legacy_stream(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        yield ("content", "replayed")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_stream)
+    seen = []
+    with pytest.raises(RuntimeError, match="tool run failed"):
+        async for item in agent_real.stream_run_agent(_event(), tmp_path):
+            seen.append(item)
+    assert seen == [("tool_started", {"name": "close_alert"})]
+    assert legacy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_preserves_post_tool_recovery_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    expiry = {"provider": "feishu", "connector_id": "lark-cli"}
+
+    async def failing_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "lark_cli", "session_id": "session-1", "tool_call_id": "call-1"})
+        yield (
+            "tool_completed",
+            {
+                "name": "lark_cli",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "failure_subsystem": "credential",
+                "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                "retryable": False,
+            },
+        )
+        yield ("content", "partial")
+        agent_real._CREDENTIAL_EXPIRY_SIGNAL.get().set(expiry)
+        raise RuntimeError("tool run failed")
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+    assert chunks == [
+        ("tool_started", {"name": "lark_cli", "session_id": "session-1", "tool_call_id": "call-1"}),
+        (
+            "tool_completed",
+            {
+                "name": "lark_cli",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "failure_subsystem": "credential",
+                "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                "retryable": False,
+            },
+        ),
+        ("content", "partial"),
+        (
+            "auth_required",
+            {
+                **expiry,
+                "operation_ref": {"session_id": "session-1", "tool_call_id": "call-1"},
+            },
+        ),
+        ("content", "\n\n" + agent_real._PARTIAL_FAILURE_NOTICE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_keeps_legacy_fallback_before_tool_started(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    async def failing_stream(*_args, **_kwargs):
+        if False:
+            yield
+        raise RuntimeError("model failed before tools")
+
+    async def legacy_stream(*_args, **_kwargs):
+        yield ("content", "legacy reply")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_stream)
+    assert [item async for item in agent_real.stream_run_agent(_event(), tmp_path)] == [
+        ("content", "legacy reply")
+    ]
+
+
+def test_aiagent_subprocess_main_replays_event(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+
+    seen: dict[str, object] = {}
+
+    def fake_run(event, profile_home, *, usage_sink=None):
+        seen["text"] = event.text
+        seen["message_id"] = event.message_id
+        seen["profile_home"] = profile_home
+        seen["source_user_id"] = event.source.user_id
+        seen["source_platform"] = event.source.platform
+        return "ok from child"
+
+    payload = {
+        "event": {
+            "text": "hello child",
+            "message_id": "om_child",
+            "source": {
+                "platform": "feishu",
+                "chat_id": "oc_child",
+                "user_id": "ou_child",
+            },
+        },
+        "profile_home": str(tmp_path),
+    }
+
+    stdout = io.StringIO()
+    monkeypatch.setattr(agent_real, "_run_with_aiagent", fake_run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    aiagent_subprocess.main()
+
+    assert json.loads(stdout.getvalue()) == {"result": "ok from child", "error": None}
+    assert seen == {
+        "text": "hello child",
+        "message_id": "om_child",
+        "profile_home": tmp_path,
+        "source_user_id": "ou_child",
+        "source_platform": "feishu",
+    }
+
+
+def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+
+    def fake_run(event, profile_home, *, event_sink=None, usage_sink=None):
+        assert event.text == "hello child"
+        assert profile_home == tmp_path
+        assert event_sink is not None
+        event_sink("tool_started", name="feishu_task_tasklist", preview="rename")
+        event_sink("content", text="done")
+        return "done"
+
+    payload = {
+        "event": {
+            "text": "hello child",
+            "message_id": "om_child",
+            "source": {"platform": "feishu", "chat_id": "oc_child", "user_id": "ou_child"},
+        },
+        "profile_home": str(tmp_path),
+    }
+
+    stdout = io.StringIO()
+    monkeypatch.setenv("HERMES_AIAGENT_EVENT_STREAM", "1")
+    monkeypatch.setattr(agent_real, "_run_with_aiagent", fake_run)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    aiagent_subprocess.main()
+
+    lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert lines == [
+        {"event": "tool_started", "name": "feishu_task_tasklist", "preview": "rename"},
+        {"event": "content", "text": "done"},
+        {"event": "done", "result": "done", "error": None},
+    ]
+
+
+@pytest.mark.parametrize("event_stream", [False, True])
+def test_aiagent_subprocess_serializes_typed_failure_fields(
+    monkeypatch,
+    tmp_path: Path,
+    event_stream: bool,
+):
+    from hermes_multitenancy import aiagent_subprocess
+
+    class TypedFailure(RuntimeError):
+        error_code = "EXPERT_UNAVAILABLE"
+        failure_subsystem = "expert_resolution"
+        retryable = False
+
+    def fail(*_args, **_kwargs):
+        raise TypedFailure("closed")
+
+    payload = {
+        "event": {
+            "text": "hello child",
+            "message_id": "om_child",
+            "source": {"platform": "webui", "chat_id": "s1", "user_id": "u1"},
+        },
+        "profile_home": str(tmp_path),
+    }
+    stdout = io.StringIO()
+    if event_stream:
+        monkeypatch.setenv("HERMES_AIAGENT_EVENT_STREAM", "1")
+    else:
+        monkeypatch.delenv("HERMES_AIAGENT_EVENT_STREAM", raising=False)
+
+    aiagent_subprocess._run_payload(payload, fail, stdout)
+
+    data = json.loads(stdout.getvalue())
+    assert data["error_code"] == "EXPERT_UNAVAILABLE"
+    assert data["failure_subsystem"] == "expert_resolution"
+    assert data["retryable"] is False
+    assert data.get("event") == ("done" if event_stream else None)
+
+
+def test_aiagent_subprocess_runs_in_terminal_cwd_and_restores(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import aiagent_subprocess
+
+    selected = tmp_path / "workspace" / "project-a"
+    selected.mkdir(parents=True)
+    monkeypatch.setenv("TERMINAL_CWD", str(selected))
+    original = Path.cwd()
+    seen = []
+
+    def run(*_args, **_kwargs):
+        seen.append(Path.cwd())
+        return "ok"
+
+    payload = {
+        "event": {"text": "hello", "source": {"platform": "webui"}},
+        "profile_home": str(tmp_path),
+    }
+    aiagent_subprocess._run_payload(payload, run, io.StringIO())
+
+    assert seen == [selected]
+    assert Path.cwd() == original
+
+
+@pytest.mark.parametrize("local_harness", [False, True])
+def test_run_with_aiagent_keeps_selected_workspace_for_tools(
+    monkeypatch, tmp_path: Path, local_harness: bool
+):
+    # Reads os.environ INSIDE run_conversation: the spawn env dict is not the
+    # child's effective env, because run.py re-asserts the profile anchors twice.
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import executor_map, harness_webui_runtime
+
+    profile_home = tmp_path / "profiles" / "coder"
+    selected = profile_home / "workspace" / "project-a"
+    selected.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen: dict[str, str] = {}
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            seen["terminal_cwd"] = os.environ["TERMINAL_CWD"]
+            seen["forced_terminal_cwd"] = os.environ["_HERMES_FORCE_TERMINAL_CWD"]
+            seen["home"] = os.environ["HOME"]
+            seen["forced_home"] = os.environ["_HERMES_FORCE_HOME"]
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+    expected_home = profile_home / "home"
+    if local_harness:
+        # The private 0700 workflow home _codex_runtime_env hands the child.
+        expected_home = tmp_path / "workflow" / "home"
+        expected_home.mkdir(parents=True)
+        codex_bin = tmp_path / "bin" / executor_map.CODEX_BINARY
+        codex_bin.parent.mkdir()
+        codex_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        codex_bin.chmod(0o755)
+
+        @contextmanager
+        def _no_resume(*_args, **_kwargs):
+            yield
+
+        monkeypatch.setenv("PATH", str(codex_bin.parent))
+        monkeypatch.setenv("HERMES_LOCAL_HARNESS", "1")
+        monkeypatch.setenv(
+            agent_real.EXECUTOR_RUNTIME_ENV, executor_map.CODEX_APP_SERVER
+        )
+        monkeypatch.setenv("HOME", str(expected_home))
+        monkeypatch.setenv("_HERMES_FORCE_HOME", str(expected_home))
+        monkeypatch.setattr(
+            harness_webui_runtime, "codex_thread_resume_scope", _no_resume
+        )
+    event = _event()
+    event.raw_event = {"workspace": "project-a"}
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen == {
+        "terminal_cwd": str(selected),
+        "forced_terminal_cwd": str(selected),
+        "home": str(expected_home),
+        "forced_home": str(expected_home),
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_child_expert_failure_never_calls_legacy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Exercise the OS child and parent decoder, not a mocked subprocess wrapper."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    event = _event()
+    event.raw_event = {"metadata": {"expert_id": "requested"}}
+    child_payload = {
+        "event": {
+            "text": "hello",
+            "message_id": "om_child_boundary",
+            "raw_event": {"metadata": {"expert_id": "requested"}},
+            "broker_role_override": {
+                "expert_id": "different",
+                "block": "**Role Override**",
+            },
+            "source": {
+                "platform": "webui",
+                "chat_id": "session-child-boundary",
+                "chat_type": "dm",
+                "user_id": "ou_child",
+                "user_name": "tester",
+            },
+        },
+        "profile_home": str(profile_home),
+    }
+    legacy_calls = 0
+
+    async def fail_legacy(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        raise AssertionError("legacy fallback must not run")
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._event_to_subprocess_payload",
+        lambda *_args, **_kwargs: child_payload,
+    )
+    monkeypatch.setattr(agent_real, "_legacy_real_run_agent", fail_legacy)
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        await agent_real.real_run_agent(event, profile_home)
+
+    assert legacy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_real_child_expert_failure_never_calls_legacy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Exercise the streamed OS-child protocol and fail-closed parent branch."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    event = _event()
+    event.raw_event = {"metadata": {"expert_id": "requested"}}
+    child_payload = {
+        "event": {
+            "text": "hello",
+            "message_id": "om_stream_child_boundary",
+            "raw_event": {"metadata": {"expert_id": "requested"}},
+            "broker_role_override": {
+                "expert_id": "different",
+                "block": "**Role Override**",
+            },
+            "source": {
+                "platform": "webui",
+                "chat_id": "session-stream-child-boundary",
+                "chat_type": "dm",
+                "user_id": "ou_child",
+                "user_name": "tester",
+            },
+        },
+        "profile_home": str(profile_home),
+    }
+    legacy_calls = 0
+
+    async def fail_legacy(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        raise AssertionError("legacy fallback must not run")
+        yield
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._event_to_subprocess_payload",
+        lambda *_args, **_kwargs: child_payload,
+    )
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        async for _item in agent_real.stream_run_agent(event, profile_home):
+            pass
+
+    assert legacy_calls == 0
+
+
+def test_aiagent_worker_main_reuses_runner_and_rotates_run_env(monkeypatch, tmp_path: Path, capsys):
+    from hermes_multitenancy import aiagent_subprocess
+
+    env_snapshots: list[dict[str, str]] = []
+    load_count = 0
+
+    def fake_loader():
+        nonlocal load_count
+        load_count += 1
+
+        def fake_run(event, profile_home, *, event_sink=None, messages=None, usage_sink=None):
+            del event, profile_home, messages
+            snapshot = dict(os.environ)
+            env_snapshots.append(snapshot)
+            run_id = snapshot["HERMES_MULTITENANCY_RUN_ID"]
+            assert event_sink is not None
+            event_sink("content", text=f"content-{run_id}")
+            if usage_sink is not None:
+                usage_sink["input_tokens"] = len(run_id)
+            return f"done-{run_id}"
+
+        return fake_run
+
+    profile_home = tmp_path / "profiles" / "worker"
+    event_payload = {
+        "text": "hello",
+        "message_id": "om_worker",
+        "source": {
+            "platform": "webui",
+            "chat_id": "session-worker",
+            "user_id": "ou_worker",
+        },
+    }
+    requests = [
+        {
+            "type": "run",
+            "payload": {
+                "event": event_payload,
+                "profile_home": str(profile_home),
+                "messages": [{"role": "user", "content": "first"}],
+            },
+            "env": {
+                "HERMES_AIAGENT_EVENT_STREAM": "1",
+                "HERMES_MULTITENANCY_RUN_ID": "run-one",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(tmp_path / "approval-one"),
+                "ONLY_FIRST": "yes",
+            },
+        },
+        {
+            "type": "run",
+            "payload": {
+                "event": event_payload,
+                "profile_home": str(profile_home),
+            },
+            "env": {
+                "HERMES_AIAGENT_EVENT_STREAM": "1",
+                "HERMES_MULTITENANCY_RUN_ID": "run-two",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(tmp_path / "approval-two"),
+                "ONLY_SECOND": "yes",
+            },
+        },
+    ]
+
+    monkeypatch.setattr(aiagent_subprocess, "_load_run_with_aiagent", fake_loader)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(json.dumps(req) for req in requests) + "\n"))
+
+    aiagent_subprocess.worker_main()
+
+    out_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert out_lines[0] == {"event": "ready"}
+    assert out_lines[1]["event"] == "content"
+    assert out_lines[1]["text"] == "content-run-one"
+    assert out_lines[2] == {
+        "event": "done",
+        "result": "done-run-one",
+        "error": None,
+        "usage": {"input_tokens": len("run-one")},
+    }
+    assert out_lines[3]["text"] == "content-run-two"
+    assert out_lines[4]["result"] == "done-run-two"
+    assert load_count == 1
+    assert env_snapshots[0]["ONLY_FIRST"] == "yes"
+    assert "ONLY_FIRST" not in env_snapshots[1]
+    assert env_snapshots[1]["ONLY_SECOND"] == "yes"
+    assert env_snapshots[0]["HERMES_MULTITENANCY_APPROVAL_DIR"] != env_snapshots[1]["HERMES_MULTITENANCY_APPROVAL_DIR"]
+
+
+def test_aiagent_subprocess_script_loader_adds_repo_root_for_relative_imports():
+    """The child script is executed by file path, so sys.path starts at package dir."""
+    script = Path(__file__).resolve().parents[1] / "hermes_multitenancy" / "aiagent_subprocess.py"
+    repo_root = script.parents[1]
+    code = f"""
+import importlib.util
+import sys
+from pathlib import Path
+script = Path({str(script)!r})
+repo_root = Path({str(repo_root)!r})
+sys.path = [str(script.parent)] + [p for p in sys.path if p and Path(p).resolve() != repo_root]
+spec = importlib.util.spec_from_file_location("aiagent_subprocess", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+run = module._load_run_with_aiagent()
+print(run.__module__)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "hermes_multitenancy.agent_real"
+
+
+def test_session_search_proxy_installs_http_wrapper(monkeypatch):
+    import urllib.request
+
+    from hermes_multitenancy import agent_real
+    from tools import session_search_tool
+
+    class FakeAIAgent:
+        def _get_session_db_for_recall(self):
+            return None
+
+    original = session_search_tool.session_search
+    original_getter = FakeAIAgent._get_session_db_for_recall
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://127.0.0.1:8766")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "tok-session")
+    requests = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "ok": True,
+                "result": json.dumps({"success": True, "count": 1}),
+            }).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        requests.append({
+            "url": req.full_url,
+            "timeout": timeout,
+            "authorization": req.headers.get("Authorization"),
+            "body": json.loads(req.data.decode("utf-8")),
+        })
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    try:
+        agent_real._install_session_search_proxy_for_aiagent()
+        agent_real._install_session_search_recall_db_proxy(FakeAIAgent)
+        result = session_search_tool.session_search(
+            query="marker",
+            limit=2,
+            current_session_id="current-session",
+            profile="owner",
+            detail="compact",
+            after="7d",
+            before="1d",
+            exclude_session_ids=["seen-session"],
+        )
+        recall_db = FakeAIAgent._get_session_db_for_recall(object())
+    finally:
+        session_search_tool.session_search = original
+        FakeAIAgent._get_session_db_for_recall = original_getter
+
+    assert len(requests) == 1
+    assert requests[0]["url"] == "http://127.0.0.1:8766/api/run-broker/internal/session-search"
+    assert requests[0]["authorization"] == "Bearer tok-session"
+    assert requests[0]["body"]["query"] == "marker"
+    assert requests[0]["body"]["current_session_id"] == "current-session"
+    assert requests[0]["body"]["profile"] == "owner"
+    assert requests[0]["body"]["detail"] == "compact"
+    assert requests[0]["body"]["after"] == "7d"
+    assert requests[0]["body"]["before"] == "1d"
+    assert requests[0]["body"]["exclude_session_ids"] == ["seen-session"]
+    assert json.loads(result) == {"success": True, "count": 1}
+    assert recall_db is not None
+
+
+def test_session_search_proxy_reads_current_run_env_after_reinstall(monkeypatch):
+    import urllib.request
+
+    from hermes_multitenancy import agent_real
+
+    fake_tools = types.ModuleType("tools")
+    fake_session_search_tool = types.ModuleType("tools.session_search_tool")
+    fake_session_search_tool.session_search = lambda **_kwargs: "{}"
+    fake_tools.session_search_tool = fake_session_search_tool
+    monkeypatch.setitem(sys.modules, "tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", fake_session_search_tool)
+
+    requests: list[dict[str, object]] = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "ok": True,
+                "result": json.dumps({"success": True}),
+            }).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        requests.append({
+            "url": req.full_url,
+            "timeout": timeout,
+            "authorization": req.headers.get("Authorization"),
+            "body": json.loads(req.data.decode("utf-8")),
+        })
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://broker-one")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "token-one")
+    agent_real._install_session_search_proxy_for_aiagent()
+    fake_session_search_tool.session_search(query="first", current_session_id="s1")
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://broker-two")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "token-two")
+    agent_real._install_session_search_proxy_for_aiagent()
+    fake_session_search_tool.session_search(query="second", current_session_id="s2")
+
+    assert [request["url"] for request in requests] == [
+        "http://broker-one/api/run-broker/internal/session-search",
+        "http://broker-two/api/run-broker/internal/session-search",
+    ]
+    assert [request["authorization"] for request in requests] == [
+        "Bearer token-one",
+        "Bearer token-two",
+    ]
+    assert [request["body"]["current_session_id"] for request in requests] == ["s1", "s2"]
+
+
+def test_session_search_proxy_covers_real_agent_tool_dispatch(tmp_path: Path):
+    code = r'''
+import json
+import os
+import urllib.request
+
+from agent import agent_runtime_helpers
+import hermes_cli.middleware as middleware
+from hermes_multitenancy import agent_real
+
+
+class FakeAIAgent:
+    session_id = "current-session"
+    _current_turn_id = ""
+    _current_api_request_id = ""
+    _memory_manager = None
+    valid_tool_names = set()
+    enabled_toolsets = None
+    disabled_toolsets = None
+
+    def _get_session_db_for_recall(self):
+        return None
+
+
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+requests = []
+
+
+def fake_urlopen(req, timeout):
+    url = getattr(req, "full_url", str(req))
+    if url != "http://127.0.0.1:8766/api/run-broker/internal/session-search":
+        return _Response({"error": "blocked in test"})
+    request = {
+        "url": url,
+        "timeout": timeout,
+        "body": json.loads(req.data.decode("utf-8")),
+    }
+    requests.append(request)
+    return _Response({
+        "ok": True,
+        "result": json.dumps({"success": True, "count": 1}),
+    })
+
+
+urllib.request.urlopen = fake_urlopen
+middleware.run_tool_execution_middleware = lambda _name, args, execute, **_kwargs: execute(args)
+
+agent_real._install_session_search_proxy_for_aiagent()
+agent_real._install_session_search_recall_db_proxy(FakeAIAgent)
+result = agent_runtime_helpers.invoke_tool(
+    FakeAIAgent(),
+    "session_search",
+    {"query": "marker", "limit": 2, "detail": "compact", "after": "7d", "before": "1d", "exclude_session_ids": ["seen-session"]},
+    "task-id",
+    pre_tool_block_checked=True,
+    skip_tool_request_middleware=True,
+)
+print("RESULT_JSON=" + json.dumps({"requests": requests, "result": json.loads(result)}), flush=True)
+os._exit(0)
+'''
+    env = os.environ.copy()
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    env["HERMES_HOME"] = str(profile_home)
+    env["HERMES_MULTITENANCY_SESSION_SEARCH_URL"] = "http://127.0.0.1:8766"
+    env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(Path.cwd()),
+        env.get("HERMES_AGENT_REPO", ""),
+        env.get("PYTHONPATH", ""),
+    ])
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result_line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT_JSON="))
+    payload = json.loads(result_line.removeprefix("RESULT_JSON="))
+    assert len(payload["requests"]) == 1
+    assert payload["requests"][0]["body"]["query"] == "marker"
+    assert payload["requests"][0]["body"]["current_session_id"] == "current-session"
+    assert payload["requests"][0]["body"]["detail"] == "compact"
+    assert payload["requests"][0]["body"]["after"] == "7d"
+    assert payload["requests"][0]["body"]["before"] == "1d"
+    assert payload["requests"][0]["body"]["exclude_session_ids"] == ["seen-session"]
+    assert payload["result"] == {"success": True, "count": 1}
+
+
+def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypatch, tmp_path: Path):
+    """OpenClaw/ClawHub skills often use ``{baseDir}``.
+
+    The compatibility belongs in multitenancy's routed runtime so upstream
+    skills can remain unchanged and hermes-agent does not need a local fork
+    patch for every profile-scoped skill convention.
+    """
+    from hermes_multitenancy import agent_real
+
+    calls: list[tuple[str, str | None]] = []
+
+    def original_substitute(content, skill_dir, session_id):
+        calls.append((content, str(skill_dir) if skill_dir else None))
+        return content.replace("${HERMES_SKILL_DIR}", str(skill_dir))
+
+    fake_skill_preprocessing = SimpleNamespace(
+        substitute_template_vars=original_substitute,
+    )
+    fake_skill_commands = SimpleNamespace(
+        _substitute_template_vars=original_substitute,
+    )
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    monkeypatch.setattr(agent_pkg, "skill_preprocessing", fake_skill_preprocessing, raising=False)
+    monkeypatch.setattr(agent_pkg, "skill_commands", fake_skill_commands, raising=False)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_preprocessing", fake_skill_preprocessing)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+
+    profile_home = tmp_path / "profile"
+    skill_dir = profile_home / "skills" / "Keep" / "keep-record"
+
+    agent_real._install_skill_runtime_compat(profile_home)
+
+    content = "node {baseDir}/scripts/mcp-call.js and ${HERMES_SKILL_DIR}/README.md"
+    assert fake_skill_preprocessing.substitute_template_vars(content, skill_dir, "s1") == (
+        f"node {skill_dir}/scripts/mcp-call.js and {skill_dir}/README.md"
+    )
+    assert fake_skill_commands._substitute_template_vars(content, skill_dir, "s1") == (
+        f"node {skill_dir}/scripts/mcp-call.js and {skill_dir}/README.md"
+    )
+    assert calls == [
+        (content, str(skill_dir)),
+        (content, str(skill_dir)),
+    ]
+
+
+def test_skill_runtime_compat_injects_keep_login_override(monkeypatch, tmp_path: Path):
+    """Legacy keep-login skill docs are adapted at render time, not patched upstream."""
+    from hermes_multitenancy import agent_real
+
+    def original_substitute(content, skill_dir, session_id):
+        return content
+
+    fake_skill_preprocessing = SimpleNamespace(
+        substitute_template_vars=original_substitute,
+    )
+    fake_skill_commands = SimpleNamespace(
+        _substitute_template_vars=original_substitute,
+    )
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    monkeypatch.setattr(agent_pkg, "skill_preprocessing", fake_skill_preprocessing, raising=False)
+    monkeypatch.setattr(agent_pkg, "skill_commands", fake_skill_commands, raising=False)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_preprocessing", fake_skill_preprocessing)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+
+    profile_home = tmp_path / "profile"
+    keep_skill_dir = profile_home / "skills" / "Keep" / "keep-login-skill"
+    other_skill_dir = profile_home / "skills" / "other"
+
+    agent_real._install_skill_runtime_compat(profile_home)
+
+    rendered = fake_skill_preprocessing.substitute_template_vars(
+        "Check ~/.keep-login/token.enc then run get_bearer_token.py",
+        keep_skill_dir,
+        "s1",
+    )
+    assert "Hermes Keep Auth Compatibility" in rendered
+    assert 'kep-auth "${PROFILE_ARGS[@]}" --env pre status' in rendered
+    assert "Do not judge Hermes login state by ~/.keep-login/token*.enc" in rendered
+
+    unrelated = fake_skill_preprocessing.substitute_template_vars(
+        "Run a normal command",
+        other_skill_dir,
+        "s1",
+    )
+    assert "Hermes Keep Auth Compatibility" not in unrelated
+
+
+def test_load_feishu_oapi_runtime_patches_legacy_uat_refresh_to_multitenancy(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+
+    refresh_calls: list[dict[str, object]] = []
+
+    def fake_refresh_uat_for_user(**kwargs):
+        refresh_calls.append(kwargs)
+        return {"access_token": "new-access"}
+
+    fake_feishu_uat_auth = types.ModuleType("hermes_multitenancy.feishu_uat_auth")
+    fake_feishu_uat_auth.refresh_uat_for_user = fake_refresh_uat_for_user
+    monkeypatch.setitem(sys.modules, "hermes_multitenancy.feishu_uat_auth", fake_feishu_uat_auth)
+
+    fake_feishu_auth = types.ModuleType("hermes_cli.feishu_auth")
+
+    def old_refresh_uat_for_user(*_args, **_kwargs):
+        raise AssertionError("old refresh implementation must not be called")
+
+    fake_feishu_auth.refresh_uat_for_user = old_refresh_uat_for_user
+    monkeypatch.setitem(sys.modules, "hermes_cli.feishu_auth", fake_feishu_auth)
+
+    fake_feishu_oapi = types.ModuleType("tools.feishu_oapi_client")
+    fake_feishu_oapi.sender_open_id_scope = agent_real._missing_sender_open_id_scope
+    fake_feishu_oapi.current_sender_open_id = agent_real._MissingCurrentSenderOpenId()
+    fake_feishu_oapi._resolve_feishu_credentials = lambda: ("cli", "secret", "feishu")
+    fake_feishu_oapi._load_uat = lambda _open_id=None: {}
+    fake_tools = types.ModuleType("tools")
+    fake_tools.feishu_oapi_client = fake_feishu_oapi
+    monkeypatch.setitem(sys.modules, "tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "tools.feishu_oapi_client", fake_feishu_oapi)
+
+    agent_real._load_feishu_oapi_runtime(profile_home)
+
+    result = fake_feishu_auth.refresh_uat_for_user("ou_owner", "legacy-client", "legacy-secret")
+
+    assert result == {"access_token": "new-access"}
+    assert refresh_calls == [{
+        "open_id": "ou_owner",
+        "client_id": "legacy-client",
+        "client_secret": "legacy-secret",
+        "shared_home": shared_home,
+        "force": True,
+    }]
+
+
+def test_credential_env_runtime_compat_loads_env_and_registers_passthrough(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [alice]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-test"},
+        )
+    finally:
+        store.close()
+
+    registered: list[list[str]] = []
+    fake_env_passthrough = SimpleNamespace(
+        register_env_passthrough=lambda names: registered.append(list(names)),
+        _config_passthrough=frozenset({"EXISTING_TOKEN"}),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
+
+    from hermes_multitenancy.credential_materializer import git_auth_env, git_identity_env
+
+    credential_env = agent_real._credential_env_for_aiagent(profile_home)
+    # The token now travels with the git auth env that makes plain `git` use it
+    # (helper + insteadOf, see tests/test_git_auth_env.py) plus the commit
+    # identity riding the same GIT_CONFIG_* channel (see
+    # tests/test_git_identity_env.py) — and nothing else. Composed in the
+    # production order: identity seeded first, auth appended onto its count.
+    assert credential_env["GITLAB_TOKEN"] == "glpat-test"
+    expected = {"GITLAB_TOKEN": "glpat-test"}
+    expected.update(git_identity_env(expected, profile="alice"))
+    expected.update(git_auth_env(expected))
+    assert set(credential_env) == set(expected)
+    # Identity holds slot 0: git lets later entries win, so appending auth
+    # after it is the only order that keeps an explicit identity able to win.
+    assert credential_env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert credential_env["GIT_CONFIG_VALUE_0"] == "alice"
+
+    agent_real._install_credential_env_passthrough(profile_home)
+
+    assert registered == [sorted(credential_env)]
+    assert fake_env_passthrough._config_passthrough == frozenset(
+        {"EXISTING_TOKEN", *credential_env}
+    )
+
+
+def test_apply_runtime_env_for_aiagent_restores_credential_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [alice]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-test"},
+        )
+    finally:
+        store.close()
+
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_GITLAB_TOKEN", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    assert os.environ["GITLAB_TOKEN"] == "glpat-test"
+    assert os.environ["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
+    cleanup()
+    assert "GITLAB_TOKEN" not in os.environ
+    assert "_HERMES_FORCE_GITLAB_TOKEN" not in os.environ
+
+
+def test_apply_runtime_env_for_aiagent_forces_profile_boundary(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    keys = [
+        "HOME",
+        "WORKSPACE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "HERMES_HOME",
+        "HERMES_SHARED_HOME",
+        "HERMES_PROFILE",
+        "KEP_PROFILE",
+        "TERMINAL_HOME_MODE",
+    ]
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(f"_HERMES_FORCE_{key}", raising=False)
+
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["HOME"] == str(profile_home / "home")
+        assert os.environ["WORKSPACE"] == str(profile_home / "workspace")
+        assert os.environ["HERMES_HOME"] == str(profile_home)
+        assert os.environ["HERMES_SHARED_HOME"] == str(shared)
+        assert os.environ["HERMES_PROFILE"] == "alice"
+        assert os.environ["KEP_PROFILE"] == "alice"
+        assert os.environ["TERMINAL_HOME_MODE"] == "profile"
+        assert os.environ["_HERMES_FORCE_HOME"] == str(profile_home / "home")
+        assert os.environ["_HERMES_FORCE_WORKSPACE"] == str(profile_home / "workspace")
+        assert os.environ["_HERMES_FORCE_HERMES_HOME"] == str(profile_home)
+        assert os.environ["_HERMES_FORCE_HERMES_SHARED_HOME"] == str(shared)
+        assert os.environ["_HERMES_FORCE_HERMES_PROFILE"] == "alice"
+        assert os.environ["_HERMES_FORCE_KEP_PROFILE"] == "alice"
+        assert os.environ["_HERMES_FORCE_TERMINAL_HOME_MODE"] == "profile"
+    finally:
+        cleanup()
+
+    for key in keys:
+        assert key not in os.environ
+        assert f"_HERMES_FORCE_{key}" not in os.environ
+
+
+def test_apply_runtime_env_for_aiagent_allows_execute_code_profile_boundary(
+    monkeypatch, tmp_path: Path
+):
+    from tools.code_execution_env import _scrub_child_env
+
+    from hermes_multitenancy import agent_real
+
+    registered: set[str] = set()
+
+    def register_env_passthrough(names):
+        registered.update(str(name) for name in names)
+
+    fake_env_passthrough = SimpleNamespace(
+        register_env_passthrough=register_env_passthrough,
+        is_env_passthrough=lambda name: name in registered,
+        resolve_passthrough_value=lambda name, fallback: fallback,
+        scoped_passthrough_additions=lambda present: {},
+        _config_passthrough=frozenset(),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-pass")
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        child_env = _scrub_child_env(dict(os.environ))
+
+        assert child_env["HOME"] == str(profile_home / "home")
+        assert child_env["WORKSPACE"] == str(profile_home / "workspace")
+        assert child_env["HERMES_HOME"] == str(profile_home)
+        assert child_env["HERMES_SHARED_HOME"] == str(shared)
+        assert child_env["HERMES_PROFILE"] == "alice"
+        assert child_env["KEP_PROFILE"] == "alice"
+        assert child_env["TERMINAL_HOME_MODE"] == "profile"
+        assert "OPENAI_API_KEY" not in child_env
+    finally:
+        cleanup()
+
+
+def test_build_subprocess_env_forces_credential_env_through_terminal_scrub(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [alice]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-test"},
+        )
+    finally:
+        store.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env["GITLAB_TOKEN"] == "glpat-test"
+    assert env["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
+
+
+def test_shared_agent_subprocess_does_not_inject_owner_profile_secret_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "owned_agent"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text("TAVILY_API_KEY=shared-tool-key\n", encoding="utf-8")
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=owner-profile-key\nOWNER_ONLY_SECRET=owner-only\n",
+        encoding="utf-8",
+    )
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [owned_agent]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-owner"},
+        )
+    finally:
+        store.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_AGENT_ID": "agent-shared",
+            "HERMES_AGENT_SHARE_ROLE": "viewer",
+            "HERMES_AGENT_ACTOR_OPEN_ID": "ou_viewer",
+        },
+    )
+
+    assert env["TAVILY_API_KEY"] == "shared-tool-key"
+    assert "OPENAI_API_KEY" not in env
+    assert "OWNER_ONLY_SECRET" not in env
+    assert "GITLAB_TOKEN" not in env
+    assert "_HERMES_FORCE_GITLAB_TOKEN" not in env
+
+
+def test_shared_tavily_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "TAVILY_API_KEY=tvly-test",
+                "TAVILY_BASE_URL=https://tavily.example.test",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["TAVILY_API_KEY"] == "tvly-test"
+    assert loaded["TAVILY_BASE_URL"] == "https://tavily.example.test"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TAVILY_API_KEY", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["TAVILY_API_KEY"] == "tvly-test"
+        assert "_HERMES_FORCE_TAVILY_API_KEY" not in os.environ
+    finally:
+        cleanup()
+    assert "TAVILY_API_KEY" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["TAVILY_API_KEY"] == "tvly-test"
+    assert "_HERMES_FORCE_TAVILY_API_KEY" not in env
+
+
+def test_shared_fal_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "FAL_KEY=fal-test",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["FAL_KEY"] == "fal-test"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_FAL_KEY", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["FAL_KEY"] == "fal-test"
+        assert "_HERMES_FORCE_FAL_KEY" not in os.environ
+    finally:
+        cleanup()
+    assert "FAL_KEY" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["FAL_KEY"] == "fal-test"
+    assert "_HERMES_FORCE_FAL_KEY" not in env
+
+
+def test_shared_vod_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "TENCENTCLOUD_SECRET_ID=vod-secret-id",
+                "TENCENTCLOUD_SECRET_KEY=vod-secret-key",
+                "VOD_SUBAPP_ID=123456789",
+                "VOD_REGION=ap-guangzhou",
+                "VOD_STORAGE_MODE=Temporary",
+                "VOD_POLL_TIMEOUT=300",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+    assert loaded["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+    assert loaded["VOD_SUBAPP_ID"] == "123456789"
+    assert loaded["VOD_REGION"] == "ap-guangzhou"
+    assert loaded["VOD_STORAGE_MODE"] == "Temporary"
+    assert loaded["VOD_POLL_TIMEOUT"] == "300"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_ID", raising=False)
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("VOD_SUBAPP_ID", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TENCENTCLOUD_SECRET_ID", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_VOD_SUBAPP_ID", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+        assert os.environ["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+        assert os.environ["VOD_SUBAPP_ID"] == "123456789"
+        assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_ID" not in os.environ
+        assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY" not in os.environ
+        assert "_HERMES_FORCE_VOD_SUBAPP_ID" not in os.environ
+    finally:
+        cleanup()
+    assert "TENCENTCLOUD_SECRET_ID" not in os.environ
+    assert "TENCENTCLOUD_SECRET_KEY" not in os.environ
+    assert "VOD_SUBAPP_ID" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+    assert env["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+    assert env["VOD_SUBAPP_ID"] == "123456789"
+    assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_ID" not in env
+    assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY" not in env
+    assert "_HERMES_FORCE_VOD_SUBAPP_ID" not in env
+
+
+def test_vod_model_override_env_is_scoped_to_one_aiagent_run(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", raising=False)
+    cleanup = agent_real._apply_vod_image_model_override_for_aiagent(
+        "用 gpt-image2-high 帮我生图：一张未来城市海报"
+    )
+    try:
+        assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
+    finally:
+        cleanup()
+    assert "HERMES_VOD_IMAGE_MODEL_OVERRIDE" not in os.environ
+
+    monkeypatch.setenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", "gem-3.1")
+    cleanup = agent_real._apply_vod_image_model_override_for_aiagent(
+        "普通帮我生图：一张未来城市海报"
+    )
+    try:
+        assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gem-3.1"
+    finally:
+        cleanup()
+    assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gem-3.1"
+
+
+def test_build_subprocess_env_forwards_vod_model_override(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    approval_dir = tmp_path / "approvals"
+    monkeypatch.setenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", "gpt-image2-high")
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
+
+
+def test_write_token_ledger_from_child_writes_in_parent(monkeypatch, tmp_path: Path):
+    """Regression (codex review): the ledger MUST be written by the parent, not the
+    sandboxed child (which can't write /var/log/hermes). The parent resolves
+    sender/platform from the event and writes the usage block the child emitted."""
+    import json
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+
+    event = SimpleNamespace(source=SimpleNamespace(
+        platform=SimpleNamespace(value="feishu"), chat_type="group", chat_id="oc_team",
+        user_id="ou_sender", message_id="om_x",
+    ))
+    profile_home = tmp_path / "profiles" / "grpprofile"
+    profile_home.mkdir(parents=True)
+    usage = {"model": "sonnet-4-6", "input_tokens": 100, "output_tokens": 40, "total_tokens": 140}
+
+    agent_real._write_token_ledger_from_child(event, profile_home, usage)
+
+    row = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert row["sender_open_id"] == "ou_sender"
+    assert row["profile"] == "grpprofile"
+    assert row["platform"] == "feishu"
+    assert row["chat_type"] == "group"
+    assert row["chat_id"] == "oc_team"   # persisted so uploader can resolve the group owner
+    assert row["model"] == "sonnet-4-6"
+    assert row["total_tokens"] == 140
+
+
+def test_write_token_ledger_uses_canonical_chat_extraction(monkeypatch, tmp_path: Path):
+    """Regression (codex review): topic groups / fallback-shaped events carry chat info on
+    parent_chat_id / event.message.chat_id and chat_type 'topic'. The ledger must capture
+    the router-canonical chat_id/chat_type, else group turns mis-bill."""
+    import json
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "t.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+
+    # chat_type only on event; chat_id only on source.parent_chat_id (a real Feishu variant).
+    event = SimpleNamespace(
+        chat_type="topic",
+        source=SimpleNamespace(platform=SimpleNamespace(value="feishu"),
+                               parent_chat_id="oc_topic_parent", user_id="ou_s"),
+    )
+    profile_home = tmp_path / "profiles" / "grp"
+    profile_home.mkdir(parents=True)
+    agent_real._write_token_ledger_from_child(
+        event, profile_home, {"model": "m", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+    row = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert row["chat_type"] == "topic"
+    assert row["chat_id"] == "oc_topic_parent"
+
+
+def test_write_token_ledger_disabled_is_noop(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.delenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", raising=False)
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+    event = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value="feishu"), chat_type="p2p", user_id="ou_x"))
+    agent_real._write_token_ledger_from_child(
+        event, tmp_path, {"model": "m", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+    assert not ledger.exists()
+
+
+def test_write_token_ledger_ignores_non_dict_usage(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+    event = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value="feishu"), chat_type="p2p", user_id="ou_x"))
+    # Child emitted no usage (None) -> parent must no-op, not crash.
+    agent_real._write_token_ledger_from_child(event, tmp_path, None)
+    assert not ledger.exists()
+
+
+def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env_disabled = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert "HERMES_MULTITENANCY_BROWSER_ENABLED" not in env_disabled
+
+    (profile_home / "config.yaml").write_text(
+        "multitenancy:\n  browser:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    env_enabled = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env_enabled["HERMES_MULTITENANCY_BROWSER_ENABLED"] == "1"
+    assert env_enabled["HERMES_BROWSER_SOCKET_BASE_DIR"] == str(profile_home / "browser" / "run")
+    assert env_enabled["PLAYWRIGHT_BROWSERS_PATH"] == str(profile_home / "browser" / "ms-playwright")
+
+
+def test_aiagent_stream_status_keeps_three_visible_dots_while_refreshing():
+    from hermes_multitenancy import agent_real
+
+    statuses = [agent_real._animated_stream_status("准备响应", tick) for tick in range(1, 5)]
+
+    assert len(set(statuses)) == 4
+    assert [
+        agent_real._strip_stream_status_animation_markers(status)
+        for status in statuses
+    ] == [""] * 4
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({
+                    "event": "approval_required",
+                    "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+                    "approval_id": "approval_1",
+                    "command": "python -c \"print(1)\"",
+                    "description": "script execution via -e/-c flag",
+                    "decision_path": "/tmp/approval_1.json",
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "approval_resolved",
+                    "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+                    "approval_id": "approval_1",
+                    "choice": "once",
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events = [
+        item
+        async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+    ]
+
+    assert events == [
+        ("approval_required", {
+            "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+            "approval_id": "approval_1",
+            "command": "python -c \"print(1)\"",
+            "description": "script execution via -e/-c flag",
+            "decision_path": "/tmp/approval_1.json",
+        }),
+        ("approval_resolved", {
+            "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+            "approval_id": "approval_1",
+            "choice": "once",
+        }),
+        ("done", "ok"),
+    ]
+
+
+def test_stream_aiagent_subprocess_initializes_state_db_schema_for_fresh_profile(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    state_db = profile_home / "state.db"
+    assert not state_db.exists()
+    initialized_paths: list[Path] = []
+
+    class FakeSessionDB:
+        def __init__(self, db_path):
+            initialized_paths.append(Path(db_path))
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS sessions ("
+                    "id TEXT PRIMARY KEY, source TEXT, started_at REAL)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS messages ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "session_id TEXT, role TEXT, content TEXT, reasoning TEXT, "
+                    "tool_name TEXT, tool_calls TEXT, timestamp REAL)"
+                )
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_state",
+        SimpleNamespace(SessionDB=FakeSessionDB),
+    )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "hello back"}\n',
+                b'{"event": "done", "result": "hello back", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        event = _event()
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(event, profile_home)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "hello back"), ("done", "hello back")]
+    assert initialized_paths == [state_db]
+    assert state_db.exists()
+    with sqlite3.connect(state_db) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {"sessions", "messages"} <= tables
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        event = _event()
+        assert conn.execute("SELECT role, content FROM messages ORDER BY id").fetchall() == [
+            ("user", event.text),
+            ("assistant", "hello back"),
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_ok", [False, True])
+async def test_mapped_stream_commits_state_only_after_receipt(
+    monkeypatch, tmp_path: Path, receipt_ok: bool
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core, executor_map
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event":"content","text":"gated answer"}\n',
+                b'{"event":"done","result":"gated answer","error":null,"usage":{"api_calls":1}}\n',
+            ]
+
+        async def readline(self):
+            return self.lines.pop(0) if self.lines else b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    @contextmanager
+    def fake_env_scope(*_args, **_kwargs):
+        yield dict(os.environ)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setitem(
+        agent_real._stream_aiagent_subprocess.__globals__,
+        "_bind_codex_run_workspace",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        executor_map,
+        "runtime_for_event",
+        lambda *_args: executor_map.CODEX_APP_SERVER,
+    )
+
+    async def complete(_event, _profile):
+        with sqlite3.connect(profile_home / "state.db") as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant'"
+            ).fetchone()[0] == 0
+        if not receipt_ok:
+            raise executor_map.ExecutorUnavailable("receipt rejected")
+
+    monkeypatch.setattr(_core, "_complete_codex_spend_receipt", complete)
+    event = _event()
+    stream = _core._verified_codex_stream(event, profile_home)
+    if receipt_ok:
+        assert [item async for item in stream] == [
+            ("content", "gated answer"),
+            ("done", "gated answer"),
+        ]
+    else:
+        with pytest.raises(executor_map.ExecutorUnavailable, match="receipt rejected"):
+            _ = [item async for item in stream]
+
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages ORDER BY id"
+        ).fetchall()
+    assert rows == (
+        [("user", event.text), ("assistant", "gated answer")]
+        if receipt_ok
+        else [("user", event.text)]
+    )
+
+
+def test_stream_aiagent_subprocess_redacts_ingest_secret_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.stream.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_stream"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps(
+                    {"event": "content", "text": f"content Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {"event": "thinking", "text": f"thinking Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {
+                        "event": "tool_started",
+                        "name": "terminal",
+                        "preview": f"curl -H 'Authorization: Bearer {secret_value}'",
+                        "args": {"command": f"curl -H 'Authorization: Bearer {secret_value}'"},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {"event": "done", "result": f"done Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(event, tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+    encoded_events = json.dumps(events, ensure_ascii=False)
+
+    assert secret_value not in encoded_events
+    assert secret_value[:16] not in encoded_events
+    assert "Authorization: Bearer eyJ" not in encoded_events
+    assert "[REDACTED:cms_bearer]" in encoded_events
+
+
+def test_stream_aiagent_subprocess_forwards_child_clarify_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({
+                    "event": "clarify_required",
+                    "session_key": "agent:profile:coder:platform:webui:session:s1",
+                    "clarify_id": "clarify_1",
+                    "question": "Which report style?",
+                    "choices": ["brief", "detailed"],
+                    "response_path": "/tmp/clarify_1.json",
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "clarify_resolved",
+                    "session_key": "agent:profile:coder:platform:webui:session:s1",
+                    "clarify_id": "clarify_1",
+                    "response": "brief",
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        ("clarify_required", {
+            "session_key": "agent:profile:coder:platform:webui:session:s1",
+            "clarify_id": "clarify_1",
+            "question": "Which report style?",
+            "choices": ["brief", "detailed"],
+            "response_path": "/tmp/clarify_1.json",
+        }),
+        ("clarify_resolved", {
+            "session_key": "agent:profile:coder:platform:webui:session:s1",
+            "clarify_id": "clarify_1",
+            "response": "brief",
+        }),
+        ("done", "ok"),
+    ]
+
+
+def test_stream_aiagent_subprocess_appends_conversation_audit_jsonl(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, "
+            "content TEXT, "
+            "reasoning TEXT, "
+            "tool_name TEXT, "
+            "tool_calls TEXT, "
+            "timestamp REAL NOT NULL)"
+        )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({"event": "content", "text": "hello "}).encode() + b"\n",
+                json.dumps({"event": "content", "text": "world"}).encode() + b"\n",
+                json.dumps({
+                    "event": "tool_started",
+                    "tool_call_id": "call-audit-1",
+                    "name": "terminal",
+                    "preview": "echo ok",
+                    "args": {"command": "echo ok"},
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "tool_completed",
+                    "tool_call_id": "call-audit-1",
+                    "name": "terminal",
+                    "is_error": False,
+                    "failure_subsystem": None,
+                    "error_code": None,
+                    "retryable": False,
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    audit_path = tmp_path / "conversation-audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), profile_home)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        ("content", "hello "),
+        ("content", "world"),
+        ("tool_started", {
+            "tool_call_id": "call-audit-1",
+            "name": "terminal",
+            "preview": "echo ok",
+            "args": {"command": "echo ok"},
+        }),
+        ("tool_completed", {
+            "tool_call_id": "call-audit-1",
+            "name": "terminal",
+            "is_error": False,
+            "failure_subsystem": None,
+            "error_code": None,
+            "retryable": False,
+        }),
+        ("done", "ok"),
+    ]
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert [row["role"] for row in rows] == ["user", "assistant", "assistant"]
+    assert rows[0]["profile"] == "owner"
+    assert rows[0]["platform"] == "feishu"
+    assert rows[0]["chat_type"] == "dm"
+    assert rows[0]["content"] == "hello"
+    assert rows[1]["content"] == "hello world"
+    assert rows[1]["tool_name"] is None
+    assert rows[1]["finish_reason"] == "tool_calls"
+    assert rows[2]["content"] == ""
+    assert rows[2]["tool_name"] == "terminal"
+    assert json.loads(rows[2]["tool_calls"]) == {
+        "name": "terminal",
+        "args": {"command": "echo ok"},
+        "preview": "echo ok",
+    }
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        mirrored = conn.execute(
+            "SELECT role,tool_call_id,content FROM messages"
+            " WHERE tool_call_id='call-audit-1' ORDER BY id"
+        ).fetchall()
+    assert mirrored == [
+        ("assistant", "call-audit-1", ""),
+        (
+            "tool",
+            "call-audit-1",
+            '{"failure_subsystem":null,"error_code":null,"retryable":false,"is_error":false}',
+        ),
+    ]
+
+
+def test_stream_aiagent_subprocess_audits_text_only_done_finish_reason(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, "
+            "content TEXT, "
+            "reasoning TEXT, "
+            "tool_name TEXT, "
+            "tool_calls TEXT, "
+            "timestamp REAL NOT NULL)"
+        )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({"event": "content", "text": "plain answer"}).encode() + b"\n",
+                b'{"event": "done", "result": "plain answer", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 124
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    audit_path = tmp_path / "conversation-audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), profile_home)
+        ]
+
+    assert asyncio.run(collect_events()) == [
+        ("content", "plain answer"),
+        ("done", "plain answer"),
+    ]
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert rows[1]["content"] == "plain answer"
+    assert rows[1]["finish_reason"] == "stop"
+    assert rows[1]["tool_calls"] is None
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_status(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(0.03)
+                return b'{"event": "done", "result": "ok", "error": null}\n'
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events = [
+        item
+        async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+    ]
+
+    assert events[0][0] == "status"
+    assert agent_real._strip_stream_status_animation_markers(events[0][1]) == ""
+    assert "已等待" not in events[0][1]
+    assert events[-1] == ("done", "ok")
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_emits_status_while_waiting_after_first_event(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "delegate_task"}\n'
+            if self.calls == 2:
+                await asyncio.sleep(0.03)
+                return b'{"event": "done", "result": "ok", "error": null}\n'
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events = [
+        item
+        async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+    ]
+
+    assert events[0] == ("tool_started", {"name": "delegate_task"})
+    assert events[1][0] == "status"
+    assert agent_real._strip_stream_status_animation_markers(events[1][1]) == ""
+    assert events[-1] == ("done", "ok")
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_idle_timeout_is_runtime_error_not_cancelled(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    created = {}
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "delegate_task"}\n'
+            await asyncio.sleep(60)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = FakeProc()
+        return created["proc"]
+
+    real_getenv = os.getenv
+
+    def fast_default_timeout(name, default=None):
+        if name == "HERMES_AIAGENT_SUBPROCESS_TIMEOUT":
+            assert default == "300"
+            return "0.02"
+        return real_getenv(name, default)
+
+    monkeypatch.delenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", raising=False)
+    monkeypatch.setattr(os, "getenv", fast_default_timeout)
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match="produced no stream events"):
+        async for _item in agent_real._stream_aiagent_subprocess(_event(), tmp_path):
+            pass
+
+    assert created["proc"].killed is True
+
+
+def test_stream_aiagent_subprocess_reuses_opt_in_warm_worker_and_rotates_run_env(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    env_count = 0
+    seen_envs: list[dict[str, str]] = []
+    created: list[object] = []
+
+    @contextmanager
+    def fake_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        nonlocal env_count
+        env_count += 1
+        yield {
+            "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+            "HERMES_MULTITENANCY_RUN_ID": f"run-{env_count}",
+            "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+            "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": f"cred-token-{env_count}",
+            "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN": f"search-token-{env_count}",
+            "LARKSUITE_CLI_PROXY_KEY": f"lark-key-{env_count}",
+            "HERMES_LITELLM_RUNTIME_API_KEY": f"employee-key-{env_count}",
+            "HERMES_LITELLM_RUNTIME_EMPLOYEE_ID": f"employee-{env_count}",
+            **(extra or {}),
+        }
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+            self.closed = False
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                request = json.loads(line)
+                env = dict(request["env"])
+                seen_envs.append(env)
+                run_id = env["HERMES_MULTITENANCY_RUN_ID"]
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": f"content-{run_id}"}).encode() + b"\n"
+                )
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "done", "result": f"done-{run_id}", "error": None}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerStderr:
+        async def read(self):
+            return b""
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = FakeWorkerStderr()
+            self.pid = 456
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        proc = FakeWorkerProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    try:
+        profile = tmp_path / "profiles" / "warm"
+
+        async def collect_events():
+            return [
+                item
+                async for item in agent_real._stream_aiagent_subprocess(_event(), profile)
+            ]
+
+        async def collect_both():
+            first_events = await collect_events()
+            second_events = await collect_events()
+            return first_events, second_events
+
+        first, second = asyncio.run(collect_both())
+
+        assert first == [("content", "content-run-1"), ("done", "done-run-1")]
+        assert second == [("content", "content-run-2"), ("done", "done-run-2")]
+        assert len(created) == 1
+        assert seen_envs[0]["HERMES_MULTITENANCY_CRED_BROKER_TOKEN"] == "cred-token-1"
+        assert seen_envs[1]["HERMES_MULTITENANCY_CRED_BROKER_TOKEN"] == "cred-token-2"
+        assert seen_envs[0]["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] == "search-token-1"
+        assert seen_envs[1]["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] == "search-token-2"
+        assert seen_envs[0]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-1"
+        assert seen_envs[1]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-2"
+        assert seen_envs[0]["HERMES_LITELLM_RUNTIME_API_KEY"] == "employee-key-1"
+        assert seen_envs[1]["HERMES_LITELLM_RUNTIME_API_KEY"] == "employee-key-2"
+        assert seen_envs[0]["HERMES_LITELLM_RUNTIME_EMPLOYEE_ID"] == "employee-1"
+        assert seen_envs[1]["HERMES_LITELLM_RUNTIME_EMPLOYEE_ID"] == "employee-2"
+        assert seen_envs[0]["HERMES_MULTITENANCY_APPROVAL_DIR"] != seen_envs[1]["HERMES_MULTITENANCY_APPROVAL_DIR"]
+        assert created[0].stdin.closed is False
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_warm_worker_holds_slot_until_env_scope_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    env_count = 0
+    active_scopes = 0
+    max_active_scopes = 0
+
+    @contextmanager
+    def fake_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        nonlocal env_count, active_scopes, max_active_scopes
+        env_count += 1
+        active_scopes += 1
+        max_active_scopes = max(max_active_scopes, active_scopes)
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_RUN_ID": f"run-{env_count}",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                **(extra or {}),
+            }
+        finally:
+            active_scopes -= 1
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                request = json.loads(line)
+                run_id = request["env"]["HERMES_MULTITENANCY_RUN_ID"]
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": f"content-{run_id}"}).encode() + b"\n"
+                )
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "done", "result": f"done-{run_id}", "error": None}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 457
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        nonlocal max_active_scopes
+        profile = tmp_path / "profiles" / "warm-slot"
+        first = agent_real._stream_aiagent_subprocess(_event(), profile)
+        second_task = None
+        try:
+            assert await first.__anext__() == ("content", "content-run-1")
+            assert await first.__anext__() == ("done", "done-run-1")
+            assert active_scopes == 1
+
+            async def collect_second():
+                return [item async for item in agent_real._stream_aiagent_subprocess(_event(), profile)]
+
+            second_task = asyncio.create_task(collect_second())
+            await asyncio.sleep(0.02)
+            assert max_active_scopes == 1
+            assert second_task.done() is False
+
+            await first.aclose()
+            assert await asyncio.wait_for(second_task, timeout=SYNC_TIMEOUT) == [
+                ("content", "content-run-2"),
+                ("done", "done-run-2"),
+            ]
+        finally:
+            await first.aclose()
+            if second_task is not None and not second_task.done():
+                second_task.cancel()
+                try:
+                    await second_task
+                except asyncio.CancelledError:
+                    pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert max_active_scopes == 1
+    assert active_scopes == 0
+
+
+def test_stream_aiagent_subprocess_warm_worker_releases_slot_when_env_scope_enter_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    create_calls: list[tuple[object, ...]] = []
+
+    @contextmanager
+    def failing_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        raise RuntimeError("env enter failed")
+        yield {}
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        create_calls.append(args)
+        raise AssertionError("subprocess should not start when env scope fails")
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", failing_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        profile = tmp_path / "profiles" / "env-fail"
+        with pytest.raises(RuntimeError, match="env enter failed"):
+            async for _item in agent_real._stream_aiagent_subprocess(_event(), profile):
+                pass
+        worker = agent_real._get_aiagent_warm_worker(profile)
+        assert worker._lock.acquire(blocking=False) is True
+        worker._lock.release()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert create_calls == []
+
+
+def test_aiagent_warm_worker_slot_serializes_across_event_loops(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    worker = agent_real._AiagentWarmWorker(tmp_path)
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+    second_acquired = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    async def first_runner():
+        run = await worker.acquire_run()
+        order.append("first")
+        first_acquired.set()
+        await asyncio.to_thread(release_first.wait)
+        await run.close()
+
+    async def second_runner():
+        await asyncio.to_thread(first_acquired.wait)
+        run = await worker.acquire_run()
+        try:
+            order.append("second")
+            second_acquired.set()
+        finally:
+            await run.close()
+
+    def run_coro(coro):
+        try:
+            asyncio.run(coro())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run_coro, args=(first_runner,))
+    second_thread = threading.Thread(target=run_coro, args=(second_runner,))
+    first_thread.start()
+    assert first_acquired.wait(timeout=1)
+    second_thread.start()
+
+    time.sleep(0.05)
+    second_blocked_while_first_held = not second_acquired.is_set()
+
+    release_first.set()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert second_blocked_while_first_held is True
+    assert order == ["first", "second"]
+
+
+def test_aiagent_warm_worker_process_is_loop_local_but_profile_slot_is_shared(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    workers = []
+    errors: list[BaseException] = []
+
+    async def collect_worker():
+        workers.append(agent_real._get_aiagent_warm_worker(tmp_path))
+
+    def run_in_loop():
+        try:
+            asyncio.run(collect_worker())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run_in_loop)
+    second_thread = threading.Thread(target=run_in_loop)
+    first_thread.start()
+    first_thread.join(timeout=1)
+    second_thread.start()
+    second_thread.join(timeout=1)
+
+    try:
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        assert len(workers) == 2
+        assert workers[0] is not workers[1]
+        assert workers[0]._lock is workers[1]._lock
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_warm_worker_disabled_uses_one_shot_command(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_AIAGENT_WARM_WORKER", raising=False)
+    calls: list[tuple[object, ...]] = []
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "one-shot-ok"}\n',
+                b'{"event": "done", "result": "one-shot-ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 654
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "one-shot-ok"), ("done", "one-shot-ok")]
+    assert len(calls) == 1
+    assert "--worker" not in calls[0]
+    assert str(calls[0][1]).endswith("aiagent_subprocess.py")
+
+
+def test_stream_aiagent_subprocess_falls_back_to_one_shot_when_warm_worker_spawn_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    calls: list[tuple[object, ...]] = []
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "fallback-ok"}\n',
+                b'{"event": "done", "result": "fallback-ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 789
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("warm worker spawn failed")
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "fallback-ok"), ("done", "fallback-ok")]
+    assert "--worker" in calls[0]
+    assert "--worker" not in calls[1]
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_falls_back_when_warm_worker_dies_before_first_event(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    calls: list[tuple[object, ...]] = []
+
+    class WarmStdin:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    class WarmStdout:
+        def __init__(self):
+            self.lines = [b'{"event": "ready"}\n', b""]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class OneShotStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class OneShotStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "fallback-after-eof"}\n',
+                b'{"event": "done", "result": "fallback-after-eof", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self, *, warm: bool):
+            self.stdin = WarmStdin() if warm else OneShotStdin()
+            self.stdout = WarmStdout() if warm else OneShotStdout()
+            self.stderr = FakeStderr()
+            self.pid = 790 if warm else 791
+            self.returncode = None
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        return FakeProc(warm="--worker" in args)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    try:
+        events = asyncio.run(collect_events())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert events == [("content", "fallback-after-eof"), ("done", "fallback-after-eof")]
+    assert len(calls) == 2
+    assert "--worker" in calls[0]
+    assert "--worker" not in calls[1]
+
+
+def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    event = _event()
+    event.source.user_id = "g41a5b5g"
+    event.raw_message = {
+        "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": "ou_raw_sender",
+                    "union_id": "on_raw_sender",
+                }
+            }
+        }
+    }
+
+    payload = agent_real._event_to_subprocess_payload(event, tmp_path)
+
+    assert payload["event"]["sender_open_id"] == "ou_raw_sender"
+
+
+def test_event_payload_carries_router_messages(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+        {"role": "user", "content": "send me the link"},
+    ]
+
+    payload = agent_real._event_to_subprocess_payload(_event(), tmp_path, messages=messages)
+
+    assert payload["messages"] == messages
+
+
+def test_event_payload_canonicalizes_profile_home_before_sandbox(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "real-profile"
+    profile_home.mkdir()
+    alias = tmp_path / "profile-alias"
+    alias.symlink_to(profile_home, target_is_directory=True)
+
+    payload = agent_real._event_to_subprocess_payload(_event(), alias)
+
+    assert payload["profile_home"] == str(profile_home.resolve())
+
+
+def test_event_payload_preserves_webui_raw_session_for_child_replay(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.source.chat_id = ""
+    event.source.chat_type = "webui"
+    event.raw_event = {
+        "channel": "webui",
+        "session_id": "webui-doc-session-123",
+        "metadata": {"conversation": "webui:webui-doc-session-123"},
+    }
+
+    payload = agent_real._event_to_subprocess_payload(event, profile_home)
+    replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
+    child_session_id = agent_real._resolve_aiagent_session_id(
+        replayed,
+        profile_home,
+        replayed.sender_open_id,
+    )
+
+    assert payload["event"]["raw_event"]["session_id"] == "webui-doc-session-123"
+    assert "platform:webui" in child_session_id
+    assert "session:webui-doc-session-123" in child_session_id
+    assert "chat_type:webui:user" not in child_session_id
+
+
+def test_configure_feishu_uat_home_binds_to_profile_local_dir(tmp_path: Path):
+    """档 A change: FEISHU_UAT_DIR points at <profile>/feishu_uat/, not shared."""
+    from hermes_multitenancy import agent_real
+
+    default_home = tmp_path / ".hermes"
+    profile_home = default_home / "profiles" / "coder"
+    fake_feishu_oapi = SimpleNamespace(
+        FEISHU_UAT_PATH=None,
+        FEISHU_UAT_DIR=None,
+    )
+
+    shared_home = agent_real._configure_feishu_uat_home(fake_feishu_oapi, profile_home)
+
+    # shared_home is still derived correctly (cron etc. still need it).
+    assert shared_home == default_home
+    # But UAT lookups are now scoped to the profile.
+    assert fake_feishu_oapi.FEISHU_UAT_PATH == profile_home / "feishu_uat.json"
+    assert fake_feishu_oapi.FEISHU_UAT_DIR == profile_home / "feishu_uat"
+    # And the dir is created mode 0700.
+    import stat as stat_mod
+    mode = stat_mod.S_IMODE((profile_home / "feishu_uat").stat().st_mode)
+    assert mode == 0o700
+
+
+def test_configure_feishu_uat_home_does_not_leak_other_profiles_dir(tmp_path: Path):
+    """Pointing two profiles at the same fake_feishu_oapi must give them disjoint dirs."""
+    from hermes_multitenancy import agent_real
+
+    default_home = tmp_path / ".hermes"
+    alice = default_home / "profiles" / "alice"
+    bob = default_home / "profiles" / "bob"
+    fake = SimpleNamespace(FEISHU_UAT_PATH=None, FEISHU_UAT_DIR=None)
+
+    agent_real._configure_feishu_uat_home(fake, alice)
+    assert fake.FEISHU_UAT_DIR == alice / "feishu_uat"
+
+    agent_real._configure_feishu_uat_home(fake, bob)
+    assert fake.FEISHU_UAT_DIR == bob / "feishu_uat"
+    # The previous binding must not still be reachable through any property.
+    assert alice / "feishu_uat" != bob / "feishu_uat"
+
+
+def test_configure_cron_home_skips_binding_in_multitenancy_layout(monkeypatch, tmp_path: Path):
+    """In multitenancy nested layout (<root>/profiles/<name>) the function is
+    a no-op: cron writes stay at the profile-default path and the dedicated
+    multi-profile worker (``cron_worker``) handles tick-time delivery."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    sentinel_jobs = object()
+    sentinel_output = object()
+    cron_jobs.JOBS_FILE = sentinel_jobs
+    cron_jobs.OUTPUT_DIR = sentinel_output
+    cron_pkg.jobs = cron_jobs
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    agent_real._configure_cron_home(shared_home)
+
+    # Untouched: multitenancy layout triggers early return before any rebinding.
+    assert cron_jobs.JOBS_FILE is sentinel_jobs
+    assert cron_jobs.OUTPUT_DIR is sentinel_output
+
+
+def test_configure_cron_home_patches_native_cronjob_create_with_owner(
+    monkeypatch, tmp_path: Path
+):
+    """Feishu-created native cron jobs persist owner context at creation time."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    stored: dict[str, object] = {}
+
+    def create_job(**kwargs):
+        stored["job"] = {"id": "job123", **kwargs}
+        return dict(stored["job"])
+
+    def update_job(job_id, updates):
+        assert job_id == "job123"
+        stored["job"].update(updates)
+        return dict(stored["job"])
+
+    cronjob_tools.create_job = create_job
+    cronjob_tools.update_job = update_job
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_owner")
+
+    agent_real._configure_cron_home(shared_home)
+
+    job = cronjob_tools.create_job(prompt="check calendar", schedule="0 10 * * *", deliver="feishu")
+
+    assert job["owner_open_id"] == "ou_owner"
+    assert job["owner_profile"] == "owner"
+    assert stored["job"]["owner_open_id"] == "ou_owner"
+
+
+def test_configure_cron_home_patches_native_cronjob_run_to_broker(
+    monkeypatch, tmp_path: Path
+):
+    """Native cronjob(action=run) should forward to router RunBroker jobs API."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import cron_worker
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    forwarded: list[dict[str, object]] = []
+
+    def create_job(**kwargs):
+        return {"id": "job123", **kwargs}
+
+    def update_job(job_id, updates):
+        return {"id": job_id, **updates}
+
+    def trigger_job(_job_id):
+        raise AssertionError("native cron trigger_job must not run locally")
+
+    def resolve_job_ref(job_id):
+        assert job_id == "job123"
+        return {
+            "id": "job123",
+            "name": "cron canary",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "owner",
+        }
+
+    def get_job(job_id):
+        return resolve_job_ref(job_id)
+
+    def execute_job_now(_job):
+        raise AssertionError("native cron _execute_job_now must not run locally")
+
+    def format_job(job):
+        return dict(job)
+
+    def cronjob(action, job_id=None, **_kwargs):
+        normalized = (action or "").strip().lower()
+        job = resolve_job_ref(job_id)
+        if normalized in {"run", "run_now", "trigger"}:
+            exec_result = cronjob_tools._execute_job_now(job)
+            result = cronjob_tools._format_job(cronjob_tools.get_job(job_id) or {"id": job_id})
+            result["executed"] = exec_result.get("claimed", False)
+            return json.dumps({"success": True, "job": result}, indent=2)
+        raise AssertionError(f"unexpected action {action!r}")
+
+    def fake_forward(*, job_id, profile_home, owner_open_id):
+        forwarded.append({
+            "job_id": job_id,
+            "profile_home": profile_home,
+            "owner_open_id": owner_open_id,
+        })
+        return {
+            "id": job_id,
+            "name": "cron canary",
+            "owner_open_id": owner_open_id,
+            "owner_profile": profile_home.name,
+            "next_run_at": "now",
+        }
+
+    cronjob_tools.create_job = create_job
+    cronjob_tools.update_job = update_job
+    cronjob_tools.trigger_job = trigger_job
+    cronjob_tools.resolve_job_ref = resolve_job_ref
+    cronjob_tools.get_job = get_job
+    cronjob_tools._execute_job_now = execute_job_now
+    cronjob_tools._format_job = format_job
+    cronjob_tools.cronjob = cronjob
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(cron_worker, "trigger_profile_cron_job_via_run_broker", fake_forward)
+    cached_cronjob = cronjob_tools.cronjob
+
+    agent_real._configure_cron_home(shared_home)
+
+    job = cronjob_tools.trigger_job("job123")
+    payload = json.loads(cached_cronjob(action="run", job_id="job123"))
+
+    assert job["owner_open_id"] == "ou_owner"
+    assert payload["success"] is True
+    assert payload["job"]["owner_open_id"] == "ou_owner"
+    assert forwarded == [
+        {
+            "job_id": "job123",
+            "profile_home": profile_home,
+            "owner_open_id": "ou_owner",
+        },
+        {
+            "job_id": "job123",
+            "profile_home": profile_home,
+            "owner_open_id": "ou_owner",
+        },
+    ]
+
+
+def test_configure_cron_home_binds_shared_in_legacy_layout(monkeypatch, tmp_path: Path):
+    """Outside the multitenancy nested layout (e.g. single-profile or legacy
+    deployments) the function still rebinds cron paths to the shared store."""
+    from hermes_multitenancy import agent_real
+
+    legacy_home = tmp_path / ".hermes-legacy"
+    shared_home = tmp_path / ".hermes"
+    legacy_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    path_security = types.ModuleType("tools.path_security")
+    path_security.validate_within_dir = lambda path, root: None
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+    tools_pkg.path_security = path_security
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setitem(sys.modules, "tools.path_security", path_security)
+    monkeypatch.setenv("HERMES_HOME", str(legacy_home))
+
+    agent_real._configure_cron_home(shared_home)
+
+    assert cron_jobs.JOBS_FILE == shared_home.resolve() / "cron" / "jobs.json"
+    assert cron_jobs.OUTPUT_DIR == shared_home.resolve() / "cron" / "output"
+    assert os.environ["HERMES_HOME"] == str(legacy_home)
+    assert cronjob_tools._validate_cron_script_path("reminder.py") is None
+    assert "relative to shared" in cronjob_tools._validate_cron_script_path("/tmp/reminder.py")
+
+
+def test_tool_progress_logger_records_tool_names(caplog):
+    from hermes_multitenancy import agent_real
+
+    with caplog.at_level(logging.INFO, logger=agent_real.__name__):
+        agent_real._log_aiagent_tool_progress(
+            "tool.started",
+            "feishu_calendar_list_events",
+            "list events",
+            {},
+        )
+        agent_real._log_aiagent_tool_progress(
+            "tool.completed",
+            "feishu_calendar_list_events",
+            None,
+            None,
+            duration=1.25,
+            is_error=False,
+        )
+
+    assert "[multitenancy] tool.started feishu_calendar_list_events" in caplog.text
+    assert "[multitenancy] tool.completed feishu_calendar_list_events" in caplog.text
+
+
+def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, str] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["chat_id_kwarg"] = kwargs.get("chat_id", "")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            from gateway.session_context import get_session_env
+
+            seen["session_chat_id"] = get_session_env("HERMES_SESSION_CHAT_ID")
+            seen["session_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _event()
+    event.source.chat_id = "oc_current"
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen == {
+        "chat_id_kwarg": "oc_current",
+        "session_chat_id": "oc_current",
+        "session_platform": "feishu",
+    }
+
+
+def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_path: Path):
+    """Official-clean Hermes no longer ships tools.feishu_oapi_client."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    tools_mod = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.delitem(sys.modules, "tools.feishu_oapi_client", raising=False)
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["toolsets"] = kwargs.get("toolsets")
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
+            seen["user_message"] = user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            seen["cleanup"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+
+    event = _event()
+    event.source.user_id = "ou_clean_upstream_sender"
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen["user_message"].endswith("\nhello")
+    assert seen["cleanup"] is True
+
+
+@pytest.mark.parametrize("platform", ["feishu", "webui", "cron"])
+def test_run_with_aiagent_adds_current_time_envelope_without_persisting_it(
+    monkeypatch,
+    tmp_path: Path,
+    platform: str,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, str] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(
+            self,
+            user_message,
+            task_id,
+            conversation_history=None,
+            persist_user_message=None,
+        ):
+            seen["user_message"] = user_message
+            seen["persist_user_message"] = persist_user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value=platform)
+    before = datetime.now(ZoneInfo("Asia/Shanghai"))
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    after = datetime.now(ZoneInfo("Asia/Shanghai"))
+
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    expected_prefixes = {
+        f"[{weekdays[current.weekday()]} {current.isoformat(timespec='minutes')} Asia/Shanghai]\n"
+        for current in (before, after)
+    }
+    assert any(
+        seen["user_message"].startswith(prefix) for prefix in expected_prefixes
+    )
+    assert seen["user_message"].endswith("\nhello")
+    assert seen["persist_user_message"] == "hello"
+
+
+def test_run_with_aiagent_rejects_invalid_profile_timezone(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "timezone: Mars/Olympus_Mons\nmodel:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=object))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="invalid profile timezone"):
+        agent_real._run_with_aiagent(_event(), profile_home)
+
+
+def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tmp_path: Path):
+    """Expert overlay rides the UPSTREAM ephemeral_system_prompt seam (0 core change).
+
+    The persona block must arrive via the ``ephemeral_system_prompt`` constructor
+    kwarg (present in NousResearch origin/main), NOT via the fork-only
+    ``identity_override`` kwarg and NOT via a run_conversation ``system_message``.
+    """
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - hermes-api-server\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, ephemeral_system_prompt=None, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            captured["ephemeral_system_prompt"] = ephemeral_system_prompt
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, system_message=None, persist_user_message=None):
+            captured["run_system_message"] = system_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(
+        agent_real,
+        "_role_override_block_for_event",
+        lambda event, home: "ROLE OVERRIDE\n我是资源投放专家",
+    )
+    monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _: [])
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_skill_env_policy", lambda _: ("pre", ("pre", "online")))
+    monkeypatch.setattr(agent_real.credential_hub, "kep_auth_state_line", lambda **_: "VERIFIED: pre=needs_auth")
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    # identity rides ephemeral_system_prompt — never the fork-only identity_override
+    assert "identity_override" not in captured["kwargs"]
+    # Expert block leads; todo progress rules are CONCATENATED after it (R1:
+    # the two share one kwarg and must never overwrite each other).
+    ephemeral = captured["ephemeral_system_prompt"]
+    assert isinstance(ephemeral, str)
+    assert ephemeral.startswith("VERIFIED: pre=needs_auth\n\nROLE OVERRIDE\n我是资源投放专家")
+    assert "任务进度规则" in ephemeral
+    assert ephemeral.index("ROLE OVERRIDE") < ephemeral.index("任务进度规则")
+    assert 'lark_cli` tool with `mode="script"' in ephemeral
+    # and NOT smuggled through run_conversation(system_message=...)
+    assert captured.get("run_system_message") is None
+
+
+def test_run_with_aiagent_falls_back_when_core_lacks_ephemeral_seam(monkeypatch, tmp_path: Path):
+    """Narrow TypeError fallback (SPEC guard): a core WITHOUT ephemeral_system_prompt
+    drops the expert overlay and runs as a normal SOUL session — never hard-fails."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    attempts: list[dict] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if "ephemeral_system_prompt" in kwargs:
+                raise TypeError(
+                    "__init__() got an unexpected keyword argument 'ephemeral_system_prompt'"
+                )
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(
+        agent_real,
+        "_role_override_block_for_event",
+        lambda event, home: "ROLE OVERRIDE\n我是资源投放专家",
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    # first attempt carried the overlay (raised TypeError), retry dropped it → SOUL run
+    assert len(attempts) == 2
+    assert "ephemeral_system_prompt" in attempts[0]
+    assert "ephemeral_system_prompt" not in attempts[1]
+
+
+@pytest.mark.parametrize(("platform", "has_todo_rules"), [("feishu", True), ("webui", False)])
+def test_run_with_aiagent_omits_expert_system_message_without_expert(
+    monkeypatch, tmp_path: Path, platform: str, has_todo_rules: bool
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n"
+        "  feishu:\n  - hermes-api-server\n"
+        "  webui:\n  - hermes-api-server\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value=platform)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "identity_override" not in captured
+    ephemeral = captured.get("ephemeral_system_prompt")
+    assert isinstance(ephemeral, str)
+    assert 'lark_cli` tool with `mode="script"' in ephemeral
+    if has_todo_rules:
+        assert ephemeral.startswith("任务进度规则")
+        assert "ROLE OVERRIDE" not in ephemeral
+    else:
+        assert ephemeral.startswith("Installed Plugin/Skill script execution:")
+
+
+def test_run_with_aiagent_omits_todo_rules_when_todo_toolset_disabled(monkeypatch, tmp_path: Path):
+    """Profile with agent.disabled_toolsets: [todo] must not receive todo rules
+    (instructing the model to call a tool it doesn't have causes failed calls)."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  feishu:\n  - hermes-api-server\n"
+        "agent:\n  disabled_toolsets:\n  - todo\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert 'lark_cli` tool with `mode="script"' in str(
+        captured.get("ephemeral_system_prompt") or ""
+    )
+
+
+def test_run_with_aiagent_omits_todo_rules_in_explicit_mode_without_todo(monkeypatch, tmp_path: Path):
+    """Explicit toolsets_mode with a list that resolves WITHOUT todo must not
+    inject the rules (review HIGH: never instruct the model to call a tool
+    absent from its schema)."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  feishu:\n  - file\n"
+        "multitenancy:\n  toolsets_mode: explicit\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured.get("enabled_toolsets") == ["file"]
+    assert 'lark_cli` tool with `mode="script"' in str(
+        captured.get("ephemeral_system_prompt") or ""
+    )
+
+
+def test_run_with_aiagent_applies_expert_skill_scope_cleanup(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+    cleanup_calls: list[str] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["constructed"] = True
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(
+        agent_real,
+        "_apply_expert_skill_scope_for_aiagent",
+        lambda event, home: (lambda: cleanup_calls.append("cleaned")),
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["constructed"] is True
+    assert cleanup_calls == ["cleaned"]
+
+
+def test_run_with_aiagent_cleans_expert_skill_scope_on_agent_init_error(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    cleanup_calls: list[str] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    monkeypatch.setattr(
+        agent_real,
+        "_apply_expert_skill_scope_for_aiagent",
+        lambda event, home: (lambda: cleanup_calls.append("cleaned")),
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        agent_real._run_with_aiagent(event, profile_home)
+    assert cleanup_calls == ["cleaned"]
+
+
+def test_run_with_aiagent_preserves_short_parent_tmp_and_profile_child_tmp(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / (
+        "feishu_group_8ec050fb3255_703fc51f7d272a1f"
+    )
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  webui:\n  - terminal\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
+            from tools import code_execution_env as code_execution_tool
+
+            cached_tempdir = tempfile.tempdir
+            tempfile.tempdir = None
+            try:
+                socket_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"hermes_rpc_{uuid.uuid4().hex}.sock",
+                )
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    server.bind(socket_path)
+                finally:
+                    server.close()
+                    if os.path.exists(socket_path):
+                        os.unlink(socket_path)
+            finally:
+                tempfile.tempdir = cached_tempdir
+
+            child_env = code_execution_tool._scrub_child_env(dict(os.environ))
+            seen.update(
+                parent_tmp=os.environ["TMPDIR"],
+                parent_socket_bytes=len(os.fsencode(socket_path)),
+                child_tmp=child_env["TMPDIR"],
+            )
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setenv("HERMES_SANDBOX_HOST", "1")
+    monkeypatch.setattr(agent_real.sys, "platform", "linux")
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen["parent_tmp"] == "/tmp"
+    assert seen["parent_socket_bytes"] < 108
+    assert seen["child_tmp"] == str(profile_home / "tmp")
+
+
+def test_run_with_aiagent_registers_vod_provider_in_child_process(monkeypatch, tmp_path: Path):
+    """Routed AIAgent subprocesses do not go through the Hermes plugin loader."""
+    from agent.image_gen_registry import _reset_for_tests, get_provider
+    from hermes_multitenancy import agent_real
+
+    _reset_for_tests()
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "image_gen:\n  provider: tencent-vod\n  model: gem-3.1\n"
+        "platform_toolsets:\n  webui:\n  - image_gen\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            provider = get_provider("tencent-vod")
+            seen["provider_name_at_init"] = getattr(provider, "name", None)
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
+            provider = get_provider("tencent-vod")
+            seen["provider_name_at_run"] = getattr(provider, "name", None)
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    try:
+        assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+        assert seen == {
+            "provider_name_at_init": "tencent-vod",
+            "provider_name_at_run": "tencent-vod",
+        }
+    finally:
+        _reset_for_tests()
+
+
+def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
+            seen["user_message"] = user_message
+            seen["conversation_history"] = conversation_history
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.text = "send me the link"
+    messages = [
+        {"role": "user", "content": "create a doc"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+        {"role": "user", "content": "send me the link"},
+    ]
+
+    assert agent_real._run_with_aiagent(event, profile_home, messages=messages) == "ok"
+    assert seen["user_message"].endswith("\nsend me the link")
+    assert seen["conversation_history"] == [
+        {"role": "user", "content": "create a doc"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+    ]
+
+
+def test_aiagent_session_id_is_stable_across_feishu_message_ids(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    first = _event()
+    second = _event()
+    second.message_id = "om_next"
+    second.source.message_id = "om_source_next"
+
+    first_session = agent_real._resolve_aiagent_session_id(
+        first,
+        profile_home,
+        "ou_sender",
+    )
+    second_session = agent_real._resolve_aiagent_session_id(
+        second,
+        profile_home,
+        "ou_sender",
+    )
+
+    assert first_session == second_session
+    assert "profile:coder" in first_session
+    assert "chat:oc_test" in first_session
+    assert "user:ou_sender" in first_session
+
+
+def test_aiagent_session_id_isolates_users_in_same_feishu_chat(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+
+    assert agent_real._resolve_aiagent_session_id(event, profile_home, "ou_owner") != (
+        agent_real._resolve_aiagent_session_id(event, profile_home, "ou_yuan")
+    )
+
+
+def test_multitenant_gateway_session_key_matches_router_shape(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+
+    assert agent_real._resolve_multitenant_gateway_session_key(
+        event,
+        profile_home,
+        "ou_test",
+    ) == "multitenancy:feishu:coder:oc_test:ou_test"
+
+
+def test_resolve_enabled_toolsets_merges_feishu_override_with_default_tools():
+    from hermes_multitenancy import agent_real
+
+    seen: dict[str, object] = {}
+
+    def fake_get_platform_tools(config, platform, *, include_default_mcp_servers=True):
+        seen["platform_toolsets"] = config.get("platform_toolsets")
+        seen["platform"] = platform
+        seen["include_default_mcp_servers"] = include_default_mcp_servers
+        return {"web", "browser", "feishu_doc"}
+
+    config = {
+        "platform_toolsets": {
+            "feishu": ["feishu_drive"],
+        }
+    }
+
+    assert agent_real._resolve_enabled_toolsets(
+        config,
+        "feishu",
+        platform_tools_resolver=fake_get_platform_tools,
+    ) == ["browser", "feishu_doc", "feishu_drive", "web"]
+    assert seen == {
+        "platform_toolsets": {},
+        "platform": "feishu",
+        "include_default_mcp_servers": True,
+    }
+
+
+def test_resolve_enabled_toolsets_allows_explicit_mode(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    def fake_get_platform_tools(*_args, **_kwargs):
+        raise AssertionError("explicit mode must not resolve platform defaults")
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_TOOLSETS_MODE", "explicit")
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"platform_toolsets": {"feishu": ["feishu_drive", "web"]}},
+        "feishu",
+        platform_tools_resolver=fake_get_platform_tools,
+    ) == ["feishu_drive", "web"]
+
+
+def test_resolve_enabled_toolsets_merges_webui_lark_cli_with_api_server_defaults():
+    from hermes_multitenancy import agent_real
+
+    seen: dict[str, object] = {}
+
+    def fake_get_platform_tools(config, platform, *, include_default_mcp_servers=True):
+        seen["platform_toolsets"] = config.get("platform_toolsets")
+        seen["platform"] = platform
+        seen["include_default_mcp_servers"] = include_default_mcp_servers
+        if platform == "webui":
+            raise KeyError("webui")
+        return {"terminal", "file", "web"}
+
+    config = {
+        "platform_toolsets": {
+            "feishu": ["lark-cli"],
+            "api_server": ["lark-cli"],
+            "webui": ["lark-cli"],
+        },
+        "multitenancy": {
+            "toolsets_mode": "explicit",
+            "platform_toolsets_mode": {
+                "feishu": "explicit",
+                "api_server": "merge_default",
+                "webui": "merge_default",
+            },
+        },
+    }
+
+    assert agent_real._resolve_enabled_toolsets(
+        config,
+        "webui",
+        platform_tools_resolver=fake_get_platform_tools,
+    ) == ["file", "lark-cli", "request-authorization", "terminal", "web"]
+    assert seen == {
+        "platform_toolsets": {
+            "feishu": ["lark-cli"],
+        },
+        "platform": "api_server",
+        "include_default_mcp_servers": True,
+    }
+
+
+def test_resolve_enabled_toolsets_preserves_webui_core_tools_without_resolver():
+    from hermes_multitenancy import agent_real
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"platform_toolsets": {"webui": ["lark-cli"]}},
+        "webui",
+        platform_tools_resolver=None,
+    ) == ["file", "lark-cli", "request-authorization", "terminal", "web"]
+
+
+def test_resolve_enabled_toolsets_removes_browser_unless_profile_enabled(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    def fake_get_platform_tools(config, platform, *, include_default_mcp_servers=True):
+        return {"browser", "web", "file"}
+
+    assert agent_real._resolve_enabled_toolsets(
+        {},
+        "webui",
+        platform_tools_resolver=fake_get_platform_tools,
+        profile_home=profile_home,
+    ) == ["file", "request-authorization", "web"]
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"multitenancy": {"browser": {"enabled": True}}},
+        "webui",
+        platform_tools_resolver=fake_get_platform_tools,
+        profile_home=profile_home,
+    ) == ["browser", "file", "request-authorization", "web"]
+
+
+def test_resolve_enabled_toolsets_denies_browser_for_router_profile(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "multitenancy_router"
+    profile_home.mkdir(parents=True)
+
+    assert agent_real._resolve_enabled_toolsets(
+        {
+            "platform_toolsets": {"webui": ["browser", "web"]},
+            "multitenancy": {"browser": {"enabled": True}},
+        },
+        "webui",
+        platform_tools_resolver=None,
+        profile_home=profile_home,
+    ) == ["file", "request-authorization", "terminal", "web"]
+
+
+def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["file", "lark-cli", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["file", "lark-cli", "terminal", "web"],
+    }
+
+
+def test_run_with_aiagent_passes_disabled_toolsets_to_core(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: openai/test-model\n"
+        "agent:\n"
+        "  disabled_toolsets:\n"
+        "  - delegation\n"
+        "platform_toolsets:\n"
+        "  webui:\n"
+        "  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+            captured["disabled_toolsets"] = kwargs.get("disabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["delegation", "file", "terminal", "web"],
+        "disabled_toolsets": ["delegation"],
+    }
+
+
+def test_run_with_aiagent_applies_frozen_project_context(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.projects import ProjectStore
+
+    profile_home = tmp_path / "profiles" / "coder"
+    (profile_home / "workspace" / "reports").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n", encoding="utf-8"
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    store = ProjectStore(profile_home)
+    project = store.create_project(
+        "actor-a",
+        {
+            "name": "Alpha",
+            "description": "Validate visible context, continuity, and task archives.",
+            "instructions": "Use the approved template.",
+            "primary_folder": "reports",
+        },
+    )
+    context = store.bind_session(
+        actor_subject="actor-a",
+        session_id="session-a",
+        requested_project_id=project["id"],
+        requested_supplied=True,
+        requested_workspace=None,
+    )
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.source.user_id = "actor-a"
+    event.raw_event = {
+        "session_id": "session-a",
+        "workspace": "reports",
+        "metadata": {},
+    }
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            captured["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["skip_memory"] is True
+    assert {"memory", "session_search"}.issubset(set(captured["disabled_toolsets"]))
+    assert captured["terminal_cwd"] == str((profile_home / "workspace" / "reports").resolve())
+    prompt = str(captured["ephemeral_system_prompt"])
+    assert "Project description: Validate visible context, continuity, and task archives." in prompt
+    assert "Use the approved template." in prompt
+    assert context.instructions_fingerprint in prompt
+
+    (profile_home / "workspace" / "other").mkdir()
+    event.raw_event["workspace"] = "other"
+    with pytest.raises(RuntimeError, match="workspace binding mismatch"):
+        agent_real._run_with_aiagent(event, profile_home)
+
+    no_folder_project = store.create_project(
+        "actor-a",
+        {"name": "No folder", "instructions": "Stay concise."},
+    )
+    store.bind_session(
+        actor_subject="actor-a",
+        session_id="session-b",
+        requested_project_id=no_folder_project["id"],
+        requested_supplied=True,
+        requested_workspace=None,
+    )
+    event.raw_event = {"session_id": "session-b", "workspace": None, "metadata": {}}
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "bind a development folder to the Project first" in str(
+        captured["ephemeral_system_prompt"]
+    )
+    assert {"code_execution", "delegation", "file", "terminal"}.issubset(
+        set(captured["disabled_toolsets"])
+    )
+
+
+def test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "lark-cli", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["file", "lark-cli", "terminal", "web"],
+    }
+
+
+def test_run_with_aiagent_adds_terminal_for_ingest_strict_toolsets(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "lark-cli"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["lark-cli", "terminal"],
+    }
+
+
+def test_ingest_enabled_toolsets_removes_composite_delegate_task(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    fake_toolsets = SimpleNamespace(
+        resolve_toolset=lambda name: ["delegate_task", "terminal"]
+        if name == "composite-delegating"
+        else [name],
+    )
+    monkeypatch.setitem(sys.modules, "toolsets", fake_toolsets)
+
+    assert agent_real._ingest_enabled_toolsets(
+        ["composite-delegating", "lark-cli"],
+        "webui",
+    ) == ["lark-cli", "terminal"]
+
+
+def test_run_with_aiagent_ingest_secret_env_builds_authorization_header(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.env.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_run"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [
+        {
+            "name": "cms_bearer",
+            "type": "bearer_token",
+            "usage": "Authorization Bearer",
+        }
+    ]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    registered_passthrough: set[str] = set()
+    fake_env_passthrough_mod = SimpleNamespace(
+        _config_passthrough=frozenset(),
+        register_env_passthrough=lambda names: registered_passthrough.update(names),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough_mod)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "lark-cli"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            env_secret_dir = Path(os.environ["HERMES_INGEST_SECRET_DIR"])
+            bearer = (env_secret_dir / "cms_bearer").read_text(encoding="utf-8")
+            authorization = f"Bearer {bearer}"
+            captured["authorization_matches"] = authorization == f"Bearer {secret_value}"
+            captured["authorization_len"] = len(authorization)
+            captured["manifest"] = json.loads(os.environ["HERMES_INGEST_SECRET_MANIFEST"])
+            return {"final_response": f"ok auth_len={captured['authorization_len']}"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    result = agent_real._run_with_aiagent(event, profile_home)
+
+    assert result == f"ok auth_len={len('Bearer ' + secret_value)}"
+    assert captured["platform_key"] == "webui"
+    assert captured["enabled_toolsets"] == ["lark-cli", "terminal"]
+    assert captured["authorization_matches"] is True
+    assert captured["manifest"] == manifest
+    expected_ingest_passthrough = {
+        "HERMES_INGEST_SECRET_DIR",
+        "HERMES_INGEST_SECRET_MANIFEST",
+    }
+    assert expected_ingest_passthrough <= registered_passthrough
+    assert "KEP_PROFILE" in registered_passthrough
+    assert "TERMINAL_HOME_MODE" in registered_passthrough
+    assert "OPENAI_API_KEY" not in registered_passthrough
+    assert set(fake_env_passthrough_mod._config_passthrough) == registered_passthrough
+    assert secret_value not in json.dumps(captured, ensure_ascii=False)
+    assert secret_value not in result
+
+
+def test_run_with_aiagent_reapplies_profile_home_after_agent_init(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            os.environ["TERMINAL_HOME_MODE"] = "auto"
+            os.environ["HOME"] = "/home/hermes"
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            captured["home"] = os.environ.get("HOME")
+            captured["mode"] = os.environ.get("TERMINAL_HOME_MODE")
+            captured["kep_profile"] = os.environ.get("KEP_PROFILE")
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "home": str(profile_home / "home"),
+        "mode": "profile",
+        "kep_profile": "sunke",
+    }
+
+
+def test_execute_code_child_env_patch_survives_tool_time_env_reset(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - terminal\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {
+            "HOME": source_env.get("HOME", ""),
+            "HERMES_HOME": source_env.get("HERMES_HOME", ""),
+            "KEP_PROFILE": source_env.get("KEP_PROFILE", ""),
+            "TERMINAL_HOME_MODE": source_env.get("TERMINAL_HOME_MODE", ""),
+        }
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            os.environ["TERMINAL_HOME_MODE"] = "auto"
+            os.environ["HOME"] = "/home/hermes"
+            child_env = fake_code_execution_tool._scrub_child_env(os.environ)
+            captured.update({
+                "child_home": child_env.get("HOME"),
+                "child_mode": child_env.get("TERMINAL_HOME_MODE"),
+                "child_kep_profile": child_env.get("KEP_PROFILE"),
+            })
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "child_home": str(profile_home / "home"),
+        "child_mode": "profile",
+        "child_kep_profile": "sunke",
+    }
+    assert fake_code_execution_tool._scrub_child_env is original_scrub_child_env
+
+
+def test_execute_code_child_env_patch_forces_subprocess_home_override(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return dict(source_env)
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    def production_get_subprocess_home(env=None):
+        source = env or os.environ
+        mode = source.get("TERMINAL_HOME_MODE") or os.environ.get("TERMINAL_HOME_MODE", "auto")
+        if mode == "profile":
+            return str(profile_home / "home")
+        if source.get("HOME") == str(profile_home / "home"):
+            return "/home/hermes"
+        return None
+
+    fake_hermes_constants = SimpleNamespace(get_subprocess_home=production_get_subprocess_home)
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake_hermes_constants)
+    monkeypatch.setenv("HOME", str(profile_home / "home"))
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "auto")
+    monkeypatch.setenv("_HERMES_FORCE_HOME", str(profile_home / "home"))
+    monkeypatch.setenv("_HERMES_FORCE_TERMINAL_HOME_MODE", "profile")
+
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(profile_home)
+    try:
+        assert fake_hermes_constants.get_subprocess_home() == str(profile_home / "home")
+    finally:
+        cleanup()
+
+    assert fake_hermes_constants.get_subprocess_home is production_get_subprocess_home
+
+
+def test_execute_code_child_env_patch_uses_each_source_env_not_lifo_stack(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {
+            "HOME": source_env.get("HOME", ""),
+            "KEP_PROFILE": source_env.get("KEP_PROFILE", ""),
+            "TERMINAL_HOME_MODE": source_env.get("TERMINAL_HOME_MODE", ""),
+            "TMPDIR": source_env.get("TMPDIR", ""),
+        }
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "alice")
+    try:
+        alice_env = {
+            "HOME": "/home/hermes",
+            "KEP_PROFILE": "alice",
+            "TERMINAL_HOME_MODE": "auto",
+            "TMPDIR": "/tmp",
+            "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "alice" / "home"),
+            "_HERMES_FORCE_KEP_PROFILE": "alice",
+            "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+            "_HERMES_FORCE_TMPDIR": str(tmp_path / "profiles" / "alice" / "tmp"),
+        }
+        bob_env = {
+            "HOME": "/home/hermes",
+            "KEP_PROFILE": "bob",
+            "TERMINAL_HOME_MODE": "auto",
+            "TMPDIR": "/tmp",
+            "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "bob" / "home"),
+            "_HERMES_FORCE_KEP_PROFILE": "bob",
+            "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+            "_HERMES_FORCE_TMPDIR": str(tmp_path / "profiles" / "bob" / "tmp"),
+        }
+
+        assert fake_code_execution_tool._scrub_child_env(alice_env) == {
+            "HOME": str(tmp_path / "profiles" / "alice" / "home"),
+            "KEP_PROFILE": "alice",
+            "TERMINAL_HOME_MODE": "profile",
+            "TMPDIR": str(tmp_path / "profiles" / "alice" / "tmp"),
+        }
+        assert fake_code_execution_tool._scrub_child_env(bob_env) == {
+            "HOME": str(tmp_path / "profiles" / "bob" / "home"),
+            "KEP_PROFILE": "bob",
+            "TERMINAL_HOME_MODE": "profile",
+            "TMPDIR": str(tmp_path / "profiles" / "bob" / "tmp"),
+        }
+    finally:
+        cleanup()
+
+
+def test_execute_code_child_env_patch_refcounts_overlapping_runs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {"HOME": source_env.get("HOME", "")}
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    cleanup_a = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "alice")
+    cleanup_b = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "bob")
+    assert fake_code_execution_tool._scrub_child_env is not original_scrub_child_env
+
+    cleanup_b()
+    assert fake_code_execution_tool._scrub_child_env is not original_scrub_child_env
+    assert fake_code_execution_tool._scrub_child_env({
+        "HOME": "/home/hermes",
+        "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "alice" / "home"),
+    })["HOME"] == str(tmp_path / "profiles" / "alice" / "home")
+
+    cleanup_a()
+    assert fake_code_execution_tool._scrub_child_env is original_scrub_child_env
+
+
+def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    pytest.importorskip("hermes_cli.tools_config")
+    toolsets_mod = pytest.importorskip("toolsets")
+    from hermes_multitenancy import agent_real
+
+    assert "delegate_task" in set(toolsets_mod.resolve_toolset("delegation"))
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: openai/test-model\n"
+        "platform_toolsets:\n"
+        "  webui:\n"
+        "  - hermes-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    enabled_toolsets = set(captured["enabled_toolsets"] or [])
+    assert "delegation" not in enabled_toolsets
+    assert "terminal" in enabled_toolsets
+    assert "code_execution" in enabled_toolsets
+    expanded_tools: set[str] = set()
+    for toolset_name in enabled_toolsets:
+        expanded_tools.update(toolsets_mod.resolve_toolset(toolset_name))
+    assert "delegate_task" not in expanded_tools
+
+
+def test_run_with_aiagent_redacts_ingest_secret_from_finalize_logs(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.finalize.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_finalize"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {
+                "failed": True,
+                "final_response": None,
+                "error": f"tool failed Authorization: Bearer {secret_value}",
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        with pytest.raises(RuntimeError) as excinfo:
+            agent_real._run_with_aiagent(event, profile_home)
+
+    assert "[REDACTED:cms_bearer]" in str(excinfo.value)
+    assert "[REDACTED:cms_bearer]" in caplog.text
+    assert secret_value not in str(excinfo.value)
+    assert secret_value not in caplog.text
+    assert secret_value[:16] not in caplog.text
+    assert "Authorization: Bearer eyJ" not in caplog.text
+
+
+def test_ingest_runtime_redactor_redacts_opaque_secret_prefix(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "sk-live-1234567890abcdef"
+    leaked_prefix = secret_value[:10]
+    secret_dir = tmp_path / "ingest-secrets" / "ing_prefix"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_api_key").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_api_key", "type": "api_key", "usage": "API key"}]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    redacted = agent_real._redact_ingest_runtime_text(
+        f"tool failed after token prefix {leaked_prefix}"
+    )
+
+    assert "[REDACTED:cms_api_key:prefix]" in redacted
+    assert leaked_prefix not in redacted
+    assert secret_value not in redacted
+
+
+def test_run_with_aiagent_keeps_delegation_toolset_for_non_ingest_runs(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "webui"}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["delegation", "file", "terminal", "web"],
+    }
+
+
+def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "tools.feishu_oapi_client", raising=False)
+    tools_mod = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            seen["user_message"] = user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "lark-cli" in (seen["enabled_toolsets"] or [])
+    assert "terminal" in (seen["enabled_toolsets"] or [])
+    assert "file" in (seen["enabled_toolsets"] or [])
+    assert seen["user_message"].endswith("\nhello")
+
+
+def test_run_with_aiagent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "toolsets:\n  - hermes-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  cwd: /workspace\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["model"] = kwargs.get("model")
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["model"] == "test-model"
+
+
+def test_run_with_aiagent_uses_webui_session_model_metadata(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/profile-default\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "profile-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "session-key")
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+        }
+    }
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["model"] == "claude-sonnet-4-5"
+    assert captured["provider"] == "anthropic"
+    assert captured["api_key"] == "session-key"
+
+
+def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, tmp_path: Path):
+    from types import ModuleType
+
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setattr(
+        agent_real,
+        "_resolve_enabled_toolsets",
+        lambda *_args, **_kwargs: ["moa", "terminal"],
+    )
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  default: custom:litellm-sre/tencent-sonnet-4-6",
+                "  provider: custom:litellm-sre",
+                "  base_url: https://litellm.example/v1",
+                "custom_providers:",
+                "  - name: litellm-sre",
+                "    base_url: https://litellm.example/v1",
+                "    api_key: test-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runtime_calls: list[tuple[str, dict]] = []
+
+    def set_runtime_main(provider, model, **kwargs):
+        runtime_calls.append(
+            (
+                "set",
+                {
+                    "provider": provider,
+                    "model": model,
+                    **kwargs,
+                },
+            )
+        )
+
+    def clear_runtime_main():
+        runtime_calls.append(("clear", {}))
+
+    fake_aux = ModuleType("agent.auxiliary_client")
+    fake_aux.set_runtime_main = set_runtime_main
+    fake_aux.clear_runtime_main = clear_runtime_main
+    fake_aux._resolve_task_provider_model = lambda *_args, **_kwargs: (
+        "auto", "aux-model", None, None, None
+    )
+    fake_aux.resolve_provider_client = lambda provider, model=None, **_kwargs: (
+        provider,
+        model,
+    )
+    fake_aux._evict_cached_clients = lambda _provider: None
+    fake_agent_pkg = ModuleType("agent")
+    fake_agent_pkg.auxiliary_client = fake_aux
+    monkeypatch.setitem(sys.modules, "agent", fake_agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            captured["runtime_at_run"] = list(runtime_calls)
+            captured["ambient_openai_key"] = os.environ.get("OPENAI_API_KEY")
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "litellm_billing_enforced": True,
+            "litellm_billing_user_id": "litellm-user-1",
+            "litellm_billing_base_url": "https://litellm.example/v1",
+        }
+    }
+    monkeypatch.setenv("HERMES_LITELLM_RUNTIME_API_KEY", "employee-key")
+    monkeypatch.setenv(
+        "HERMES_LITELLM_RUNTIME_BASE_URL", "https://litellm.example/v1"
+    )
+    monkeypatch.setenv("HERMES_LITELLM_RUNTIME_EMPLOYEE_ID", "alice")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-shared-key")
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+
+    assert captured["model"] == "tencent-sonnet-4-6"
+    assert captured["provider"] == "custom:litellm-sre"
+    assert captured["base_url"] == "https://litellm.example/v1"
+    assert captured["api_key"] == "employee-key"
+    assert captured["ambient_openai_key"] is None
+    assert "request_overrides" not in captured
+    assert "request_overrides_base_url" not in captured
+    assert captured["enabled_toolsets"] == ["terminal"]
+    assert "moa" in captured["disabled_toolsets"]
+    assert captured["runtime_at_run"] == [
+        (
+            "set",
+            {
+                "provider": "custom:litellm-sre",
+                "model": "tencent-sonnet-4-6",
+                "base_url": "https://litellm.example/v1",
+                "api_key": "employee-key",
+                "api_mode": "",
+                "request_overrides": {},
+                "request_overrides_base_url": "",
+            },
+        )
+    ]
+    assert runtime_calls[-1] == ("clear", {})
+
+
+def test_aux_runtime_sync_fallback_cleanup_without_clear(monkeypatch):
+    from types import ModuleType
+
+    from hermes_multitenancy import agent_real
+
+    calls: list[tuple[str, str, dict]] = []
+
+    def set_runtime_main(provider, model, **kwargs):
+        calls.append((provider, model, kwargs))
+
+    fake_aux = ModuleType("agent.auxiliary_client")
+    fake_aux.set_runtime_main = set_runtime_main
+    fake_agent_pkg = ModuleType("agent")
+    fake_agent_pkg.auxiliary_client = fake_aux
+    monkeypatch.setitem(sys.modules, "agent", fake_agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+
+    cleanup = agent_real._sync_auxiliary_runtime_main_for_aiagent(
+        provider="custom:litellm-sre",
+        model="tencent-sonnet-4-6",
+        base_url="https://litellm.example/v1",
+        api_key="test-key",
+    )
+    cleanup()
+
+    assert calls == [
+        (
+            "custom:litellm-sre",
+            "tencent-sonnet-4-6",
+            {
+                "base_url": "https://litellm.example/v1",
+                "api_key": "test-key",
+                "api_mode": "",
+                "request_overrides": {},
+                "request_overrides_base_url": "",
+            },
+        ),
+        ("", "", {"base_url": "", "api_key": "", "api_mode": ""}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  cwd: /workspace\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    captured: dict[str, object] = {}
+
+    class FakeDelta:
+        content = "ok"
+
+    class FakeChunk:
+        choices = [SimpleNamespace(delta=FakeDelta())]
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured["model"] = kwargs["model"]
+
+            async def stream():
+                yield FakeChunk()
+
+            return stream()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["api_key"] = kwargs.get("api_key")
+
+        chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeClient))
+
+    chunks = [
+        item async for item in agent_real.stream_run_agent(_event(), profile_home)
+    ]
+
+    assert [chunk for chunk in chunks if chunk[0] == "content"] == [("content", "ok")]
+    assert captured["model"] == "test-model"
+    assert captured["api_key"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_legacy_real_run_agent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  cwd: /workspace\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured["model"] = kwargs["model"]
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content="legacy ok"))
+                ],
+                usage=None,
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["api_key"] = kwargs.get("api_key")
+
+        chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeClient))
+
+    assert await agent_real._legacy_real_run_agent(_event(), profile_home) == "legacy ok"
+    assert captured["model"] == "test-model"
+    assert captured["api_key"] == "test-key"
+
+
+def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            self.kwargs["tool_start_callback"](
+                "call-1", "feishu_task_tasklist", {"action": "patch"}
+            )
+            self.kwargs["reasoning_callback"]("我在处理工具结果")
+            self.kwargs["stream_delta_callback"]("已完成")
+            self.kwargs["tool_progress_callback"](
+                "tool.completed",
+                "feishu_task_tasklist",
+                None,
+                None,
+                duration=0.25,
+                is_error=True,
+                result="Error: connector failed",
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-1",
+                "feishu_task_tasklist",
+                {"action": "patch"},
+                "Error: connector failed",
+            )
+            return {"final_response": "已完成"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    result = agent_real._run_with_aiagent(
+        _event(),
+        profile_home,
+        event_sink=lambda event, **payload: events.append({"event": event, **payload}),
+    )
+
+    assert result == "已完成"
+    assert events == [
+        {
+            "event": "tool_started",
+            "session_id": "agent:profile:coder:platform:feishu:chat_type:dm:chat:oc_test:user:ou_test",
+            "tool_call_id": "call-1",
+            "name": "feishu_task_tasklist",
+            "preview": None,
+            "args": {"action": "patch"},
+        },
+        {"event": "thinking", "text": "我在处理工具结果"},
+        {"event": "content", "text": "已完成"},
+        {
+            "event": "tool_completed",
+            "session_id": "agent:profile:coder:platform:feishu:chat_type:dm:chat:oc_test:user:ou_test",
+            "tool_call_id": "call-1",
+            "name": "feishu_task_tasklist",
+            "duration": 0.25,
+            "is_error": True,
+            "failure_subsystem": None,
+            "error_code": None,
+            "retryable": False,
+        },
+    ]
+
+
+def test_run_with_aiagent_correlates_same_name_completion_metadata_by_result(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n", encoding="utf-8"
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            first_result = {"ok": True, "value": "first"}
+            second_result = {"ok": False, "error_code": "SECOND_FAILED"}
+            for call_id in ("call-1", "call-2"):
+                self.kwargs["tool_start_callback"](call_id, "same_tool", {})
+            self.kwargs["tool_progress_callback"](
+                "tool.completed", "same_tool", None, None,
+                duration=1.0, is_error=False, result=first_result,
+            )
+            self.kwargs["tool_progress_callback"](
+                "tool.completed", "same_tool", None, None,
+                duration=2.0, is_error=True, result=second_result,
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-2", "same_tool", {}, second_result
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-1", "same_tool", {}, first_result
+            )
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    agent_real._run_with_aiagent(
+        _event(),
+        profile_home,
+        event_sink=lambda event, **payload: events.append({"event": event, **payload}),
+    )
+
+    completed = [event for event in events if event["event"] == "tool_completed"]
+    assert [(event["tool_call_id"], event["duration"], event["is_error"]) for event in completed] == [
+        ("call-2", 2.0, True),
+        ("call-1", 1.0, False),
+    ]
+
+
+def test_run_with_aiagent_ignores_reasoning_available_preview(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            self.kwargs["tool_progress_callback"](
+                "reasoning.available",
+                "",
+                "visible answer preview",
+                None,
+            )
+            self.kwargs["stream_delta_callback"]("final answer")
+            return {"final_response": "final answer"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    result = agent_real._run_with_aiagent(
+        _event(),
+        profile_home,
+        event_sink=lambda event, **payload: events.append({"event": event, **payload}),
+    )
+
+    assert result == "final answer"
+    assert events == [{"event": "content", "text": "final answer"}]
+
+
+def test_reasoning_storage_drops_duplicate_visible_content():
+    from hermes_multitenancy import agent_real
+
+    assert agent_real._reasoning_for_state_db(
+        "\n\n✅ 测试日历已创建成功！",
+        "✅ 测试日历已创建成功！",
+        preserve_reasoning=True,
+    ) is None
+
+
+def test_reasoning_storage_suppresses_webui_reasoning():
+    from hermes_multitenancy import agent_real
+
+    assert agent_real._reasoning_for_state_db(
+        "日历已创建成功。",
+        "The user wants me to call lark_cli first.",
+        preserve_reasoning=False,
+    ) is None
+
+
+def test_run_with_aiagent_bridges_gateway_approval_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_DIR", str(approval_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT", "1")
+
+    registered, resolved = _install_fake_approval(monkeypatch)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            session_key = self.kwargs["gateway_session_key"]
+            assert session_key == "multitenancy:feishu:coder:oc_test:ou_test"
+            notify = registered[session_key]
+            notify({
+                "command": "python -c 'print(1)'",
+                "description": "script execution via -c flag",
+                "pattern_keys": ["script execution via -c flag"],
+            })
+            return {"final_response": "approved"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "approval_required":
+            Path(payload["decision_path"]).write_text(
+                json.dumps({"choice": "once"}),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    result = agent_real._run_with_aiagent(_event(), profile_home, event_sink=sink)
+
+    assert result == "approved"
+    assert events[0]["event"] == "approval_required"
+    assert events[0]["session_key"] == "multitenancy:feishu:coder:oc_test:ou_test"
+    assert events[0]["command"] == "python -c 'print(1)'"
+    assert events[1]["event"] == "approval_resolved"
+    assert events[1]["choice"] == "once"
+    assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+
+
+def test_run_with_aiagent_bridges_webui_clarify_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - clarify\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    clarify_dir = tmp_path / "clarify"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(clarify_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT", "1")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            answer = self.kwargs["clarify_callback"](
+                "Which report style?",
+                ["brief", "detailed"],
+            )
+            return {"final_response": f"picked:{answer}"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "clarify_required":
+            Path(payload["response_path"]).write_text(
+                json.dumps({"response": "brief"}),
+                encoding="utf-8",
+            )
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="make a report",
+            session_id="webui-session-1",
+        )
+    )
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    result = agent_real._run_with_aiagent(event, profile_home, event_sink=sink)
+
+    assert result == "picked:brief"
+    assert events[0]["event"] == "clarify_required"
+    assert events[0]["question"] == "Which report style?"
+    assert events[0]["choices"] == ["brief", "detailed"]
+    assert events[0]["session_key"] == "multitenancy:webui:coder:unknown:ou_owner"
+    assert events[1]["event"] == "clarify_resolved"
+    assert events[1]["response"] == "brief"
+
+
+def test_run_with_aiagent_bridges_feishu_clarify_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - clarify\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path / "clarify"))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT", "1")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": f"picked:{self.kwargs['clarify_callback']('Which?', ['A', 'B'])}"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "clarify_required":
+            Path(payload["response_path"]).write_text(json.dumps({"response": "A"}), encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home, event_sink=sink) == "picked:A"
+    assert events[0]["session_key"] == "multitenancy:feishu:coder:oc_test:ou_test"
+
+
+def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+    observed: dict[str, object] = {}
+    async_delivery_state = contextvars.ContextVar("async_delivery_state", default=True)
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(kwargs)
+        return async_delivery_state.set(bool(kwargs.get("async_delivery", True)))
+
+    def clear_session_vars(token):
+        async_delivery_state.reset(token)
+
+    def async_delivery_supported():
+        return async_delivery_state.get()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=clear_session_vars,
+        async_delivery_supported=async_delivery_supported,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            from gateway.session_context import async_delivery_supported
+
+            observed["async_delivery_supported"] = async_delivery_supported()
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="analyze image",
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert captured_session_vars
+    assert captured_session_vars[0]["async_delivery"] is False
+    assert observed["async_delivery_supported"] is False
+
+
+def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "\n".join([
+            "model:",
+            "  default: openai/test-model",
+            "terminal:",
+            "  cwd: /workspace/project",
+            "platform_toolsets:",
+            "  webui:",
+            "  - lark-cli",
+        ]),
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    observed: dict[str, object] = {}
+    vision_calls: list[dict[str, object]] = []
+
+    async def fake_vision_analyze_tool(image_url, user_prompt=None):
+        vision_calls.append({"image_url": image_url, "user_prompt": user_prompt})
+        return json.dumps({
+            "success": True,
+            "analysis": "账单详情：Keep停车费收款码，金额 385.00，交易成功。",
+        })
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fake_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            observed["user_message"] = user_message
+            observed["persist_user_message"] = persist_user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: /workspace/uploads/receipt.png",
+                'If analyzing this image, call vision_analyze with image_url "uploads/receipt.png" directly.',
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert vision_calls == [{
+        "image_url": str(upload_path),
+        "user_prompt": "Describe everything visible in this uploaded WebUI image. Include all visible text, UI labels, numbers, objects, layout, colors, and any notable visual details. Do not infer content that is not visible.",
+    }]
+    assert "WebUI image attachment analysis" in str(observed["user_message"])
+    assert "账单详情" in str(observed["user_message"])
+    assert "385.00" in str(observed["user_message"])
+    assert str(observed["user_message"]).split("\n", 1)[1] == str(
+        observed["persist_user_message"]
+    )
+
+
+def test_run_with_aiagent_fails_closed_when_webui_image_analysis_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "\n".join([
+            "model:",
+            "  default: openai/test-model",
+            "terminal:",
+            "  cwd: /workspace/project",
+            "platform_toolsets:",
+            "  webui:",
+            "  - lark-cli",
+        ]),
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        agent_real,
+        "_analyze_webui_uploaded_image",
+        lambda *_args, **_kwargs: (False, "vision provider unavailable"),
+    )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            raise AssertionError("vision-unavailable request must stop before AIAgent")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: /workspace/uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    reply = agent_real._run_with_aiagent(event, profile_home)
+
+    assert "视觉能力暂不可用" in reply
+    assert "vision provider unavailable" not in reply
+
+
+def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "\n".join([
+            "model:",
+            "  default: custom:litellm-sre/tencent-sonnet-4-6",
+            "  base_url: https://litellm.example/v1",
+            "custom_providers:",
+            "  - name: litellm-sre",
+            "    base_url: https://litellm.example/v1",
+            "    api_key: test-key",
+            "platform_toolsets:",
+            "  webui:",
+            "    - lark-cli",
+        ]),
+        encoding="utf-8",
+    )
+
+    observed: dict[str, object] = {}
+    vision_calls: list[dict[str, object]] = []
+
+    async def failing_vision_analyze_tool(image_url, user_prompt=None):
+        vision_calls.append({"image_url": image_url, "user_prompt": user_prompt})
+        return json.dumps({
+            "success": False,
+            "analysis": "No LLM provider configured for task=vision provider=auto.",
+        })
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = failing_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    openai_calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            openai_calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="账单详情：Keep停车费收款码，金额 385.00，交易成功。"
+                        )
+                    )
+                ]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key, base_url=None):
+            observed["openai_client"] = {"api_key": api_key, "base_url": base_url}
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert vision_calls == [{
+        "image_url": str(upload_path),
+        "user_prompt": "Describe everything visible in this uploaded WebUI image. Include all visible text, UI labels, numbers, objects, layout, colors, and any notable visual details. Do not infer content that is not visible.",
+    }]
+    assert observed["openai_client"] == {
+        "api_key": "test-key",
+        "base_url": "https://litellm.example/v1",
+    }
+    assert openai_calls[0]["model"] == "tencent-sonnet-4-6"
+    assert openai_calls[0]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "账单详情" in str(observed["user_message"])
+    assert "385.00" in str(observed["user_message"])
+    assert "No LLM provider configured" not in str(observed["user_message"])
+
+
+def test_run_with_aiagent_does_not_prefill_webui_image_outside_workspace(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    (profile_home / "workspace" / "uploads").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    async def fail_vision_analyze_tool(*_args, **_kwargs):
+        raise AssertionError("outside-workspace markers must not be analyzed")
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fail_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: fake.png]",
+                "Local image path for tools: /etc/passwd",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert (
+        agent_real._run_with_aiagent(event, profile_home)
+        == agent_real._WEBUI_VISION_UNAVAILABLE_REPLY
+    )
+    assert observed == {}
+
+
+def test_run_with_aiagent_only_prefills_webui_images_from_uploads(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    non_upload_path = profile_home / "workspace" / "notes" / "receipt.png"
+    real_upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    text_upload_path = profile_home / "workspace" / "uploads" / "secret.txt"
+    non_upload_path.parent.mkdir(parents=True)
+    text_upload_path.parent.mkdir(parents=True)
+    non_upload_path.write_bytes(b"fake-png")
+    real_upload_path.write_bytes(b"fake-png")
+    text_upload_path.write_text("not an image", encoding="utf-8")
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    async def fail_vision_analyze_tool(*_args, **_kwargs):
+        raise AssertionError("non-upload and non-image markers must not be analyzed")
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fail_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: fake.png]",
+                "Local image path for tools: notes/receipt.png",
+                "[Attached image: fake.txt]",
+                "Local image path for tools: uploads/secret.txt",
+                "[Attached image: forged.png]",
+                "Local image path for tools: /tmp/workspace/uploads/receipt.png",
+                "[Attached image: scheme.png]",
+                "Local image path for tools: file:///workspace/uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert (
+        agent_real._run_with_aiagent(event, profile_home)
+        == agent_real._WEBUI_VISION_UNAVAILABLE_REPLY
+    )
+    assert observed == {}
+
+
+def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    async def fail_vision_analyze_tool(*_args, **_kwargs):
+        raise AssertionError("external ingest text must not trigger WebUI image preflight")
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fail_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="coder",
+            content="\n".join([
+                "请分析这个文件",
+                "[Attached image: fake.png]",
+                "Local image path for tools: uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+            metadata={"source": "ingest"},
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    user_message = str(observed["user_message"])
+    assert "WebUI image attachment analysis" not in user_message
+    assert "Local image path for tools: uploads/receipt.png" in user_message
+
+
+def test_run_with_aiagent_keeps_non_webui_delegation_in_run(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(kwargs)
+        return object()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=lambda token: None,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
+    assert captured_session_vars
+    assert captured_session_vars[0]["async_delivery"] is False
+
+
+def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(dict(kwargs))
+        if "async_delivery" in kwargs:
+            raise TypeError("set_session_vars() got an unexpected keyword argument 'async_delivery'")
+        return object()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=lambda token: None,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="analyze image",
+            session_id="webui-session-1",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        assert agent_real._run_with_aiagent(event, profile_home) == "done"
+
+    assert len(captured_session_vars) == 2
+    assert captured_session_vars[0]["async_delivery"] is False
+    assert "async_delivery" not in captured_session_vars[1]
+    assert "does not accept async_delivery" in caplog.text
+    assert "falling back to legacy session context behavior" in caplog.text
+    assert "WebUI" not in caplog.text
+
+
+def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    approval_dir = tmp_path / "approval"
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_DIR", str(approval_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT", "1")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    registered, resolved = _install_fake_approval(monkeypatch)
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "approval_required":
+            Path(payload["decision_path"]).write_text(
+                json.dumps({"choice": "once"}),
+                encoding="utf-8",
+            )
+
+    cleanup = agent_real._configure_gateway_approval_bridge(
+        sink,
+        "multitenancy:feishu:coder:oc_test:ou_test",
+    )
+    try:
+        worker_result: dict[str, str] = {}
+
+        def worker_thread_tool_guard():
+            session_key = os.getenv("HERMES_SESSION_KEY", "default")
+            notify = registered.get(session_key)
+            if notify is None:
+                worker_result["status"] = "missing"
+                return
+            notify({
+                "command": "python -c 'print(1)'",
+                "description": "script execution via -c flag",
+                "pattern_keys": ["script execution via -c flag"],
+            })
+            worker_result["status"] = "notified"
+
+        worker_thread_tool_guard()
+
+        assert worker_result == {"status": "notified"}
+        assert events[0]["event"] == "approval_required"
+        assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+    finally:
+        cleanup()
+
+    assert os.getenv("HERMES_SESSION_KEY") is None
+    assert os.getenv("HERMES_GATEWAY_SESSION") is None
+    assert os.getenv("HERMES_EXEC_ASK") is None
+
+
+def test_run_with_aiagent_closes_real_agent_resources(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen = {"closed": False}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "ok"
+    assert seen["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_kills_child_when_cancelled(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    started = asyncio.Event()
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = None
+            self.killed = False
+
+        async def communicate(self, _payload):
+            started.set()
+            await asyncio.Event().wait()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    fake_proc = FakeProc()
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    task = asyncio.create_task(agent_real._run_aiagent_subprocess(_event(), tmp_path))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_proc.killed is True
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_executes_sibling_script(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    seen_args: list[str] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self, _payload):
+            return b'{"result": "ok", "error": null}', b""
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        seen_args.extend(str(arg) for arg in args)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    assert await agent_real._run_aiagent_subprocess(_event(), tmp_path) == "ok"
+    assert seen_args[0] == sys.executable
+    assert seen_args[1].endswith("aiagent_subprocess.py")
+    assert "-m" not in seen_args
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_redacts_ingest_secret_from_child_errors(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.subprocess.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_child"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    class FakeProc:
+        returncode = 1
+
+        async def communicate(self, _payload):
+            stdout = json.dumps(
+                {"result": None, "error": f"child Authorization: Bearer {secret_value}"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            stderr = f"stderr Authorization: Bearer {secret_value}".encode("utf-8")
+            return stdout, stderr
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_multitenancy.agent_real"):
+        with pytest.raises(RuntimeError) as excinfo:
+            await agent_real._run_aiagent_subprocess(event, tmp_path)
+
+    assert "[REDACTED:cms_bearer]" in str(excinfo.value)
+    assert "[REDACTED:cms_bearer]" in caplog.text
+    assert secret_value not in str(excinfo.value)
+    assert secret_value not in caplog.text
+    assert secret_value[:16] not in caplog.text
+    assert "Authorization: Bearer eyJ" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 档 A — env whitelist + HOME/XDG/TMPDIR pivot
+# ---------------------------------------------------------------------------
+
+
+def test_build_subprocess_env_drops_non_allowlisted_parent_env(monkeypatch, tmp_path: Path):
+    """Parent env not on the allowlist (e.g. ambient OPENAI_API_KEY) must NOT leak."""
+    from hermes_multitenancy import agent_real
+
+    # Simulate gateway process having a bunch of secret env vars set.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-parent")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-parent")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # allowlisted — must survive
+    monkeypatch.setenv("PYTHONUNBUFFERED", "1")  # allowlisted — must survive
+
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(tmp_path / "profile", approval_dir=approval_dir)
+
+    # Allowlisted keys carry over, with shared Hermes-managed tool bin prepended.
+    assert env["PATH"].endswith("/usr/bin:/bin")
+    assert env["PYTHONUNBUFFERED"] == "1"
+
+    # Secret-ish env keys must be absent.
+    for leaked in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITLAB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        assert leaked not in env, f"{leaked} leaked into subprocess env"
+
+
+def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_path: Path):
+    """Profile .env secrets are passed to the AIAgent process, not inherited from parent."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=profile-key",
+                "ANTHROPIC_BASE_URL=https://tokenhub.example/v1",
+                "FEISHU_APP_SECRET=feishu-secret",
+                "PUBLIC_RUNTIME_FLAG=enabled",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-key")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "profile-key"
+    assert env["ANTHROPIC_BASE_URL"] == "https://tokenhub.example/v1"
+    assert "FEISHU_APP_SECRET" not in env
+    assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
+
+
+def test_build_subprocess_env_loads_shared_model_env_when_profile_env_is_empty(tmp_path: Path):
+    """Profiles may inherit shared model provider keys without exposing Feishu app secrets."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "owner"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("", encoding="utf-8")
+    (shared_home / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=shared-model-key",
+                "ANTHROPIC_BASE_URL=https://tokenhub.example/v1",
+                "FEISHU_APP_ID=cli_test",
+                "FEISHU_APP_SECRET=feishu-secret",
+                "GITLAB_TOKEN=glpat-shared",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "shared-model-key"
+    assert env["ANTHROPIC_BASE_URL"] == "https://tokenhub.example/v1"
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "GITLAB_TOKEN" not in env
+
+
+def test_build_subprocess_env_filters_profile_env_symlinked_to_shared_home(tmp_path: Path):
+    """A profile .env symlink to shared .env is treated as shared config, not tenant env."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (shared_home / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=shared-model-key",
+                "GITLAB_TOKEN=glpat-shared",
+                "PUBLIC_RUNTIME_FLAG=shared-flag",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (profile / ".env").symlink_to(shared_home / ".env")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "shared-model-key"
+    assert "GITLAB_TOKEN" not in env
+    assert "PUBLIC_RUNTIME_FLAG" not in env
+
+
+def test_resolve_base_url_prefers_profile_env_for_primary_model(monkeypatch):
+    """Sandboxed AIAgent must honor provider base URLs loaded from profile .env."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://tokenhub.example")
+
+    base_url = agent_real._resolve_base_url("anthropic", True, {}, {})
+
+    assert base_url == "https://tokenhub.example"
+
+
+def test_build_subprocess_env_forwards_credential_vault_key_only(monkeypatch, tmp_path: Path):
+    """Credential vault key is router plumbing; unrelated parent secrets still stay out."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "vault-key")
+    monkeypatch.setenv("HERMES_CREDENTIAL_KEY", "legacy-vault-key")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-parent")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "vault-key"
+    assert env["HERMES_CREDENTIAL_KEY"] == "legacy-vault-key"
+    assert "GITLAB_TOKEN" not in env
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_build_subprocess_env_does_not_forward_feishu_app_or_user_tokens(monkeypatch, tmp_path: Path):
+    """Feishu app and user tokens come from credential vault, not subprocess env."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setenv("FEISHU_DOMAIN", "feishu")
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("FEISHU_UAT_REFRESH_TOKEN", "refresh-token")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_DOMAIN" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+    assert "FEISHU_UAT_REFRESH_TOKEN" not in env
+
+
+def test_build_subprocess_env_does_not_default_feishu_domain_without_app_env(monkeypatch, tmp_path: Path):
+    """Default domain is resolved by the credential broker, not ambient env."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.delenv("FEISHU_DOMAIN", raising=False)
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("FEISHU_UAT_REFRESH_TOKEN", "refresh-token")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_DOMAIN" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+    assert "FEISHU_UAT_REFRESH_TOKEN" not in env
+
+
+def test_mark_session_source_feishu_ignores_state_db_without_sessions_table(tmp_path: Path):
+    """Some Run Broker profiles have a state.db before Hermes core creates sessions."""
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    with sqlite3.connect(profile / "state.db") as conn:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT)")
+
+    agent_real._mark_session_source_feishu(profile, "session-id")
+
+
+def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path: Path):
+    """Auth-only profiles still work when auth.json is masked inside bwrap."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(
+        "model:\n  default: anthropic/custom-model-a3\n",
+        encoding="utf-8",
+    )
+    (profile / "auth.json").write_text(
+        '{"credential_pool":{"anthropic":[{"access_token":"auth-token"}]}}',
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "auth-token"
+
+
+def test_provider_adapter_profile_local_overrides_org_default(monkeypatch, tmp_path: Path):
+    """Profile-local model provider credentials win over org/global fallback rows."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: anthropic/claude-test\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    store = CredentialStore(shared / "multitenancy.db")
+    expires_at = int(time.time() * 1000) + 3600_000
+    for profile_name, token in (
+        ("__global__", "fallback-token"),
+        ("__org__", "org-token"),
+        ("alice", "profile-token"),
+    ):
+        store.put_credential(
+            profile_name=profile_name,
+            subject_id="anthropic",
+            provider="anthropic",
+            secret_kind="api_key",
+            payload={"api_key": token},
+            expires_at=expires_at,
+        )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+    raw_plan = json.dumps(plan, ensure_ascii=False)
+
+    assert env["ANTHROPIC_API_KEY"] == "profile-token"
+    assert "_HERMES_FORCE_ANTHROPIC_API_KEY" not in env
+    assert "_HERMES_FORCE_HERMES_MULTITENANCY_CREDENTIAL_KEY" not in env
+    anthropic = next(item for item in plan["providers"] if item["provider"] == "anthropic")
+    assert anthropic["selected_source"] == "profile"
+    assert anthropic["source_profile"] == "alice"
+    assert anthropic["status"] == "valid"
+    assert "profile-token" not in raw_plan
+    assert "org-token" not in raw_plan
+    assert "fallback-token" not in raw_plan
+
+
+def test_provider_adapter_org_default_fills_thin_profile(monkeypatch, tmp_path: Path):
+    """A thin profile with no local key can inherit the organization provider."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "thin"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  default: anthropic/claude-test\nfallback:\n  - openrouter/test\n",
+        encoding="utf-8",
+    )
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    store = CredentialStore(shared / "multitenancy.db")
+    expires_at = int(time.time() * 1000) + 3600_000
+    store.put_credential(
+        profile_name="__org__",
+        subject_id="anthropic",
+        provider="anthropic",
+        secret_kind="api_key",
+        payload={"api_key": "org-token"},
+        expires_at=expires_at,
+    )
+    store.put_credential(
+        profile_name="__global__",
+        subject_id="openrouter",
+        provider="openrouter",
+        secret_kind="api_key",
+        payload={"api_key": "fallback-openrouter-token"},
+        expires_at=expires_at,
+    )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+
+    assert env["ANTHROPIC_API_KEY"] == "org-token"
+    assert env["OPENROUTER_API_KEY"] == "fallback-openrouter-token"
+    sources = {item["provider"]: item["selected_source"] for item in plan["providers"]}
+    assert sources == {"anthropic": "org", "openrouter": "fallback"}
+
+
+def test_provider_adapter_ignores_feishu_credentials(monkeypatch, tmp_path: Path):
+    """Provider fallback must not turn Feishu app/UAT rows into model env secrets."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: feishu/not-a-model-provider\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    store = CredentialStore(shared / "multitenancy.db")
+    store.put_credential(
+        profile_name="__global__",
+        subject_id="feishu_app",
+        provider="feishu",
+        secret_kind="app",
+        payload={"app_id": "cli_test", "app_secret": "app-secret"},
+    )
+    store.put_credential(
+        profile_name="__org__",
+        subject_id="feishu",
+        provider="feishu",
+        secret_kind="uat",
+        payload={"access_token": "uat-token", "refresh_token": "refresh-token"},
+    )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+    raw_plan = json.dumps(plan, ensure_ascii=False)
+
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+    assert "FEISHU_UAT_REFRESH_TOKEN" not in env
+    assert "feishu" not in {item["provider"] for item in plan["providers"]}
+    assert "app-secret" not in raw_plan
+    assert "uat-token" not in raw_plan
+
+
+def test_credential_status_uses_provider_adapter_without_secrets(monkeypatch, tmp_path: Path):
+    """Model-visible provider status reports inherited state, not raw keys."""
+    from hermes_multitenancy.credential_tool import credential_status
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "thin"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: anthropic/claude-test\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    CredentialStore(shared / "multitenancy.db").put_credential(
+        profile_name="__org__",
+        subject_id="anthropic",
+        provider="anthropic",
+        secret_kind="api_key",
+        payload={"api_key": "org-token"},
+        scopes=["llm:chat"],
+        expires_at=int(time.time() * 1000) + 3600_000,
+    )
+
+    raw = credential_status({"provider": "anthropic", "credential_kind": "api_key"})
+    status = json.loads(raw)
+
+    assert status["status"] == "valid"
+    assert status["provider"] == "anthropic"
+    assert status["credential_kind"] == "api_key"
+    assert status["selected_source"] == "org"
+    assert status["source_profile"] == "__org__"
+    assert status["has_credential"] is True
+    assert "org-token" not in raw
+
+
+def test_build_subprocess_env_pivots_home_workspace_and_token_compat_env(tmp_path: Path):
+    """Token-oriented skills should work unchanged inside a profile.
+
+    Existing OpenClaw-style skills and internal CLIs typically discover token
+    state through HOME, /workspace, or KEP_PROFILE.  Multitenancy owns the
+    routing, so the subprocess env must transparently redirect those anchors
+    to the routed profile instead of requiring each skill to call
+    hermes_multitenancy.skill_storage.
+    """
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["XDG_CACHE_HOME"] == str(profile / "cache")
+    assert env["XDG_CONFIG_HOME"] == str(profile / "config")
+    assert env["XDG_STATE_HOME"] == str(profile / "state")
+    assert env["XDG_DATA_HOME"] == str(profile / "data")
+    assert env["TMPDIR"] == str(profile / "tmp")
+    assert env["HOME"] == str(profile / "home")
+    assert env["WORKSPACE"] == str(profile / "workspace")
+    assert env["KEP_PROFILE"] == "alice"
+    assert env["HERMES_PROFILE"] == "alice"
+
+    # XDG/TMPDIR pivot dirs must exist and be private (mode 0700).
+    for sub in ("home", "workspace", "cache", "config", "state", "data", "tmp"):
+        d = profile / sub
+        assert d.is_dir(), f"{sub} not created"
+        mode = d.stat().st_mode & 0o777
+        assert mode == 0o700, f"{sub} mode is {oct(mode)}, expected 0o700"
+
+    for agent_dir in (".claude", ".agents", ".codex", ".cursor", ".codeium"):
+        script = profile / "home" / agent_dir / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+        assert script.is_symlink()
+        assert script.resolve().name == "keep_login_get_bearer_token.py"
+    keep_login_marker = profile / "home" / ".keep-login" / "README-HERMES.txt"
+    assert keep_login_marker.exists()
+    assert not (profile / "home" / ".keep-login" / "token.enc").exists()
+    assert not (profile / "home" / ".keep-login" / "token-pre.enc").exists()
+
+
+def test_build_subprocess_env_forces_profile_boundary_into_tool_subprocesses(tmp_path: Path):
+    """terminal/execute_code apply a second env scrub, so profile anchors need force passthrough."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["_HERMES_FORCE_HOME"] == str(profile / "home")
+    assert env["_HERMES_FORCE_WORKSPACE"] == str(profile / "workspace")
+    assert env["_HERMES_FORCE_HERMES_HOME"] == str(profile)
+    assert env["_HERMES_FORCE_HERMES_SHARED_HOME"] == str(tmp_path)
+    assert env["_HERMES_FORCE_HERMES_PROFILE"] == "alice"
+    assert env["_HERMES_FORCE_KEP_PROFILE"] == "alice"
+    assert env["_HERMES_FORCE_TERMINAL_HOME_MODE"] == "profile"
+
+
+def test_keep_login_compat_wrapper_uses_profile_scoped_kep_auth(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    online_token = _jwt_with_exp(int(time.time()) + 3600)
+    pre_token = _jwt_with_exp(int(time.time()) + 7200)
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+env_name = args[args.index("--env") + 1]
+profile = args[args.index("--profile") + 1] if "--profile" in args else os.environ.get("KEP_PROFILE", "")
+command = args[-1]
+if command == "status":
+    if (profile == "dengwenhui" and env_name == "pre") or env_name == "missing":
+        print("state: not logged in")
+        sys.exit(77)
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    if (profile == "dengwenhui" and env_name == "pre") or env_name == "missing":
+        print("state: not logged in")
+        sys.exit(77)
+    if env_name == "expired":
+        print({expired_token!r})
+    elif env_name == "pre":
+        print({pre_token!r})
+    else:
+        print({online_token!r})
+    sys.exit(0)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    profile = shared / "profiles" / "sunke"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    script = profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+
+    online = subprocess.run(
+        [sys.executable, str(script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert online.returncode == 0
+    assert online.stdout.strip() == online_token
+    assert ".keep-login" not in online.stdout + online.stderr
+
+    pre_from_url = subprocess.run(
+        [sys.executable, str(script), "--url", "https://proxy.cms.pre.example.com/api/x"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert pre_from_url.returncode == 0
+    assert pre_from_url.stdout.strip() == pre_token
+
+    dengwenhui_profile = shared / "profiles" / "dengwenhui"
+    dengwenhui_env = agent_real._build_subprocess_env(dengwenhui_profile, approval_dir=approval_dir)
+    dengwenhui_env["PATH"] = f"{bin_dir}{os.pathsep}{dengwenhui_env['PATH']}"
+    missing_script = dengwenhui_profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+    dengwenhui_online = subprocess.run(
+        [sys.executable, str(missing_script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dengwenhui_env,
+        check=False,
+    )
+    assert dengwenhui_online.returncode == 0
+    assert dengwenhui_online.stdout.strip() == online_token
+
+    missing = subprocess.run(
+        [sys.executable, str(missing_script), "--env", "pre"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dengwenhui_env,
+        check=False,
+    )
+    assert missing.returncode == 77
+    assert "kep-auth --profile dengwenhui --env pre login" in missing.stderr
+    assert ".keep-login" not in missing.stdout + missing.stderr
+    assert "browser" not in (missing.stdout + missing.stderr).lower()
+
+
+def test_keep_login_compat_wrapper_fails_closed_without_profile(tmp_path: Path):
+    import hermes_multitenancy.compat.keep_login_get_bearer_token as wrapper
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    marker = tmp_path / "kep-auth-ran"
+    token = _jwt_with_exp(int(time.time()) + 3600)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+command = sys.argv[-1]
+if command == "status":
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    print({token!r})
+    sys.exit(0)
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("KEP_PROFILE", None)
+    env.pop("HERMES_PROFILE", None)
+    env.pop("HERMES_KEP_AUTH_BIN", None)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["HERMES_SHARED_HOME"] = str(shared)
+
+    result = subprocess.run(
+        [sys.executable, str(Path(wrapper.__file__)), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 77
+    assert "KEP_PROFILE/HERMES_PROFILE" in result.stderr
+    assert not marker.exists()
+    assert token not in result.stdout + result.stderr
+
+
+def test_keep_login_compat_wrapper_rejects_expired_jwt(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+import sys
+command = sys.argv[-1]
+if command == "status":
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    print({expired_token!r})
+    sys.exit(0)
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    profile = shared / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    script = profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 77
+    assert expired_token not in result.stdout + result.stderr
+
+
+def test_hermes_core_redacts_jwt_shaped_keep_tokens():
+    agent_repo = Path(os.environ.get("HERMES_AGENT_REPO", "")) if os.environ.get("HERMES_AGENT_REPO") else Path.home() / ".hermes" / "hermes-agent"
+    if agent_repo.exists() and str(agent_repo) not in sys.path:
+        sys.path.insert(0, str(agent_repo))
+    redact_mod = pytest.importorskip("agent.redact")
+    token = _jwt_with_exp(int(time.time()) + 3600)
+
+    redacted = redact_mod.redact_sensitive_text(f"token={token}", force=True)
+
+    assert token not in redacted
+    assert redacted.startswith("token=eyJ")
+    assert "..." in redacted
+
+
+def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
+    """HERMES_HOME / SHARED_HOME / approval_dir / event_stream flag plumbed correctly."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "bob"
+    approval_dir = tmp_path / "approval-bob"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    assert env["HERMES_HOME"] == str(profile)
+    assert env["HERMES_GATEWAY_SESSION"] == "1"
+    assert env["HERMES_EXEC_ASK"] == "1"
+    assert env["HERMES_MULTITENANCY_APPROVAL_DIR"] == str(approval_dir)
+    assert "HERMES_AIAGENT_EVENT_STREAM" not in env
+
+    stream_env = agent_real._build_subprocess_env(
+        profile, approval_dir=approval_dir, event_stream=True
+    )
+    assert stream_env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
+
+
+def test_build_subprocess_env_auto_approves_inside_sandbox_host(monkeypatch, tmp_path: Path):
+    """Sandboxed routed profiles should not pause on duplicate dangerous-command prompts."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import subprocess_env
+
+    profile = tmp_path / "profiles" / (
+        "feishu_group_8ec050fb3255_703fc51f7d272a1f"
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.setattr(subprocess_env, "sys", SimpleNamespace(platform="linux"))
+
+    env = agent_real._build_subprocess_env(
+        profile,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_SANDBOX_HOST": "0",
+            "TMPDIR": "/host/tmp",
+            "_HERMES_FORCE_TMPDIR": "/wrong-profile/tmp",
+        },
+    )
+
+    assert env["HERMES_SANDBOX_HOST"] == "1"
+    assert env["HERMES_YOLO_MODE"] == "1"
+    assert env["TMPDIR"] == "/tmp"
+    assert env["_HERMES_FORCE_TMPDIR"] == str(profile / "tmp")
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,socket,tempfile,uuid;"
+                "p=os.path.join(tempfile.gettempdir(),f'hermes_rpc_{uuid.uuid4().hex}.sock');"
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
+                "s.bind(p);"
+                "print(len(os.fsencode(p)));"
+                "s.close();"
+                "os.unlink(p)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert int(probe.stdout) < 108
+
+
+def test_build_subprocess_env_keeps_profile_tmp_when_profile_is_not_sandboxed(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import subprocess_env
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "bob")
+    monkeypatch.setattr(subprocess_env, "sys", SimpleNamespace(platform="linux"))
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["TMPDIR"] == str(profile / "tmp")
+    assert env["_HERMES_FORCE_TMPDIR"] == str(profile / "tmp")
+    assert "HERMES_SANDBOX_HOST" not in env
+
+
+def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path: Path):
+    """Shared Hermes-managed CLI installs must be callable while token state stays profile-local."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["PATH"].split(":")[0] == str(shared_home / "bin")
+    assert env["PATH"].endswith("/usr/bin:/bin")
+
+
+def test_build_subprocess_env_wires_lark_cli_sidecar_without_tokens(monkeypatch, tmp_path: Path):
+    """lark-cli gets only the sidecar key/proxy, never raw Feishu credentials."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_LARK_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("HERMES_LARK_CLI_PROXY_KEY", "short-lived-key")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "uat-secret")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+    assert env["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:16384"
+    assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived-key"
+    assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
+    assert env["LARKSUITE_CLI_BRAND"] == "feishu"
+    assert env["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+    assert env["LARKSUITE_CLI_STRICT_MODE"] == "off"
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+
+
+def test_build_subprocess_env_force_passes_lark_cli_sidecar_to_terminal(monkeypatch, tmp_path: Path):
+    """Terminal-run lark-cli must receive authsidecar env after Hermes' env scrub."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_LARK_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("HERMES_LARK_CLI_PROXY_KEY", "short-lived-key")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["_HERMES_FORCE_HERMES_LARK_CLI_BIN"] == str(lark_cli)
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:16384"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_PROXY_KEY"] == "short-lived-key"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_APP_ID"] == "cli_public"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_BRAND"] == "feishu"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_STRICT_MODE"] == "off"
+
+
+def test_build_subprocess_env_installs_kep_shims_only_for_existing_bins(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real, kep_cli_guard
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    for name in ("lark-cli-authsidecar", "hades-cli", "kep-auth", "kep-dune-cli"):
+        path = shared_bin / name
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim_dir = profile / "tmp" / "lark-cli-shim"
+
+    assert env["PATH"].split(os.pathsep)[0] == str(shim_dir)
+    assert env["PATH"].split(os.pathsep)[1] == str(shared_bin)
+    assert (shim_dir / "lark-cli").is_file()
+    assert (shim_dir / "hades-cli").is_file()
+    assert (shim_dir / "kep-auth").is_file()
+    assert (shim_dir / "kep-dune-cli").is_file()
+    assert not (shim_dir / "ocean-cli").exists()
+    assert "EXPECTED_PROFILE = 'alice'" in (shim_dir / "hades-cli").read_text(encoding="utf-8")
+
+    assert env["HERMES_LARK_CLI_REAL_BIN"] == str(shared_bin / "lark-cli-authsidecar")
+    assert env["HERMES_KEP_CLI_REAL_BIN_HADES_CLI"] == str(shared_bin / "hades-cli")
+    assert env["HERMES_KEP_CLI_REAL_BIN_KEP_AUTH"] == str(shared_bin / "kep-auth")
+    assert env["HERMES_KEP_CLI_REAL_BIN_KEP_DUNE_CLI"] == str(shared_bin / "kep-dune-cli")
+
+    allowlist = agent_real._SUBPROCESS_ENV_ALLOWLIST
+    assert "HERMES_KEP_CLI_REAL_BIN_HADES_CLI" in allowlist
+    assert "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH" in allowlist
+    assert set(kep_cli_guard.kep_cli_real_bin_env_keys()).issubset(allowlist)
+
+
+def test_build_subprocess_env_meegle_guard_never_resolves_real_binary_from_inherited_shim_path(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "real-meegle-ran"
+    for name in ("lark-cli-authsidecar", "meegle"):
+        path = shared_bin / name
+        path.write_text(
+            f"#!/bin/sh\ntouch {marker}\n" if name == "meegle" else "#!/bin/sh\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    first = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    monkeypatch.setenv("PATH", first["PATH"])
+    second = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+
+    allowed = subprocess.run([str(shim), "auth", "status"], env=second, check=False)
+    assert allowed.returncode == 0
+    assert marker.exists()
+    assert str(shared_bin / "meegle") in shim.read_text(encoding="utf-8")
+    assert f"real_binary = {str(shim)!r}" not in shim.read_text(encoding="utf-8")
+
+
+def test_build_subprocess_env_guards_meegle_resolved_from_actual_connector_path(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "real-meegle-ran"
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    actual_bin = tmp_path / "local-bin"
+    actual_bin.mkdir()
+    meegle = actual_bin / "meegle"
+    meegle.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    meegle.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{actual_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+
+    denied = subprocess.run([env["HERMES_MEEGLE_BIN"], "auth", "login"], env=env, check=False)
+    assert shim.is_file()
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert not marker.exists()
+
+    allowed = subprocess.run([env["HERMES_MEEGLE_BIN"], "auth", "status"], env=env, check=False)
+    assert allowed.returncode == 0
+    assert marker.exists()
+
+
+def test_build_subprocess_env_blocks_meegle_npx_oauth_without_blocking_other_npx(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    marker = tmp_path / "real-npx-ran"
+    node_bin = tmp_path / "node-bin"
+    node_bin.mkdir()
+    npx = node_bin / "npx"
+    npx.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    npx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{node_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim_dir = profile / "tmp" / "lark-cli-shim"
+
+    for npx_argv in (
+        ["-y", "@lark-project/meegle@1.0.19", "auth", "login"],
+        ["-y", "@lark-project/meegle@1.0.19", "-p", "login"],
+        ["-y", "@lark-project/meegle@1.0.19", "--env", "oauth"],
+        ["--package=@lark-project/meegle@1.0.19", "-c", "meegle auth"],
+        ["--package", "@lark-project/meegle@1.0.19", "-c", "meegle login"],
+        ["-p", "@lark-project/meegle@1.0.19", "-c", "meegle login"],
+    ):
+        denied = subprocess.run([str(shim_dir / "npx"), *npx_argv], env=env, check=False)
+        assert denied.returncode == 77
+        assert not marker.exists()
+
+    allowed = subprocess.run(
+        [str(shim_dir / "npx"), "-y", "unrelated-package", "--version"],
+        env=env,
+        check=False,
+    )
+    assert allowed.returncode == 0
+    assert marker.exists()
+
+
+def test_build_subprocess_env_rewrites_explicit_meegle_path_to_guard(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "explicit-meegle-ran"
+    explicit = tmp_path / "explicit-meegle"
+    explicit.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    explicit.chmod(0o755)
+    (profile / ".env").write_text(f"HERMES_MEEGLE_BIN={explicit}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+    denied = subprocess.run([env["HERMES_MEEGLE_BIN"], "login"], env=env, check=False)
+
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert not marker.exists()
+
+
+def test_build_subprocess_env_installs_deny_only_meegle_guard_when_cli_missing(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credential_hub.readers import feishu_project
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(feishu_project.shutil, "which", lambda *_args, **_kwargs: None)
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+    denied = subprocess.run([str(shim), "auth", "login"], env=env, check=False)
+    unavailable = subprocess.run([str(shim), "auth", "status"], env=env, check=False)
+
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert unavailable.returncode == 75
+
+
+def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch, tmp_path: Path):
+    """Each AIAgent run gets a short-lived sidecar key and localhost broker."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "uat-secret")
+    seen: dict[str, object] = {}
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            seen["closed"] = True
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert context.profile_name == "alice"
+        assert context.user_open_id == "ou_alice"
+        assert context.hmac_key
+        assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+        assert extra["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
+        assert extra["LARKSUITE_CLI_PROXY_KEY"] == context.hmac_key
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_public"
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+        assert extra["LARKSUITE_CLI_STRICT_MODE"] == "off"
+        assert context.allowed_identities == frozenset({"user", "bot"})
+        assert "FEISHU_APP_SECRET" not in extra
+        assert "FEISHU_UAT_ACCESS_TOKEN" not in extra
+
+    assert seen["closed"] is True
+
+
+def test_lark_cli_auth_broker_scope_defaults_to_user_when_profile_has_uat(monkeypatch, tmp_path: Path):
+    """Auto identity uses user only when the routed profile has a live sender UAT."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        # default identity stays user, but bot is always PERMITTED — the broker's
+        # per-send policy (live routing re-check) is the authoritative gate now.
+        assert seen["context"].allowed_identities == frozenset({"user", "bot"})
+
+
+def test_lark_cli_auth_broker_scope_passes_owner_mapped_bot_chat_allowlist(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Personal profiles can use bot identity only for routing-owned group chats."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_group(chat_id="oc_allowed", profile_name="feishu_group_allowed", owner_open_id="ou_alice")
+    table.upsert_group(chat_id="oc_other", profile_name="feishu_group_other", owner_open_id="ou_someone_else")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        assert extra["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+        assert context.allowed_identities == frozenset({"user", "bot"})
+        assert context.allowed_bot_chat_ids == frozenset({"oc_allowed"})
+
+
+def test_lark_cli_auth_broker_scope_uses_webui_agent_owner_for_bot_chat_allowlist(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """WebUI-owned agents should inherit the owner's mapped bot group sends."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "test-group"
+    profile.mkdir(parents=True)
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_owned_agent(
+        agent_id="webui:ou_owner:test-group",
+        profile_name="test-group",
+        owner_open_id="ou_owner",
+        display_label="test-group",
+    )
+    table.upsert_group(chat_id="oc_allowed", profile_name="feishu_group_allowed", owner_open_id="ou_owner")
+    table.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="test-group",
+            user_key="webui:ou_owner:test-group",
+            content="发群聊 P1 测试",
+            session_id="webui-agent-bot-identity",
+        )
+    )
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        context = seen["context"]
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_owner"
+        assert env["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+        assert context.allowed_bot_chat_ids == frozenset({"oc_allowed"})
+
+
+def test_owner_mapped_bot_chat_ids_closes_routing_table(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import routing
+
+    closed_paths = []
+
+    class Row:
+        chat_id = "oc_allowed"
+
+    class FakeRoutingTable:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def list_by_owner(self, owner_open_id, *, kind=None):
+            assert owner_open_id == "ou_alice"
+            assert kind == routing.KIND_GROUP
+            return [Row()]
+
+        def close(self):
+            closed_paths.append(self.db_path)
+
+    monkeypatch.setattr(agent_real, "_resolve_shared_hermes_home", lambda _profile: tmp_path)
+    monkeypatch.setattr(routing, "RoutingTable", FakeRoutingTable)
+
+    assert agent_real._owner_mapped_bot_chat_ids(tmp_path / "profiles" / "alice", "ou_alice") == frozenset(
+        {"oc_allowed"}
+    )
+    assert closed_paths == [tmp_path / "multitenancy.db"]
+
+
+def test_lark_cli_auth_broker_scope_does_not_broaden_bot_identity_without_owner_groups(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_group(chat_id="oc_other", profile_name="feishu_group_other", owner_open_id="ou_someone_else")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        assert "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS" not in extra
+        # bot identity is always permitted now; ou_alice owning no groups means the
+        # allow-set is empty, so a bot send to oc_other (owned by someone else) is
+        # denied by the broker's per-send policy — not by restricting identities here.
+        assert context.allowed_identities == frozenset({"user", "bot"})
+        assert context.allowed_bot_chat_ids == frozenset()
+
+
+def test_lark_cli_auth_broker_scope_forces_bot_for_group_profile(monkeypatch, tmp_path: Path):
+    """Group profiles must not default to a member's user identity."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+        assert seen["context"].profile_kind == "group"
+        assert seen["context"].current_chat_id == ""
+
+
+def test_lark_cli_auth_broker_scope_starts_for_group_without_sender(monkeypatch, tmp_path: Path):
+    """Bot-only group profiles must not require a member UAT/open_id to expose lark_cli."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    profile.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_group_abc"}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    seen: dict[str, object] = {}
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            seen["closed"] = True
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "") as extra:
+        context = seen["context"]
+        assert context.profile_name == "feishu_group_abc"
+        assert context.user_open_id == ""
+        assert context.profile_kind == "group"
+        assert context.current_chat_id == "oc_group_abc"
+        assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+
+    assert seen["closed"] is True
+
+
+def test_lark_cli_shared_env_loads_only_broker_control_plane(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_home.mkdir()
+    (shared_home / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_MULTITENANCY_CREDENTIAL_KEY=vault-key",
+                "HERMES_LARK_CLI_APP_ID=cli_public",
+                "FEISHU_APP_SECRET=must-not-load",
+                "ANTHROPIC_API_KEY=model-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    profile.mkdir(parents=True)
+    for key in (
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+        "HERMES_LARK_CLI_APP_ID",
+        "FEISHU_APP_SECRET",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    loaded = agent_real._load_lark_cli_shared_env(profile)
+
+    assert loaded == {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY": "vault-key",
+        "HERMES_LARK_CLI_APP_ID": "cli_public",
+    }
+    assert os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "vault-key"
+    assert os.environ["HERMES_LARK_CLI_APP_ID"] == "cli_public"
+    assert "FEISHU_APP_SECRET" not in os.environ
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_lark_cli_app_id_can_come_from_shared_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_home.mkdir()
+    (shared_home / ".env").write_text("HERMES_LARK_CLI_APP_ID=cli_from_env\n", encoding="utf-8")
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    profile.mkdir(parents=True)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+
+    assert agent_real._resolve_lark_cli_app_id(profile) == "cli_from_env"
+
+
+def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_vault(monkeypatch, tmp_path: Path):
+    """Production should not need to duplicate app_id in process env."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+    store = CredentialStore(shared_home / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_from_vault", "app_secret": "secret"},
+        )
+    finally:
+        store.close()
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_vault"
+
+
+def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_profile_uat(monkeypatch, tmp_path: Path):
+    """A local UAT file is enough to start sidecar plumbing when vault key is absent."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_alice.json").write_text(
+        json.dumps({"app_id": "cli_from_json", "access_token": "secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_json"
+
+
+def test_feishu_identity_context_log_distinguishes_legacy_uat_and_lark_cli_identity(
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    profile.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="hermes_multitenancy.agent_real"):
+        agent_real._log_feishu_identity_context(
+            profile_home=profile,
+            shared_home=shared_home,
+            sender_open_id="ou_sender",
+        )
+
+    assert "using shared Feishu UAT dir" not in caplog.text
+    assert "legacy Feishu UAT compatibility dir" in caplog.text
+    assert f"profile_uat_dir={profile / 'feishu_uat'}" in caplog.text
+    assert "lark_cli_default_identity=bot" in caplog.text
+
+
+def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatch, tmp_path: Path):
+    """The actual spawn path should get per-run broker env overrides."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    selected = profile / "workspace" / "project-a"
+    selected.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _event()
+    event.raw_event = {"workspace": "project-a"}
+    seen: dict[str, object] = {}
+
+    @contextmanager
+    def fake_scope(profile_home, sender_open_id):
+        seen["profile_home"] = profile_home
+        seen["sender_open_id"] = sender_open_id
+        yield {
+            "HERMES_LARK_CLI_BIN": "/tmp/lark-cli-authsidecar",
+            "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:19090",
+            "LARKSUITE_CLI_PROXY_KEY": "short-lived",
+            "LARKSUITE_CLI_APP_ID": "cli_public",
+        }
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+        event_stream=True,
+    ) as env:
+        assert seen["profile_home"] == profile
+        assert seen["sender_open_id"] == "ou_test"
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_test"
+        assert env["WORKSPACE"] == str(profile / "workspace")
+        assert env["TERMINAL_CWD"] == str(selected)
+        assert env["_HERMES_FORCE_TERMINAL_CWD"] == str(selected)
+        assert env["HERMES_LARK_CLI_BIN"] == "/tmp/lark-cli-authsidecar"
+        assert env["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
+        assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived"
+        assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
+        assert env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
+
+
+def test_aiagent_subprocess_env_scope_exposes_ingest_secret_dir_without_values(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    secret_dir = tmp_path / "profiles" / "alice" / "tmp" / "ingest-secrets" / "run1"
+    approval_dir.mkdir(parents=True)
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text("full-secret-token", encoding="utf-8")
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": [
+                {
+                    "name": "cms_bearer",
+                    "type": "bearer_token",
+                    "usage": "Authorization Bearer",
+                }
+            ],
+        }
+    }
+
+    @contextmanager
+    def fake_scope(_profile_home, _sender_open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-env-must-not-leak")
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert env["HERMES_INGEST_SECRET_DIR"] == str(secret_dir)
+        manifest = json.loads(env["HERMES_INGEST_SECRET_MANIFEST"])
+        assert manifest == [
+            {
+                "name": "cms_bearer",
+                "type": "bearer_token",
+                "usage": "Authorization Bearer",
+            }
+        ]
+        from tools.code_execution_env import _scrub_child_env
+        import tools
+
+        registered_passthrough: set[str] = set()
+        fake_env_passthrough_mod = SimpleNamespace(
+            _config_passthrough=frozenset(),
+            register_env_passthrough=lambda names: registered_passthrough.update(names),
+            is_env_passthrough=lambda name: name in registered_passthrough,
+            resolve_passthrough_value=lambda name, fallback: fallback,
+            scoped_passthrough_additions=lambda present: {},
+        )
+        monkeypatch.setattr(tools, "env_passthrough", fake_env_passthrough_mod, raising=False)
+        monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough_mod)
+
+        agent_real._install_ingest_secret_env_passthrough(env)
+        allowed = registered_passthrough | set(fake_env_passthrough_mod._config_passthrough)
+        execute_code_env = _scrub_child_env(env, is_passthrough=lambda name: name in allowed)
+        assert execute_code_env["HERMES_INGEST_SECRET_DIR"] == str(secret_dir)
+        assert json.loads(execute_code_env["HERMES_INGEST_SECRET_MANIFEST"]) == manifest
+        assert "full-secret-token" not in json.dumps(env)
+        assert "full-secret-token" not in json.dumps(execute_code_env)
+        assert "OPENAI_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in execute_code_env
+
+
+def test_aiagent_subprocess_env_scope_prefers_raw_feishu_open_id_for_broker(monkeypatch, tmp_path: Path):
+    """Feishu route ids like g41a5b5g must not be used as UAT broker subjects."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _event()
+    event.source.user_id = "g41a5b5g"
+    event.sender_open_id = "g41a5b5g"
+    event.raw_message = {
+        "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": "ou_real_sender",
+                },
+            },
+        },
+    }
+    seen: dict[str, object] = {}
+
+    @contextmanager
+    def fake_scope(profile_home, sender_open_id):
+        seen["sender_open_id"] = sender_open_id
+        yield {
+            "HERMES_LARK_CLI_BIN": "/tmp/lark-cli-authsidecar",
+            "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:19090",
+            "LARKSUITE_CLI_PROXY_KEY": "short-lived",
+            "LARKSUITE_CLI_APP_ID": "cli_public",
+            "LARKSUITE_CLI_DEFAULT_AS": "user",
+        }
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert seen["sender_open_id"] == "ou_real_sender"
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_real_sender"
+        assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+
+
+def test_aiagent_subprocess_env_scope_uses_webui_owner_uat_for_lark_cli_default(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """WebUI Run Broker runs must select user identity when the owner has UAT."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "owner"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_owner.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="owner",
+            user_key="ou_owner",
+            content="创建一个飞书云文档",
+            session_id="webui-lark-cli-identity",
+        )
+    )
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_owner"
+        assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+
+
+def test_lark_cli_default_identity_refreshes_expired_but_refreshable_uat(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Expired access_token with live refresh_token must still select user identity."""
+    from hermes_multitenancy import agent_real, feishu_uat_auth
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "songtingting"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    open_id = "ou_songtingting"
+    uat_path = uat_dir / f"{open_id}.json"
+    now_ms = int(time.time() * 1000)
+    uat_path.write_text(
+        json.dumps(
+            {
+                "app_id": "cli_public",
+                "user_open_id": open_id,
+                "access_token": "expired-access",
+                "refresh_token": "live-refresh",
+                "expires_at": now_ms - 60_000,
+                "refresh_expires_at": now_ms + 7 * 24 * 3600_000,
+                "scope": "im:message offline_access",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refresh_calls: list[dict[str, object]] = []
+
+    def fake_refresh(**kwargs):
+        refresh_calls.append(kwargs)
+        refreshed = json.loads(uat_path.read_text(encoding="utf-8"))
+        refreshed["access_token"] = "fresh-access"
+        refreshed["expires_at"] = int(time.time() * 1000) + 3600_000
+        uat_path.write_text(json.dumps(refreshed), encoding="utf-8")
+        return refreshed
+
+    monkeypatch.setattr(feishu_uat_auth, "refresh_uat_if_needed", fake_refresh)
+
+    assert agent_real._lark_cli_default_identity(profile, open_id) == "user"
+    assert refresh_calls == [
+        {
+            "profile_name": "songtingting",
+            "open_id": open_id,
+            "shared_home": shared_home,
+            "headroom_seconds": 300,
+        }
+    ]
+
+
+def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
+    """`extra` parameter wins over defaults so callers can override per-spawn."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "carol"
+    approval_dir = tmp_path / "approval-carol"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(
+        profile,
+        approval_dir=approval_dir,
+        extra={"HERMES_MAX_ITERATIONS": "5", "CUSTOM_KEY": "hello"},
+    )
+    assert env["HERMES_MAX_ITERATIONS"] == "5"
+    assert env["CUSTOM_KEY"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_passes_sanitized_env_to_child(
+    monkeypatch, tmp_path: Path
+):
+    """End-to-end: spawned child receives the sanitized env, not parent's full env."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-leak")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self, _payload):
+            return b'{"result": "ok", "error": null}', b""
+
+    async def fake_create_subprocess_exec(*_args, env=None, **_kwargs):
+        captured["env"] = dict(env or {})
+        captured["cwd"] = _kwargs.get("cwd")
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    profile = tmp_path / "profiles" / "isolated"
+    assert await agent_real._run_aiagent_subprocess(_event(), profile) == "ok"
+
+    child_env = captured["env"]
+    assert "OPENAI_API_KEY" not in child_env, "parent secret leaked to child"
+    assert child_env["HOME"] == str(profile / "home")
+    assert child_env["WORKSPACE"] == str(profile / "workspace")
+    assert child_env["KEP_PROFILE"] == "isolated"
+    assert child_env["HERMES_PROFILE"] == "isolated"
+    assert child_env["TMPDIR"] == str(profile / "tmp")
+    assert child_env["HERMES_HOME"] == str(profile)
+    assert captured["cwd"] == str(profile / "workspace")
+
+
+# ---------------------------------------------------------------------------
+# 档 B — sandbox-exec wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_with_sandbox_is_noop_when_disabled(monkeypatch, tmp_path: Path):
+    """Default behaviour: HERMES_USE_SANDBOX unset returns cmd unchanged."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd, "sandbox wrap must be a no-op when disabled"
+
+
+def test_aiagent_subprocess_cwd_uses_profile_workspace(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "isolated"
+    cwd = agent_real._aiagent_subprocess_cwd(profile)
+    assert cwd == str(profile / "workspace")
+    assert (profile / "workspace").is_dir()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec backend")
+def test_wrap_with_sandbox_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):
+    """HERMES_SANDBOX_PROFILES allowlist scopes sandboxing to listed profiles only."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "p.sb"
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "sandbox-exec"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test, researcher")
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    cmd = ["/usr/bin/python3", "child.py"]
+
+    # Listed profile → wrapped.
+    spike = tmp_path / "profiles" / "spike_test"
+    spike.mkdir(parents=True)
+    wrapped_spike = agent_real._wrap_with_sandbox(cmd, spike)
+    assert wrapped_spike[0] == str(fake_bin), "spike_test must be sandboxed"
+
+    # Unlisted profile → bypass.
+    prod = tmp_path / "profiles" / "feishu_g41a5b5g"
+    prod.mkdir(parents=True)
+    wrapped_prod = agent_real._wrap_with_sandbox(cmd, prod)
+    assert wrapped_prod == cmd, "unlisted profile must NOT be sandboxed during pilot"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec backend")
+def test_wrap_with_sandbox_empty_allowlist_means_all(monkeypatch, tmp_path: Path):
+    """HERMES_SANDBOX_PROFILES unset (or empty) → all profiles get sandboxed."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "p.sb"
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "sandbox-exec"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "anybody"
+    profile.mkdir(parents=True)
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+    assert wrapped[0] == str(fake_bin), "no allowlist → everyone is sandboxed"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only fallback semantics; Linux fails closed (raises)")
+def test_wrap_with_sandbox_falls_back_when_policy_missing(monkeypatch, tmp_path: Path):
+    """HERMES_USE_SANDBOX=1 but policy file missing → unsandboxed with warning."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", tmp_path / "nonexistent.sb")
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd, (
+        "Missing policy must fall back to unsandboxed exec (loud warning), "
+        "not silently crash or block the gateway."
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only fallback semantics; Linux fails closed (raises)")
+def test_wrap_with_sandbox_falls_back_when_binary_missing(monkeypatch, tmp_path: Path):
+    """If /usr/bin/sandbox-exec is not executable (non-mac), no-op + warning."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(tmp_path / "fake-sandbox-exec"))
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec argv shape")
+def test_wrap_with_sandbox_builds_full_invocation(monkeypatch, tmp_path: Path):
+    """HERMES_USE_SANDBOX=1 + policy present + binary present → full wrap."""
+    import os as _os
+    import pwd
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "sandbox" / "profile-default.sb"
+    fake_policy.parent.mkdir()
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "bin" / "sandbox-exec"
+    fake_bin.parent.mkdir()
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+
+    assert wrapped[0] == str(fake_bin)
+    assert wrapped[1] == "-f"
+    assert wrapped[2] == str(fake_policy)
+
+    # All required -D params must be present.
+    params = {}
+    i = 3
+    while i < len(wrapped) - len(cmd):
+        if wrapped[i] == "-D":
+            key, _, value = wrapped[i + 1].partition("=")
+            params[key] = value
+            i += 2
+        else:
+            break
+    for required in ("PROFILE_HOME", "SHARED_HOME", "USER_HOME",
+                     "HERMES_VENV", "HERMES_AGENT_REPO", "HERMES_MT_REPO",
+                     "CODEX_BIN", "CODEX_CODE_MODE_HOST", "HARNESS_PROFILE_ENV",
+                     "HARNESS_PROFILE_USER_HOME", "HARNESS_SHARED_AUTH",
+                     "HARNESS_USER_LARK"):
+        assert required in params, f"-D {required}=... missing from sandbox-exec args"
+    assert params["USER_HOME"] == pwd.getpwuid(_os.getuid()).pw_dir
+
+    # Original cmd is appended verbatim at the end.
+    assert wrapped[-len(cmd):] == cmd
+
+
+def test_sandbox_policy_file_is_valid_syntax():
+    """Smoke test: the shipped profile-default.sb parses successfully."""
+    import subprocess
+    from pathlib import Path as _P
+
+    if not _P("/usr/bin/sandbox-exec").is_file():
+        import pytest as _pytest
+        _pytest.skip("sandbox-exec only available on macOS")
+
+    from hermes_multitenancy import agent_real
+    policy = agent_real._SANDBOX_POLICY_FILE
+    assert policy.is_file(), f"policy {policy} not bundled with plugin"
+
+    result = subprocess.run(
+        [
+            "/usr/bin/sandbox-exec",
+            "-f", str(policy),
+            "-D", "PROFILE_HOME=/tmp/probe-profile",
+            "-D", "SHARED_HOME=/tmp/probe-shared",
+            "-D", "USER_HOME=/tmp/probe-user",
+            "-D", "HERMES_VENV=/tmp/probe-venv",
+            "-D", "HERMES_AGENT_INSTALL=/tmp/probe-install",
+                "-D", "HERMES_AGENT_REPO=/tmp/probe-agent",
+                "-D", "HERMES_MT_REPO=/tmp/probe-mt",
+                "-D", "CODEX_BIN=/usr/bin/false",
+                "-D", "CODEX_CODE_MODE_HOST=/usr/bin/false",
+                "-D", "HARNESS_PROFILE_ENV=/tmp/no-secret/.env",
+                "-D", "HARNESS_PROFILE_AUTH=/tmp/no-secret/auth.json",
+                "-D", "HARNESS_PROFILE_UAT=/tmp/no-secret/uat",
+                "-D", "HARNESS_PROFILE_TOKENS=/tmp/no-secret/tokens",
+                "-D", "HARNESS_PROFILE_CREDENTIALS=/tmp/no-secret/credentials",
+                "-D", "HARNESS_PROFILE_USER_HOME=/tmp/no-secret/home",
+                "-D", "HARNESS_SHARED_ENV=/tmp/no-secret/shared-env",
+                "-D", "HARNESS_SHARED_AUTH=/tmp/no-secret/shared-auth",
+                "-D", "HARNESS_SHARED_UAT=/tmp/no-secret/shared-uat",
+                "-D", "HARNESS_USER_KEP=/tmp/no-secret/kep",
+                "-D", "HARNESS_USER_LARK=/tmp/no-secret/lark",
+                "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (
+        f"sandbox-exec rejected policy {policy}:\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec behavior")
+def test_macos_sandbox_can_resolve_profile_ancestor_without_listing_home(monkeypatch, request):
+    """A production-shaped profile is reachable without exposing its peers or home."""
+    import subprocess
+    import tempfile
+    from pathlib import Path as _P
+
+    from hermes_multitenancy import agent_real
+
+    import pwd
+    user_home = _P(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    shared_fixture = tempfile.TemporaryDirectory(prefix=".hermes-sandbox-fixture-", dir=user_home)
+    request.addfinalizer(shared_fixture.cleanup)
+    shared_home = _P(shared_fixture.name)
+    profiles_home = shared_home / "profiles"
+    profiles_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    with (
+        tempfile.TemporaryDirectory(prefix="sandbox-owner-", dir=profiles_home) as owner,
+        tempfile.TemporaryDirectory(prefix="sandbox-peer-", dir=profiles_home) as peer,
+        tempfile.NamedTemporaryFile(prefix=".sandbox-host-", dir=user_home) as host_file,
+    ):
+        profile = _P(owner)
+        peer_secret = _P(peer) / "secret.txt"
+        peer_secret.write_text("peer", encoding="utf-8")
+
+        def run(command):
+            return subprocess.run(
+                agent_real._wrap_with_sandbox(command, profile),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        resolve = run([
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).resolve(strict=True)",
+            str(profile),
+        ])
+        assert resolve.returncode == 0, resolve.stderr
+
+        denied = (
+            run([sys.executable, "-c", "import os; os.listdir('/Users')"]),
+            run([sys.executable, "-c", "import os,sys; os.listdir(sys.argv[1])", str(user_home)]),
+            run([
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).stat()",
+                host_file.name,
+            ]),
+            run([
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).read_text()",
+                str(peer_secret),
+            ]),
+        )
+        assert all(result.returncode != 0 for result in denied)
+        assert all("Operation not permitted" in result.stderr for result in denied)
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec policy")
+def test_local_harness_sandbox_masks_profile_credentials(monkeypatch, tmp_path: Path):
+    import subprocess
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / ".hermes" / "profiles" / "alice"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / ".env").write_text("secret", encoding="utf-8")
+    ambient_keep = profile / "home" / ".keep"
+    ambient_keep.mkdir(parents=True)
+    (ambient_keep / ".calorie.env").write_text("ambient-secret", encoding="utf-8")
+    visible = workspace / "visible.txt"
+    visible.write_text("visible", encoding="utf-8")
+    workflow_home = workspace / "runs" / "workflow-1" / "home"
+    workflow_home.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+
+    denied = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(profile / ".env")], profile, local_harness=True
+        ),
+        capture_output=True,
+        text=True,
+    )
+    ambient_denied = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(ambient_keep / ".calorie.env")],
+            profile,
+            local_harness=True,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    allowed = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(visible)], profile, local_harness=True
+        ),
+        capture_output=True,
+        text=True,
+    )
+    private_home = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            [
+                sys.executable,
+                "-c",
+                "import os; from pathlib import Path; "
+                "assert os.environ['HOME'] == os.environ['_HERMES_FORCE_HOME']; "
+                "p = Path('~/.config/x').expanduser(); p.parent.mkdir(parents=True); "
+                "p.write_text('private-home'); print(p.read_text())",
+            ],
+            profile,
+            local_harness=True,
+        ),
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(workflow_home),
+            "_HERMES_FORCE_HOME": str(workflow_home),
+        },
+    )
+
+    assert denied.returncode != 0
+    assert "secret" not in denied.stdout
+    assert ambient_denied.returncode != 0
+    assert "ambient-secret" not in ambient_denied.stdout
+    assert allowed.returncode == 0
+    assert allowed.stdout == "visible"
+    assert private_home.returncode == 0, private_home.stderr
+    assert private_home.stdout.strip() == "private-home"
+
+
+def test_sandbox_policy_only_allows_signalling_children():
+    from hermes_multitenancy import agent_real
+
+    policy = agent_real._SANDBOX_POLICY_FILE.read_text(encoding="utf-8")
+
+    assert "(allow signal (target children))" in policy
+    assert "(allow signal)" not in policy.replace("(allow signal (target children))", "")
+
+
+def test_macos_sandbox_policy_allows_native_browser_paths_without_personal_chrome():
+    from hermes_multitenancy import agent_real
+
+    policy = agent_real._SANDBOX_POLICY_FILE.read_text(encoding="utf-8")
+
+    assert '(string-append (param "HERMES_AGENT_REPO") "/node_modules/agent-browser")' in policy
+    assert '(string-append (param "PROFILE_HOME") "/browser")' in policy
+    assert '(string-append (param "SHARED_HOME") "/browser-browsers")' in policy
+    assert "Application Support/Google/Chrome" not in policy
+
+
+# ---------------------------------------------------------------------------
+# 档 B — Linux bwrap backend (cross-platform — runs on macOS via platform mock)
+# ---------------------------------------------------------------------------
+
+
+def test_render_bwrap_args_strips_comments_and_substitutes(tmp_path: Path):
+    """_render_bwrap_args splits whitespace, drops comments, substitutes ${KEY}."""
+    from hermes_multitenancy import agent_real
+
+    text = (
+        "# leading comment\n"
+        "\n"
+        "--ro-bind /usr /usr   # inline comment\n"
+        "--bind ${PROFILE_HOME} ${PROFILE_HOME}\n"
+        "  --chdir ${PROFILE_HOME}  \n"
+    )
+    tokens = agent_real._render_bwrap_args(text, {"PROFILE_HOME": "/p"})
+    assert tokens == [
+        "--ro-bind", "/usr", "/usr",
+        "--bind", "/p", "/p",
+        "--chdir", "/p",
+    ]
+
+
+def test_wrap_linux_bwrap_raises_when_policy_missing(monkeypatch, tmp_path: Path):
+    """Linux backend is fail-closed: missing policy raises (no silent fallback)."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", tmp_path / "nonexistent.args")
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="bwrap policy.*is missing"):
+        agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+
+def test_wrap_linux_bwrap_raises_when_binary_missing(monkeypatch, tmp_path: Path):
+    """Linux backend is fail-closed: missing bwrap binary raises."""
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--die-with-parent\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(tmp_path / "no-such-bwrap"))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="bwrap is not.*executable"):
+        agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+
+def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
+    """Linux backend assembles bwrap + args + -- + cmd in that order."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text(
+        "--die-with-parent\n"
+        "--ro-bind /usr /usr\n"
+        "--bind ${PROFILE_HOME} ${PROFILE_HOME}\n"
+        "--chdir ${PROFILE_HOME}\n"
+    )
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    base_python = tmp_path / "base" / "bin" / "python3"
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("#!/bin/sh\n")
+    real_venv = tmp_path / "venvs" / "v019"
+    (real_venv / "bin").mkdir(parents=True)
+    (real_venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (real_venv / "bin" / "python").symlink_to(base_python)
+    linked_venv = tmp_path / "agent-install" / "venv"
+    linked_venv.parent.mkdir()
+    linked_venv.symlink_to(real_venv, target_is_directory=True)
+    cmd = [str(linked_venv / "bin" / "python"), "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, profile, local_harness=True)
+
+    assert wrapped[0] == str(fake_bin)
+    # PROFILE_HOME substitution happened.
+    profile_resolved = str(profile.resolve())
+    assert profile_resolved in wrapped
+    # -- separator before user cmd.
+    assert "--" in wrapped
+    sep_idx = wrapped.index("--")
+    resolved_launcher = str(real_venv.resolve() / "bin" / "python")
+    assert wrapped[sep_idx + 1:] == [resolved_launcher, "child.py"]
+    assert resolved_launcher != str(base_python.resolve())
+    runtime_root = str(base_python.parent.parent.resolve())
+    assert any(
+        wrapped[index:index + 3] == ["--ro-bind", runtime_root, runtime_root]
+        for index in range(len(wrapped) - 2)
+    )
+    assert any(
+        wrapped[index:index + 2] == ["--tmpfs", str(profile.resolve() / "home")]
+        for index in range(len(wrapped) - 1)
+    )
+
+
+def test_interpreter_runtime_bwrap_args_covered_root_adds_nothing(tmp_path: Path):
+    """Launcher resolving inside an already-mounted root must not add a bind."""
+    from hermes_multitenancy import agent_real
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    launcher = venv / "bin" / "python"
+    launcher.write_text("#!/bin/sh\n")
+
+    assert agent_real._interpreter_runtime_bwrap_args(str(launcher), [venv], []) == []
+
+
+def test_interpreter_runtime_bwrap_args_missing_launcher_adds_nothing(tmp_path: Path):
+    """Dangling/missing launcher must not raise nor add binds."""
+    from hermes_multitenancy import agent_real
+
+    missing = tmp_path / "venv" / "bin" / "python"
+    assert agent_real._interpreter_runtime_bwrap_args(str(missing), [], []) == []
+
+
+def test_interpreter_runtime_bwrap_args_refuses_wide_roots(tmp_path: Path):
+    """runtime-root-trust-boundary: a shallow launcher must never mount a root
+    that contains user home / shared home / profile home (tenant isolation)."""
+    from hermes_multitenancy import agent_real
+
+    user_home = tmp_path / "home" / "hermes"
+    shared_home = user_home / ".hermes"
+    profile_home = shared_home / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    # Launcher directly under $HOME/bin → derived runtime root would be $HOME.
+    (user_home / "bin").mkdir(parents=True)
+    shallow = user_home / "bin" / "python"
+    shallow.write_text("#!/bin/sh\n")
+
+    forbidden = [user_home, shared_home, profile_home]
+    assert agent_real._interpreter_runtime_bwrap_args(str(shallow), [], forbidden) == []
+
+    # Even shallower: runtime root would be an ancestor of $HOME.
+    (tmp_path / "home" / "bin").mkdir(parents=True)
+    shallower = tmp_path / "home" / "bin" / "python"
+    shallower.write_text("#!/bin/sh\n")
+    assert agent_real._interpreter_runtime_bwrap_args(str(shallower), [], forbidden) == []
+
+    # Deep release-style runtime stays allowed.
+    deep = user_home / "releases" / "r1" / ".hermes-runtime" / "python" / "cpython" / "bin"
+    deep.mkdir(parents=True)
+    deep_launcher = deep / "python3.11"
+    deep_launcher.write_text("#!/bin/sh\n")
+    runtime_root = str(deep.parent.resolve())
+    assert agent_real._interpreter_runtime_bwrap_args(str(deep_launcher), [], forbidden) == [
+        "--ro-bind", runtime_root, runtime_root,
+    ]
+
+
+def test_wrap_linux_bwrap_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):
+    """Per-profile allowlist works the same way on Linux as on macOS."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--die-with-parent\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    cmd = ["/usr/bin/python3"]
+
+    # Unlisted profile bypasses the sandbox.
+    prod = tmp_path / "profiles" / "feishu_g41a5b5g"
+    prod.mkdir(parents=True)
+    assert agent_real._wrap_with_sandbox(cmd, prod) == cmd
+
+    # Listed profile gets wrapped.
+    spike = tmp_path / "profiles" / "spike_test"
+    spike.mkdir(parents=True)
+    wrapped = agent_real._wrap_with_sandbox(cmd, spike)
+    assert wrapped[0] == str(fake_bin)
+
+
+def test_wrap_unknown_platform_is_noop_with_info_log(monkeypatch, tmp_path: Path, caplog):
+    """Non-darwin, non-linux platforms log INFO and return cmd unchanged."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    cmd = ["/usr/bin/python3"]
+    with caplog.at_level(logging.INFO, logger="hermes_multitenancy.agent_real"):
+        wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+
+    assert wrapped == cmd
+    assert any("no sandbox backend" in rec.message for rec in caplog.records)
+
+
+def test_bwrap_default_args_is_valid_syntax():
+    """Smoke test: shipped bwrap-default.args renders without unresolved placeholders."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    assert args_file.is_file(), f"policy {args_file} not bundled with plugin"
+
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/profile",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+    # No unresolved ${...} placeholders.
+    leftover = [t for t in tokens if "${" in t]
+    assert not leftover, f"unresolved placeholders in bwrap-default.args: {leftover}"
+    # Sanity: contains the expected core flags.
+    assert "--die-with-parent" in tokens
+    assert "--proc" in tokens
+    assert "--chdir" in tokens
+
+
+def test_bwrap_default_args_provides_openclaw_workspace_and_shared_bin():
+    """Linux sandbox should expose profile workspace at /workspace and shared tool bin."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    assert ("--bind", "/probe/shared/profiles/alice/workspace", "/workspace") in triples
+    assert ("--ro-bind-try", "/probe/shared/bin", "/probe/shared/bin") in triples
+    assert (
+        "--ro-bind-try",
+        "/probe/shared/browser-browsers",
+        "/probe/shared/browser-browsers",
+    ) in triples
+
+
+def test_bwrap_default_args_does_not_bind_entire_shared_home():
+    """Linux sandbox must not expose sibling profile directories read-only."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    assert ("--ro-bind", "/probe/shared", "/probe/shared") not in triples
+    assert ("--dir", "/probe/shared/profiles", "--dir") in triples
+    assert (
+        "--bind",
+        "/probe/shared/profiles/alice",
+        "/probe/shared/profiles/alice",
+    ) in triples
+
+
+def test_wrap_linux_bwrap_binds_installed_shared_skill_symlink_targets(monkeypatch, tmp_path: Path):
+    """Profile skill symlinks to shared skills must resolve inside bwrap."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "kep-prd-analysis"
+    (skill_source / "references").mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# KEP PRD Analysis\n", encoding="utf-8")
+    (skill_source / "references" / "architecture-examples.md").write_text("ref", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "kep-prd-analysis"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--dir", str(shared / "skills"), "--dir") in triples
+    assert ("--dir", str(shared / "skills" / "Keep"), "--ro-bind") in triples
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+    assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
+
+
+def test_wrap_linux_bwrap_rejects_shared_skill_symlink_chain_outside_trusted_roots(monkeypatch, tmp_path: Path):
+    """Shared symlink chains cannot expose sources outside trusted roots."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    external_skill = tmp_path / ".agents" / "skills" / "lark-slides"
+    (external_skill / "references").mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# Lark Slides\nUse xml_presentations.get.\n", encoding="utf-8")
+    (external_skill / "references" / "slides.md").write_text("xml_presentations.get", encoding="utf-8")
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    shared_link = shared / "skills" / "lark-slides"
+    shared_link.parent.mkdir(parents=True)
+    shared_link.symlink_to(external_skill, target_is_directory=True)
+    profile_link = profile / "skills" / "lark-slides"
+    profile_link.parent.mkdir(parents=True)
+    profile_link.symlink_to(shared_link, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert "--ro-bind" not in wrapped
+    assert ("--ro-bind", str(external_skill), str(shared_link)) not in triples
+    assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
+
+
+def test_wrap_linux_bwrap_rejects_profile_symlink_directly_to_external_skill(monkeypatch, tmp_path: Path):
+    """Only shared-managed external skill links are mounted into the sandbox."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    external_skill = tmp_path / ".agents" / "skills" / "rogue-lark"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# Rogue Lark\n", encoding="utf-8")
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    profile_link = profile / "skills" / "rogue-lark"
+    profile_link.parent.mkdir(parents=True)
+    profile_link.symlink_to(external_skill, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(external_skill), str(external_skill)) not in triples
+    assert ("--ro-bind", str(external_skill), str(shared / "skills" / "rogue-lark")) not in triples
+
+
+def test_wrap_linux_bwrap_binds_managed_skillhub_release_targets(monkeypatch, tmp_path: Path):
+    """AiDock SkillHub releases under _managed/ must resolve inside bwrap.
+
+    Regression: atom-member-commission 2026-07-20 — profile symlinks to
+    _managed/aidock-skillhub/<skill>/<ver>/<skill> dangled in-sandbox, so
+    SKILL.md loaded (prompt-injected) but scripts/ attachments were unreadable.
+    """
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    release = shared / "_managed" / "aidock-skillhub" / "atom-member-commission" / "1.0.0"
+    skill_source = release / "atom-member-commission"
+    (skill_source / "scripts").mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# 会员佣金填写\n", encoding="utf-8")
+    (skill_source / "_meta.json").write_text("{}", encoding="utf-8")
+    (skill_source / "scripts" / "commission.py").write_text("print('ok')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "atom-member-commission"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+    assert ("--ro-bind", str(shared / "_managed"), str(shared / "_managed")) not in triples
+
+
+def test_wrap_linux_bwrap_binds_plugin_managed_skill_targets(monkeypatch, tmp_path: Path):
+    """Expert plugin skills must resolve inside bwrap without mounting all plugin state."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    plugin_source = shared / ".hermes-plugin-managed" / ".sources" / "keep-product"
+    skill_sources = [plugin_source / "kep-ub-gen", plugin_source / "kep-ub-archive"]
+    for skill_source in skill_sources:
+        (skill_source / "scripts").mkdir(parents=True)
+        (skill_source / "references").mkdir()
+        (skill_source / "SKILL.md").write_text(f"# {skill_source.name}\n", encoding="utf-8")
+        (skill_source / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
+        (skill_source / "references" / "schema.json").write_text("{}\n", encoding="utf-8")
+        skill_link = profile / "skills" / skill_source.name
+        skill_link.parent.mkdir(parents=True, exist_ok=True)
+        skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert {("--ro-bind", str(source), str(source)) for source in skill_sources} <= triples
+    plugin_root = shared / ".hermes-plugin-managed"
+    assert ("--ro-bind", str(plugin_root), str(plugin_root)) not in triples
+    sources_root = plugin_root / ".sources"
+    assert ("--ro-bind", str(sources_root), str(sources_root)) not in triples
+    assert ("--ro-bind", str(plugin_source), str(plugin_source)) not in triples
+
+
+def test_wrap_linux_bwrap_skips_managed_skillhub_target_without_skill_md(monkeypatch, tmp_path: Path):
+    """The SKILL.md existence gate applies to _managed/ targets like any other root."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "_managed" / "aidock-skillhub" / "broken-skill" / "1.0.0" / "broken-skill"
+    (skill_source / "scripts").mkdir(parents=True)
+    (skill_source / "scripts" / "tool.py").write_text("print('ok')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "broken-skill"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) not in triples
+
+
+def test_wrap_linux_bwrap_skips_secret_like_shared_skill_targets(monkeypatch, tmp_path: Path):
+    """A shared skill symlink is not mounted if its target later gains secrets."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "secret-prd-analysis"
+    skill_source.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Secret PRD Analysis\n", encoding="utf-8")
+    (skill_source / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "secret-prd-analysis"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) not in triples
+
+
+def test_wrap_linux_bwrap_ignores_non_skill_dependency_symlinks(monkeypatch, tmp_path: Path, caplog):
+    """Dependency symlinks under a copied skill are not treated as skill roots."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    dep_source = shared / "skills" / "Keep" / "keep-record" / "node_modules"
+    dep_source.mkdir(parents=True)
+    (dep_source / "token-helper.js").write_text("// not a skill root\n", encoding="utf-8")
+    skill_dir = profile / "skills" / "Keep" / "keep-record"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    dep_link = skill_dir / "node_modules"
+    dep_link.symlink_to(dep_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(dep_source), str(dep_source)) not in triples
+    assert not any("skipping shared skill sandbox bind" in rec.message for rec in caplog.records)
+
+
+def test_bwrap_default_args_masks_profile_and_shared_secret_files():
+    """The sandbox may use env-loaded secrets, but tools must not read secret files."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    # .env and auth.lock are masked with /dev/null.
+    for secret_path in (
+        "/probe/shared/.env",
+        "/probe/shared/auth.lock",
+    ):
+        assert ("--ro-bind-try", "/dev/null", secret_path) in triples
+    # auth.json is masked with a VALID-but-EMPTY auth store instead of /dev/null
+    # (hides the host credential pool while letting hermes_cli.auth parse it
+    # silently). The real host auth.json must NOT be exposed.
+    assert (
+        "--ro-bind-try",
+        "/probe/mt-repo/hermes_multitenancy/sandbox/empty-auth.json",
+        "/probe/shared/auth.json",
+    ) in triples
+    assert ("--ro-bind-try", "/dev/null", "/probe/shared/auth.json") not in triples
+
+
+def test_wrap_linux_bwrap_binds_token_named_source_script_skill(monkeypatch, tmp_path: Path):
+    """Runtime helper source files are not credential files just because their name contains token."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "keep-login-skill"
+    scripts = skill_source / "scripts"
+    scripts.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Keep Login Skill\n", encoding="utf-8")
+    (scripts / "get_bearer_token.py").write_text("print('runtime helper')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "keep-login-skill"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+
+
+def test_sandbox_child_gets_run_scoped_broker_token_not_master_key(monkeypatch, tmp_path: Path):
+    """The sandboxed child must never inherit the SHARED master RunBroker key.
+
+    Regression for the 2026-08-04 security review finding: holding the master key
+    plus a caller-asserted owner header was enough to act as any colleague. The
+    child now receives a per-run token whose (profile, open_id) binding is held
+    server-side, and it is revoked when the run's env scope exits.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.webui_broker_server import _lookup_run_broker_scoped_token
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "0" * 64)
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    # Patch on the owning module: the package shim re-exports these, so patching
+    # the shim would leave `_core`'s own globals (what the scope actually calls)
+    # untouched.
+    from hermes_multitenancy.agent_real import _core as agent_core
+
+    monkeypatch.setattr(
+        agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "ou_alice"
+    )
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        token = env["HERMES_RUN_BROKER_KEY"]
+        assert token != "master-key-shared-by-everyone"
+        assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == token
+        assert env["HERMES_RUN_BROKER_URL"].startswith("http://127.0.0.1:")
+        record = _lookup_run_broker_scoped_token(token)
+        assert record is not None
+        assert record["profile_name"] == "alice"
+        assert record["open_id"] == "ou_alice"
+
+    # Revoked with the run — a token copied out of the child is dead afterwards.
+    assert _lookup_run_broker_scoped_token(token) is None
+
+
+def test_master_broker_key_is_stripped_even_when_strict_context_is_off(monkeypatch, tmp_path: Path):
+    """Master-key removal must not hang off an optional, default-off flag.
+
+    Regression for codex review RBOS-STRICT-OPTIONAL: the strip used to sit
+    inside `strict_context_enabled()`, which defaults to OFF and is not required
+    by `startup_guard`, so a deployment could pass preflight and still hand the
+    shared master key to every tenant child. The earlier test masked this by
+    forcing strict=1.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core as agent_core
+    from hermes_multitenancy.webui_broker_server import _lookup_run_broker_scoped_token
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    monkeypatch.setattr(
+        agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "ou_alice"
+    )
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        token = env["HERMES_RUN_BROKER_KEY"]
+        assert token != "master-key-shared-by-everyone"
+        assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == token
+        record = _lookup_run_broker_scoped_token(token)
+        assert record is not None
+        assert record["profile_name"] == "alice"
+        assert record["open_id"] == "ou_alice"
+
+    assert _lookup_run_broker_scoped_token(token) is None
+
+
+def test_child_gets_no_broker_bearer_when_owner_cannot_be_bound(monkeypatch, tmp_path: Path):
+    """No resolvable owner → no broker credential at all (never the master key)."""
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core as agent_core
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    monkeypatch.setattr(agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "")
+    monkeypatch.setattr(agent_core, "_profile_owner_open_id", lambda _home: "")
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        assert "HERMES_RUN_BROKER_KEY" not in env
+        assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+
+def test_profile_dotenv_cannot_reintroduce_master_broker_key(monkeypatch, tmp_path: Path):
+    """A master key sitting in the profile .env must not reach the child.
+
+    Regression for codex review RBOS-MASTER-REINTRODUCTION. The strip used to run
+    at the top of `_build_subprocess_env`, but `_profile_env_for_aiagent` loads
+    the profile dotenv AFTERWARDS and re-injected both names verbatim; the probed
+    child env came back as
+    {'HERMES_RUN_BROKER_KEY': 'master-from-profile', 'HERMES_MULTITENANCY_RUN_BROKER_KEY': ...}.
+    Only the token minted for this spawn may survive, whatever the source.
+    """
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    (profile_home / ".env").write_text(
+        "HERMES_RUN_BROKER_KEY=master-from-profile\n"
+        "HERMES_MULTITENANCY_RUN_BROKER_KEY=master-from-profile\n",
+        encoding="utf-8",
+    )
+
+    # 1. No minted token → the child gets no broker bearer at all.
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert "HERMES_RUN_BROKER_KEY" not in env
+    assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+    # 2. Minted token → only that value survives; the dotenv master is dropped.
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_RUN_BROKER_KEY": "scoped-token-for-this-run",
+            "HERMES_MULTITENANCY_RUN_BROKER_KEY": "scoped-token-for-this-run",
+        },
+    )
+    assert env["HERMES_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+    assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+
+    # 3. A tampered second name cannot smuggle the master through.
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={"HERMES_RUN_BROKER_KEY": "scoped-token-for-this-run"},
+    )
+    assert env["HERMES_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+    assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+
+def test_stream_aiagent_subprocess_kills_orphan_run_before_closing_auth_broker(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """An abandoned stream must not leave a run alive past its auth broker.
+
+    Regression for 2026-08-20: sunke's Feishu turns kept reporting
+    `dial tcp 127.0.0.1:<port>: connect: connection refused` from lark-cli.
+    Abandoning this generator raises GeneratorExit, which skips every except
+    branch, so the warm worker's run stayed alive while the finally closed the
+    per-turn lark-cli auth broker it was dialling.
+    """
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    order: list[str] = []
+
+    @contextmanager
+    def fake_env_scope(_event_, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:39745",
+                **(extra or {}),
+            }
+        finally:
+            order.append("auth_broker_closed")
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                if json.loads(line).get("type") != "run":
+                    continue
+                # Emit content but never `done`: the run is still mid-flight,
+                # which is the state an abandoned stream leaves behind.
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": "partial"}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 4711
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            # Only the warm-worker discard path kills this process, so the kill
+            # itself is the observable "orphan run stopped" signal.
+            order.append("orphan_run_killed")
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        profile = tmp_path / "profiles" / "orphan-run"
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        # Consumer walks away mid-run (new inbound message / GC aclose).
+        await stream.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    # The run is killed FIRST; only then may the broker it was dialling close.
+    assert order == ["orphan_run_killed", "auth_broker_closed"], order
+
+
+def _orphan_run_harness(monkeypatch, tmp_path: Path):
+    """Warm-worker stream whose run never reports done. Returns (agent_real, order, profile)."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    order: list[str] = []
+
+    @contextmanager
+    def fake_env_scope(_event_, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                **(extra or {}),
+            }
+        finally:
+            order.append("auth_broker_closed")
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                if json.loads(line).get("type") != "run":
+                    continue
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": "partial"}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 4712
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            order.append("orphan_run_killed")
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    return agent_real, order, tmp_path / "profiles" / "orphan-run"
+
+
+def test_stream_aiagent_subprocess_closes_auth_broker_even_if_orphan_discard_raises(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A failing discard must never strand the broker.
+
+    Leaking the broker is worse than leaking the run: it leaves the turn's
+    frozen identity reachable with no owner left to end it.
+    """
+    from hermes_multitenancy import agent_real as _ar
+
+    reset = getattr(_ar, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    agent_real, order, profile = _orphan_run_harness(monkeypatch, tmp_path)
+
+    # The discard helper itself must be the thing that raises: worker.close()
+    # swallows its own exceptions, so a raising kill() would never reach the
+    # teardown and the guard would be tested against nothing. CancelledError is
+    # the realistic raiser here (BaseException, so close() cannot swallow it),
+    # and it is raised from the name streaming.py actually resolves.
+    import sys as _sys
+
+    streaming_mod = _sys.modules["hermes_multitenancy.agent_real.streaming"]
+
+    async def boom(_profile_home):
+        order.append("orphan_run_killed")
+        raise asyncio.CancelledError("cancelled mid-discard")
+
+    monkeypatch.setattr(streaming_mod, "_discard_aiagent_warm_worker", boom)
+
+    async def scenario():
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        await stream.aclose()
+
+    import contextlib
+
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert "orphan_run_killed" in order
+    assert "auth_broker_closed" in order, "broker leaked when discard raised"
+
+
+def test_stream_aiagent_subprocess_orphan_discard_survives_cancel_during_teardown(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A cancel landing while the stream is being closed must not half-kill the run.
+
+    The teardown awaits the discard, so an unshielded cancel could leave the
+    orphan alive with a closed broker — the exact bug this guards.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real as _ar
+
+    reset = getattr(_ar, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    agent_real, order, profile = _orphan_run_harness(monkeypatch, tmp_path)
+
+    async def scenario():
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        closing_task = asyncio.create_task(stream.aclose())
+        await asyncio.sleep(0)
+        closing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await closing_task
+        # Let a shielded discard finish even though the awaiting task was cancelled.
+        for _ in range(20):
+            if "orphan_run_killed" in order and "auth_broker_closed" in order:
+                break
+            await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert "orphan_run_killed" in order, order
+    assert "auth_broker_closed" in order, order
+
+
+# ── tool in flight vs. stall watchdog (prod 2026-09-03: 5-min ./oup call killed at 300s) ──
+
+
+class _StallFakeStdin:
+    def write(self, _payload):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+class _StallFakeStderr:
+    async def read(self):
+        return b""
+
+
+def _stall_fake_proc(stdout):
+    class FakeProc:
+        def __init__(self):
+            self.stdin = _StallFakeStdin()
+            self.stdout = stdout
+            self.stderr = _StallFakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    return FakeProc()
+
+
+def _stall_fast_timeout(monkeypatch, seconds: str):
+    real_getenv = os.getenv
+
+    def fast_default_timeout(name, default=None):
+        if name == "HERMES_AIAGENT_SUBPROCESS_TIMEOUT":
+            assert default == "300"
+            return seconds
+        return real_getenv(name, default)
+
+    monkeypatch.delenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", raising=False)
+    monkeypatch.setattr(os, "getenv", fast_default_timeout)
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_tool_heartbeat_keeps_run_alive(monkeypatch, tmp_path: Path):
+    """A tool that outlives the watchdog window must NOT get the turn killed while
+    the child keeps sending private tool_heartbeat lines; the heartbeat itself
+    never reaches the periphery."""
+    from hermes_multitenancy import agent_real
+
+    class FakeStdout:
+        def __init__(self):
+            self.heartbeats = 0
+            self.lines = [
+                b'{"event": "tool_started", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1"}\n',
+            ]
+            self.tail = [
+                b'{"event": "tool_completed", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1", "is_error": false}\n',
+                b'{"event": "content", "text": "done"}\n',
+                b'{"event": "done", "result": "done", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            if self.heartbeats < 12:
+                # 12 gaps of 0.03s = 0.36s of "tool running" > 0.3s watchdog,
+                # with a 0.27s slack per gap so xdist load jitter cannot fire
+                # the watchdog between two heartbeats (flaked at 0.01/0.08).
+                self.heartbeats += 1
+                await asyncio.sleep(0.03)
+                return (
+                    b'{"event": "tool_heartbeat", "inflight": '
+                    b'[{"tool_call_id": "call-1", "name": "terminal", "elapsed": 1.0}]}\n'
+                )
+            if self.tail:
+                return self.tail.pop(0)
+            return b""
+
+    created = {}
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = _stall_fake_proc(FakeStdout())
+        return created["proc"]
+
+    _stall_fast_timeout(monkeypatch, "0.3")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    items = [item async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)]
+    kinds = [kind for kind, _ in items]
+
+    assert created["proc"].stdout.heartbeats == 12
+    assert created["proc"].killed is False
+    assert "tool_heartbeat" not in kinds
+    assert kinds.count("tool_started") == 1
+    assert "tool_completed" in kinds
+    assert "done" in kinds
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_idle_timeout_names_inflight_tool_and_closes_call(
+    monkeypatch, tmp_path: Path, caplog
+):
+    """Silence with a tool in flight: the kill names the tool, logs a WARNING,
+    and closes the dangling tool_call in state.db as TOOL_INTERRUPTED."""
+    import sqlite3
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1"}\n'
+            if self.calls == 2:
+                # A second, younger concurrent call: must ALSO be closed on kill.
+                return b'{"event": "tool_started", "name": "lark_cli", "tool_call_id": "call-2", "session_id": "s1"}\n'
+            await asyncio.sleep(60)
+            return b""
+
+    created = {}
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = _stall_fake_proc(FakeStdout())
+        return created["proc"]
+
+    _stall_fast_timeout(monkeypatch, "0.02")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    seen: list = []
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(AiagentToolStallTimeout) as info:
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path):
+                seen.append(item)
+
+    exc = info.value
+    assert "produced no stream events" in str(exc)
+    # The OLDEST call names the kill.
+    assert exc.tool_name == "terminal" and exc.tool_call_id == "call-1"
+    assert exc.elapsed_s is not None and exc.elapsed_s >= 0.02
+    assert "terminal" in exc.user_notice and agent_real._PARTIAL_FAILURE_NOTICE != exc.user_notice
+    assert created["proc"].killed is True
+    stall_logs = [r for r in caplog.records if "stalled and was killed" in r.getMessage()]
+    assert stall_logs and "tool=terminal" in stall_logs[0].getMessage()
+    assert "inflight=2" in stall_logs[0].getMessage()
+    assert stall_logs[0].name == "hermes_multitenancy.agent_real"
+    # The 15s wait heartbeat names the running tool + elapsed seconds in the
+    # parent log (the status event itself is an animation marker by design).
+    assert any(kind == "status" for kind, _ in seen)
+    waiting = [r.getMessage() for r in caplog.records if "waiting for AIAgent subprocess stream event" in r.getMessage()]
+    assert waiting and any("phase=工具 terminal 已运行" in m for m in waiting), waiting
+
+    rows = sqlite3.connect(tmp_path / "state.db").execute(
+        "SELECT role, tool_name, tool_call_id, content FROM messages WHERE role = 'tool' ORDER BY id"
+    ).fetchall()
+    interrupted = [(r[1], r[2]) for r in rows if "TOOL_INTERRUPTED" in (r[3] or "")]
+    assert interrupted == [("terminal", "call-1"), ("lark_cli", "call-2")], rows
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_names_stalled_tool_instead_of_generic_notice(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    stall = AiagentToolStallTimeout(300, tool_call_id="call-1", tool_name="terminal", elapsed_s=305.0)
+
+    async def stalled_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "terminal", "session_id": "s1", "tool_call_id": "call-1"})
+        yield ("content", "我来加载 skill")
+        raise stall
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    assert chunks[-1] == ("content", "\n\n" + stall.user_notice)
+    assert all(agent_real._PARTIAL_FAILURE_NOTICE not in str(chunk) for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_names_stalled_tool_even_without_preamble(monkeypatch, tmp_path: Path):
+    """Model called the tool before saying anything: the named notice must still
+    reach the user as content (not a raised exception the transports render
+    as a generic failure)."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    stall = AiagentToolStallTimeout(300, tool_call_id="call-1", tool_name="terminal", elapsed_s=301.0)
+
+    async def stalled_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "terminal", "session_id": "s1", "tool_call_id": "call-1"})
+        raise stall
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    assert chunks[-1] == ("content", stall.user_notice)
+    assert all(agent_real._PARTIAL_FAILURE_NOTICE not in str(chunk) for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_stall_without_tool_or_content_still_raises(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    async def stalled_stream(*_args, **_kwargs):
+        raise AiagentToolStallTimeout(300)
+        yield
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    with pytest.raises(AiagentToolStallTimeout):
+        async for _item in agent_real.stream_run_agent(_event(), tmp_path):
+            pass
+
+
+def test_real_execute_code_child_builder_keeps_profile_anchors(monkeypatch, tmp_path):
+    from tools import code_execution_env
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / 'profiles' / 'owner'
+    anchors = agent_real._profile_anchor_env_for_aiagent(profile)
+    for name, value in anchors.items():
+        monkeypatch.setenv(name, value)
+        monkeypatch.setenv('_HERMES_FORCE_' + name, value)
+    monkeypatch.setenv('OPENAI_API_KEY', 'must-not-leak')
+    original = code_execution_env._scrub_child_env
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(profile)
+    try:
+        child = code_execution_env._build_child_env(
+            rpc_endpoint='/tmp/test-rpc.sock', rpc_token='test-token',
+            tmpdir=str(profile / 'tmp'), child_python=sys.executable,
+        )
+        for name in ('HOME', 'HERMES_HOME', 'KEP_PROFILE', 'KEP_WORKSPACE_DIR', 'TMPDIR'):
+            assert child[name] == anchors[name]
+        assert 'OPENAI_API_KEY' not in child
+        assert not any(name.startswith('_HERMES_FORCE_') for name in child)
+    finally:
+        cleanup()
+    assert code_execution_env._scrub_child_env is original

@@ -1,0 +1,8 @@
+manifest_version: 1
+name: multitenancy
+version: 0.1.0
+description: "Multi-tenant Feishu routing for Hermes: one bot, many users, isolated profiles."
+author: Hermes Multitenancy Contributors
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch

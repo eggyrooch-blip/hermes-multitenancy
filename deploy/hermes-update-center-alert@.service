@@ -1,0 +1,12 @@
+# update-center 同步失败告警：把失败单元名 + journal 尾部（脱敏）发到飞书群 webhook。
+# webhook URL 是敏感信息，只放 prod 的 EnvironmentFile，不进仓库：
+#   /home/hermes/.hermes/update-center/alert.env 内容一行：
+#   HERMES_UPDATE_CENTER_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/<id>
+[Unit]
+Description=Feishu alert for failed update-center unit (%i)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hermes
+EnvironmentFile=/home/hermes/.hermes/update-center/alert.env
+ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_alert %i

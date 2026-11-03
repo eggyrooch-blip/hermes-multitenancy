@@ -1,0 +1,159 @@
+;;; gateway-main.sb — sandbox for the multitenancy_router gateway *main*
+;;; process (the long-running launchd-managed process that owns the Feishu
+;;; websocket, routing table, and AIAgent subprocess spawning).
+;;;
+;;; ⚠️  STATUS 2026-05-11: NOT IN PRODUCTION USE.
+;;;
+;;; Phase 2 deploy was attempted but blocked by a Python-toolchain issue,
+;;; not a policy gap:
+;;;
+;;;   * /usr/bin/sqlite3 CLI runs fine inside this policy
+;;;     ($ sandbox-exec -f gateway-main.sb -D ... /usr/bin/sqlite3 db
+;;;      "SELECT count(*) FROM multitenancy_routing" → 7 ✓)
+;;;   * raw open()/flock()/create-file in SHARED_HOME all succeed
+;;;   * but Python 3.11.14 (uv-built) sqlite3.connect() raises
+;;;     OperationalError: unable to open database file
+;;;   * routing.lookup → falls through to "no route", dispatch silently
+;;;     fails
+;;;
+;;; This is a uv-built Python (statically-bundled sqlite 3.50.4) +
+;;; sandbox-exec interaction issue; the same probe on /usr/bin/python3
+;;; (Apple-shipped) fails differently (xcode-select deny on startup).
+;;; Fixing it requires either:
+;;;   (a) switch toolchain to brew Python or Apple system Python
+;;;   (b) rebuild uv-Python with different sqlite link mode
+;;;   (c) ship a separate sqlite-binding shim through subprocess to
+;;;       /usr/bin/sqlite3 instead of in-process sqlite3 module
+;;;
+;;; Phase 1 (per-dispatch AIAgent subprocess sandboxing via
+;;; profile-default.sb) is the production deployment as of 2026-05-11.
+;;; This gateway-main.sb is checked in as a future starting point;
+;;; activate by changing the multitenancy_router plist
+;;; ProgramArguments to prepend /usr/bin/sandbox-exec -f
+;;; gateway-main.sb -D ... (see Phase 2 design in
+;;; docs/profile-isolation.md).
+;;;
+;;; This is a SUPERSET of profile-default.sb because the gateway main has
+;;; legitimate needs the per-tenant subprocess does not:
+;;;  - Bind localhost ports (api_server :8643)
+;;;  - Read+write ALL profile dirs (routing dispatches dynamically)
+;;;  - Spawn /usr/bin/sandbox-exec to wrap each AIAgent subprocess
+;;;  - Plugin discovery walks cwd/plugins + ~/.hermes/plugins
+;;;  - Maintain shared cron store + multitenancy routing DB
+;;;
+;;; The gateway main code is "trusted" (our own + upstream hermes-agent,
+;;; not LLM-driven), so this policy is less restrictive than the per-
+;;; tenant policy. The point of sandbox-izing it is supply-chain defence-
+;;; in-depth: limit the blast radius of a bug in lark SDK / hermes-agent
+;;; itself.
+;;;
+;;; Parameters (passed via sandbox-exec -D):
+;;;   SHARED_HOME           — ~/.hermes
+;;;   USER_HOME             — /Users/<user>
+;;;   HERMES_VENV           — Python venv root
+;;;   HERMES_AGENT_INSTALL  — venv.parent (editable install root)
+;;;   HERMES_AGENT_REPO     — gateway cwd
+;;;   HERMES_MT_REPO        — hermes-multitenancy plugin tree
+
+(version 1)
+(deny default)
+(import "system.sb")
+
+;; ── Process / IPC ─────────────────────────────────────────────────────
+
+(allow process-fork process-exec*)
+(allow signal)
+(allow mach-lookup)
+(allow ipc-posix-shm)
+(allow sysctl-read)
+(allow sysctl-write)
+
+;; ── File reads / writes — broad allow + targeted deny ────────────────
+;;
+;; The gateway main is "trusted" code (our own + upstream hermes-agent),
+;; and Python sqlite3 / lark SDK / aiohttp touch a long tail of paths
+;; (kernel-resolved symlinks, SIP /var redirects, hardened-runtime
+;; binary identity checks, plugin discovery walks). Enumerating every
+;; legitimate read path is fragile — instead we grant broad read+write
+;; and rely on the *targeted denies below* to keep the sensitive paths
+;; off-limits. sandbox-exec is last-match-wins, so the denies that
+;; follow this broad allow win on their subpaths.
+
+(allow file-read* file-write*)
+
+;; ── Hard denies — last-match-wins overrides the broad allow above ────
+;; These are the headline cross-tenant / cross-credential guarantees of
+;; ARM B Phase 2: no matter what filesystem trick a (compromised)
+;; gateway dependency plays, it cannot read these.
+
+(deny file-read* file-write*
+    (subpath (string-append (param "USER_HOME") "/.ssh"))
+    (subpath (string-append (param "USER_HOME") "/Library/Keychains"))
+    (subpath (string-append (param "USER_HOME") "/.password-store"))
+    (subpath (string-append (param "USER_HOME") "/.aws/credentials")))
+
+;; (file-write* is granted broadly above; the targeted denies after the
+;; broad allow keep ssh / Keychain / etc. off-limits. Specific writes
+;; that hermes needs — SHARED_HOME, ~/.local/state, /private/tmp,
+;; /private/var/folders — are all covered by the broad allow.)
+
+;; sqlite3 in WAL mode needs file-ioctl, file-issue-extension, and
+;; file-map-executable. Empirically (2026-05-11) sqlite touches these
+;; on paths not easily enumerable in advance (kernel resolves symlinks,
+;; SIP /var redirects, hardened-runtime checks on the Python binary
+;; itself, etc.). Granting them broadly here matches the unscoped
+;; test_policy.sb that was proven to let uv-Python sqlite work; the
+;; cross-tenant deny still holds via file-read*/file-write* being
+;; subpath-scoped above.
+(allow file-ioctl file-issue-extension file-map-executable)
+
+(allow iokit-open)
+(allow iokit-get-properties)
+(allow mach-priv-host-port)
+(allow mach-priv-task-port)
+(allow process-info*)
+
+;; ── Network ───────────────────────────────────────────────────────────
+;;
+;; Gateway main needs:
+;;   - Outbound 443/80/53 — Feishu websocket, LLM, plugin updates
+;;   - Bind localhost:* — api_server (8643), internal health endpoints
+;;   - UNIX socket — asyncio internals, hermes IPC
+;;
+;; No inbound from external addresses — only localhost bind.
+
+(allow network-outbound
+    (remote tcp "*:443")
+    (remote tcp "*:80")
+    (remote tcp "*:53")
+    (remote udp "*:443")
+    (remote udp "*:53")
+    (remote unix-socket)
+    ;; Localhost outbound — needed for the api_server port-conflict probe
+    ;; (api_server.py:2713 connects to 127.0.0.1:port before TCPSite.start
+    ;; to detect "port already in use"). Without this, the probe gets
+    ;; "Operation not permitted" instead of ConnectionRefusedError, which
+    ;; surfaces as "Failed to start API server: Operation not permitted".
+    (remote tcp "localhost:*"))
+
+;; Note: Apple sandbox grammar restricts (local …) host to "localhost" or
+;; "*"; literal IPs like 127.0.0.1 / ::1 are rejected at policy parse. The
+;; "localhost" form covers both v4 and v6 loopback at runtime.
+(allow network-bind
+    (local tcp "localhost:*")
+    (local udp "localhost:*")
+    (local unix-socket))
+
+;; network-bind covers ``bind()`` but NOT ``listen()`` — those are
+;; different sandbox-exec operations. Without network-inbound the
+;; api_server gets ``PermissionError: [Errno 1] Operation not permitted``
+;; from ``sock.listen()`` deep in asyncio.base_events._start_serving.
+;; Confirmed via isolated aiohttp probe 2026-05-11 17:30.
+(allow network-inbound
+    (local tcp "localhost:*")
+    (local udp "localhost:*")
+    (local unix-socket))
+
+;; ── Diagnostics — uncomment when chasing a sandbox violation ──────────
+;;
+;; (debug deny)

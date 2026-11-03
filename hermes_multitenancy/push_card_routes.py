@@ -1,0 +1,352 @@
+"""``POST /api/run-broker/notify-card`` + ``GET .../{registry_id}`` (SPEC P2).
+
+External systems call ``notify-card`` to push a fill-card to one registered
+user. Auth reuses the ingest owner-key体系 (fail-closed) and additionally binds
+each key to an ``allowed_scenes`` whitelist — the request body carries **no
+``skill``**; the skill is derived server-side from ``scene`` via the scene
+registry, so a leaked key's blast radius is only its authorized scenes
+(design §2.1, P0-1).
+
+Semantics:
+* 202 + ``registry_id`` on accept — delivery is async via the rate-limited queue.
+* Repeat ``idempotency_key`` → 200 + the original registry (no second card).
+* ``business_key`` collides with an in-flight row → 409 + the original registry.
+* Unknown/blocked scene, or a target not in the routing table → 4xx.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Any, Callable, Optional
+from urllib.parse import urlparse
+
+from . import push_registry as _reg
+from . import push_scenes as _scenes
+from . import push_send_queue as _queue
+from .webui_broker import periphery as _periphery
+
+logger = logging.getLogger(__name__)
+
+#: Hard upper bound on a caller-supplied ``expires_at`` — 30 days ahead. An
+#: unbounded value (``2**40`` = "never expires") would pin a row open forever and
+#: a value in the past would expire it instantly; both are refused (P1).
+MAX_EXPIRES_AHEAD_S = 30 * 24 * 3600
+
+
+# --- target resolution seam (default reuses the routing table) -----------
+
+def _default_target_resolver(
+    *, open_id: str, union_id: str, user_id: str = ""
+) -> Optional[dict[str, Any]]:
+    """Resolve a push target to its sending profile via the routing table.
+
+    Caller may identify the target by ANY one of open_id / union_id / user_id
+    (e.g. ``user_id="sunke"``) — whichever the external system already holds.
+    A target not present (never onboarded / off-boarded) → None → 4xx."""
+    from .routing import RoutingTable
+
+    table = RoutingTable()
+    row = None
+    if open_id:
+        row = table.lookup_by_open_id(open_id)
+    if row is None and union_id:
+        row = table.lookup_by_union_id(union_id)
+    if row is None and user_id:
+        row = table.lookup_by_user_id(user_id)
+    if row is None:
+        return None
+    return {
+        "open_id": row.open_id or open_id,
+        "union_id": row.union_id or union_id,
+        "profile_name": row.profile_name,
+        "chat_id": row.chat_id,
+    }
+
+
+_target_resolver: Callable[..., Optional[dict[str, Any]]] = _default_target_resolver
+
+#: Send dispatch seam. Default fire-and-forget onto the running loop; tests
+#: override with a recorder so the endpoint stays deterministic.
+_send_dispatch: Callable[[str], None] = lambda registry_id: asyncio.ensure_future(
+    _queue.get_send_queue().process(registry_id)
+)
+
+
+def override_target_resolver(fn: Optional[Callable[..., Optional[dict[str, Any]]]]) -> None:
+    global _target_resolver
+    _target_resolver = fn if fn is not None else _default_target_resolver
+
+
+def override_send_dispatch(fn: Optional[Callable[[str], None]]) -> None:
+    global _send_dispatch
+    _send_dispatch = fn if fn is not None else (
+        lambda registry_id: asyncio.ensure_future(_queue.get_send_queue().process(registry_id))
+    )
+
+
+# --- helpers -------------------------------------------------------------
+
+def _next_working_day_eod(now: Optional[datetime] = None) -> int:
+    """Default expiry: 23:59:59 of the next working day (Mon–Fri).
+
+    Real employees reply the next day as a matter of course — same-day 23:59 is
+    too short (design §2.1, P1-3)."""
+    now = now or datetime.now()
+    day = now + timedelta(days=1)
+    while day.weekday() >= 5:  # 5=Sat, 6=Sun
+        day = day + timedelta(days=1)
+    eod = day.replace(hour=23, minute=59, second=59, microsecond=0)
+    return int(eod.timestamp())
+
+
+def _default_business_key(scene: str, open_id: str) -> str:
+    return f"{scene}:{open_id}:{datetime.now().strftime('%Y-%m-%d')}"
+
+
+def _callback_domain_allowed(binding: dict[str, Any], callback: Any) -> Optional[str]:
+    """Fail-closed check that a per-push 落库 callback host is allowlisted for this
+    key. ``callback`` is a ``CallbackConfig | None``; ``None`` = no endpoint to vet
+    → allowed. A callback that IS present REQUIRES a non-empty
+    ``allowed_callback_domains`` on the key — a leaked key with no domain grant
+    must never exfiltrate employee data to an arbitrary host (P0). Returns an
+    error string to 403 with, else None."""
+    if callback is None:
+        return None
+    allowed = binding.get("allowed_callback_domains") or []
+    if not allowed:
+        return "per-push callback requires a callback-domain allowlist on this key"
+    host = (urlparse(callback.url).hostname or "").lower()
+    if not host:
+        return "callback url has no host"
+    for raw in allowed:
+        d = str(raw).strip().lower().lstrip(".")
+        # ponytail: exact host or subdomain-suffix match; widen to scheme/port
+        # scoping only if a caller ever needs it.
+        if d and (host == d or host.endswith("." + d)):
+            return None
+    return f"callback domain not authorized for this key: {host}"
+
+
+def _binding_allows_row(binding: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Status-read authorization: an inline row (carries ``scene_spec_json``) is
+    gated by ``allowed_skills``; a named-scene row by ``allowed_scenes``."""
+    if row.get("scene_spec_json"):
+        return str(row.get("skill") or "") in (binding.get("allowed_skills") or [])
+    return str(row.get("scene") or "") in (binding.get("allowed_scenes") or [])
+
+
+def _public_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Caller-facing projection of a registry row — no nonce, no internal marker."""
+    return {
+        "registry_id": row.get("registry_id"),
+        "scene": row.get("scene"),
+        "status": row.get("status"),
+        "target_open_id": row.get("target_open_id"),
+        "message_id": row.get("message_id"),
+        "business_key": row.get("business_key"),
+        "idempotency_key": row.get("idempotency_key"),
+        "expires_at": row.get("expires_at"),
+        "last_error": row.get("last_error"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+# --- handlers ------------------------------------------------------------
+
+def register_push_card_routes(app: Any) -> None:
+    """Register the notify-card endpoints on the run-broker app."""
+    from aiohttp import web
+
+    async def handle_notify_card(request):
+        binding = _periphery._ingest_binding_for_request(request)
+        if binding is None:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be a JSON object"}, status=400
+            )
+
+        # A scene may be DESCRIBED inline (a ``skill`` is present → self-serve,
+        # no server-side registration) or NAMED (look up a pre-registered scene).
+        # Inline wins when a skill is given; else fall back to the named registry
+        # (backward compatible). 二者取其一.
+        inline = bool(str(payload.get("skill") or "").strip())
+        if inline:
+            try:
+                scene_def = _scenes.scene_from_payload(payload)
+            except ValueError as exc:
+                return web.json_response(
+                    {"ok": False, "error": f"invalid scene spec: {exc}"}, status=400
+                )
+            # fail-closed: the key must be granted this skill (P0-1 blast radius).
+            # The per-push callback domain is vetted below on the UNIFIED path so
+            # both inline and named scenes share one fail-closed check.
+            if scene_def.skill not in (binding.get("allowed_skills") or []):
+                return web.json_response(
+                    {"ok": False,
+                     "error": f"skill not authorized for this key: {scene_def.skill}"},
+                    status=403,
+                )
+            scene = scene_def.scene
+        else:
+            scene = str(payload.get("scene") or "").strip()
+            if not scene:
+                return web.json_response(
+                    {"ok": False, "error": "scene (or inline skill) is required"}, status=400
+                )
+            scene_def = _scenes.get_scene(scene)
+            if scene_def is None:
+                return web.json_response(
+                    {"ok": False, "error": f"unknown scene: {scene}"}, status=400
+                )
+            if scene not in (binding.get("allowed_scenes") or []):
+                # fail-closed: a key may only push scenes explicitly granted to it.
+                return web.json_response(
+                    {"ok": False, "error": f"scene not authorized for this key: {scene}"},
+                    status=403,
+                )
+
+        open_id = str(payload.get("open_id") or "").strip()
+        union_id = str(payload.get("union_id") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        if not (open_id or union_id or user_id):
+            return web.json_response(
+                {"ok": False, "error": "one of open_id / union_id / user_id is required"},
+                status=400,
+            )
+        target = _target_resolver(open_id=open_id, union_id=union_id, user_id=user_id)
+        if target is None:
+            return web.json_response(
+                {"ok": False, "error": "target not registered"}, status=404
+            )
+        resolved_open_id = str(target.get("open_id") or open_id)
+        profile_name = str(target.get("profile_name") or "").strip()
+        if not profile_name:
+            return web.json_response(
+                {"ok": False, "error": "target has no sending profile"}, status=404
+            )
+
+        body_payload = payload.get("payload")
+        if body_payload is not None and not isinstance(body_payload, dict):
+            return web.json_response(
+                {"ok": False, "error": "payload must be an object"}, status=400
+            )
+        card = payload.get("card") if isinstance(payload.get("card"), dict) else None
+        if card is None:
+            # No card supplied → build a default one (title + scene name + a
+            # "reply to fill" prompt). A None card would serialize to "null" and
+            # fail the Feishu send (finding no-default-card-when-omitted).
+            from . import push_fill_form as _fill
+
+            card = _fill.default_scene_card(scene_def)
+        idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
+        business_key = str(payload.get("business_key") or "").strip() or _default_business_key(
+            scene, resolved_open_id
+        )
+        raw_expires = payload.get("expires_at")
+        if raw_expires is None:
+            expires_at = _next_working_day_eod()
+        elif isinstance(raw_expires, bool) or not isinstance(raw_expires, int):
+            # A float/string/etc is refused — only an integer unix timestamp is
+            # accepted so a 2**40 "never expires" or a bogus value can't slip in.
+            return web.json_response(
+                {"ok": False, "error": "expires_at must be an integer unix timestamp"},
+                status=400,
+            )
+        else:
+            now_ts = int(time.time())
+            if not (now_ts < raw_expires <= now_ts + MAX_EXPIRES_AHEAD_S):
+                return web.json_response(
+                    {"ok": False,
+                     "error": "expires_at must be in the future and within 30 days"},
+                    status=400,
+                )
+            expires_at = raw_expires
+
+        # Per-push overrides for this card's 回调地址 (落库 endpoint) and submit
+        # behavior. Both are capabilities the caller/scene configures — not
+        # framework-hardcoded. Stored on the row; resolved at confirm time with
+        # push-override > scene default > env priority (design §config).
+        try:
+            callback_cfg = _scenes.callback_from_payload(payload.get("callback"))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": f"invalid callback: {exc}"}, status=400)
+        # UNIFIED fail-closed domain check on the per-push callback for BOTH the
+        # inline and named-scene paths. The named path previously stored this
+        # callback with ZERO domain vetting → a leaked key could set
+        # callback.url=https://attacker.evil and exfiltrate employee data on
+        # confirm (push-override beats scene/env). One check, both paths (P0).
+        cb_err = _callback_domain_allowed(binding, callback_cfg)
+        if cb_err is not None:
+            return web.json_response({"ok": False, "error": cb_err}, status=403)
+        try:
+            behaviors_cfg = _scenes.behaviors_from_payload(payload.get("behaviors"))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": f"invalid behaviors: {exc}"}, status=400)
+
+        store = _reg.get_registry_store()
+        result = store.create(
+            scene=scene,
+            skill=scene_def.skill,
+            target_open_id=resolved_open_id,
+            target_union_id=str(target.get("union_id") or union_id) or None,
+            profile_name=profile_name,
+            chat_id=target.get("chat_id"),
+            business_key=business_key,
+            payload=body_payload,
+            card=card,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
+            callback_json=_scenes.callback_to_json(callback_cfg) if callback_cfg else None,
+            behaviors_json=_scenes.behaviors_to_json(behaviors_cfg) if behaviors_cfg else None,
+            # Inline scenes carry their full spec on the row so reply/confirm
+            # resolve it without a name lookup; named scenes resolve fresh via
+            # the registry (scene_spec_json stays NULL).
+            scene_spec_json=_scenes.scene_to_spec_json(scene_def) if inline else None,
+        )
+
+        if result.conflict == "idempotent":
+            return web.json_response(
+                {"ok": True, "duplicate": True, "registry_id": result.row["registry_id"],
+                 "status": result.row["status"]},
+                status=200,
+            )
+        if result.conflict == "business_key":
+            return web.json_response(
+                {"ok": False, "error": "business_key already in flight",
+                 "registry_id": result.row["registry_id"], "status": result.row["status"]},
+                status=409,
+            )
+
+        registry_id = result.row["registry_id"]
+        try:
+            _send_dispatch(registry_id)
+        except Exception:
+            logger.exception("[push-card] failed to dispatch send for %s", registry_id)
+        return web.json_response(
+            {"ok": True, "registry_id": registry_id, "status": _reg.STATUS_SENDING},
+            status=202,
+        )
+
+    async def handle_notify_card_status(request):
+        binding = _periphery._ingest_binding_for_request(request)
+        if binding is None:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        registry_id = str(request.match_info.get("registry_id") or "").strip()
+        row = _reg.get_registry_store().get(registry_id)
+        if row is None:
+            return web.json_response({"ok": False, "error": "not found"}, status=404)
+        if not _binding_allows_row(binding, row):
+            return web.json_response({"ok": False, "error": "not found"}, status=404)
+        return web.json_response({"ok": True, **_public_row(row)}, status=200)
+
+    app.router.add_post("/api/run-broker/notify-card", handle_notify_card)
+    app.router.add_get("/api/run-broker/notify-card/{registry_id}", handle_notify_card_status)

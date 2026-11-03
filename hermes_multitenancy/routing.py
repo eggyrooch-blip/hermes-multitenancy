@@ -1,0 +1,1929 @@
+"""SQLite-backed routing table — replaces the _SPIKE_ROUTING dict.
+
+Schema (per architect-verification.md follow-up + review v2 笔记 D4 修订版):
+  - user_id PRIMARY KEY (business key for ops/feishu-sync)
+  - profile_name (NOT UNIQUE — guest profile can serve multiple users)
+  - open_id (queryable hot path, UNIQUE among active user rows only)
+  - union_id (cross-app stable id, optional)
+  - active flag + deleted_at + synced_at + version (soft-delete + sync-staleness)
+  - kind ('user' | 'group') — group rows are per-chat-id profiles
+  - chat_id (UNIQUE among active group rows; NULL for user rows)
+  - owner_open_id (group inviter; NULL for user rows)
+  - display_label (Web UI label like "owner-IT组"; NULL for user rows)
+
+Read/write contract (per design D6 in review v2 + group-profile extension):
+  - feishu-sync writes user_id / profile_name / open_id / union_id (and version++)
+  - router writes group rows via upsert_group()
+  - router only updates last_active_at via touch_active(open_id) for user rows
+    and touch_active_group(chat_id) for group rows.
+"""
+from __future__ import annotations
+
+import contextlib
+import functools
+import fcntl
+import os
+import stat
+import logging
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator, Optional
+from uuid import uuid4
+
+from .shared_db import connect_shared
+from .credential_renewal_common import (
+    CredentialIdentityLockTimeout,
+    credential_identity_lock,
+)
+
+logger = logging.getLogger(__name__)
+
+# Default db path — independent from ~/.hermes/state.db so router writes don't
+# contend with gateway sessions/pairing/cron writes for the WAL.
+DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
+_ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS = 5.0
+_ROUTE_IDENTITY_RETRY_LIMIT = 5
+
+
+class RouteIdentityConflictError(RuntimeError):
+    """A route changed too often to acquire a stable old/new identity fence."""
+
+KIND_USER = "user"
+KIND_GROUP = "group"
+KIND_AGENT = "agent"
+_DEFAULT_REPLY_MODE = "mention"
+_VALID_REPLY_MODES = frozenset({"mention", "all"})
+AGENT_SHARE_VIEWER = "viewer"
+AGENT_SHARE_EDITOR = "editor"
+AGENT_SHARE_MANAGER = "manager"
+_VALID_AGENT_SHARE_ROLES = frozenset(
+    {AGENT_SHARE_VIEWER, AGENT_SHARE_EDITOR, AGENT_SHARE_MANAGER}
+)
+AGENT_SHARE_STATUS_ACTIVE = "active"
+AGENT_SHARE_STATUS_REVOKED = "revoked"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS multitenancy_routing (
+    user_id        TEXT PRIMARY KEY NOT NULL,
+    profile_name   TEXT NOT NULL,
+    open_id        TEXT,
+    union_id       TEXT,
+    active         INTEGER NOT NULL DEFAULT 1,
+    deleted_at     INTEGER,
+    synced_at      INTEGER NOT NULL,
+    version        INTEGER NOT NULL DEFAULT 1,
+    last_active_at INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'user',
+    chat_id        TEXT,
+    owner_open_id  TEXT,
+    display_label  TEXT
+);
+
+-- Pending inviter capture closes the restart / multi-worker hazard between
+-- Feishu bot.added and the first @mention. It lives on the same SQLite
+-- connection as the main routing table so WAL, busy_timeout, and :memory:
+-- tests all observe one shared durable hand-off surface.
+CREATE TABLE IF NOT EXISTS multitenancy_pending_group_inviter (
+    chat_id          TEXT PRIMARY KEY NOT NULL,
+    inviter_open_id  TEXT NOT NULL,
+    inviter_union_id TEXT,
+    created_at       INTEGER NOT NULL
+);
+
+-- Per-group reply-mode valve, keyed by chat_id and DECOUPLED from the
+-- routing row. The owner can flip the mode from the welcome card the instant
+-- the bot is added — long before any group message triggers
+-- _provision_group_route() and creates the kind='group' routing row. Storing
+-- the mode on its own table means get/set work regardless of provisioning
+-- order (the bug a row-column design hit: set was a silent no-op pre-provision).
+CREATE TABLE IF NOT EXISTS multitenancy_group_reply_mode (
+    chat_id     TEXT PRIMARY KEY NOT NULL,
+    mode        TEXT NOT NULL DEFAULT 'mention',
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_agent_shares (
+    agent_id           TEXT NOT NULL,
+    grantee_open_id    TEXT NOT NULL,
+    share_id           TEXT,
+    grantee_principal_id TEXT,
+    role               TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    created_by_open_id TEXT NOT NULL,
+    created_by_principal_id TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    revoked_at         INTEGER,
+    PRIMARY KEY (agent_id, grantee_open_id)
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_principals (
+    principal_id      TEXT PRIMARY KEY NOT NULL,
+    provider          TEXT NOT NULL,
+    tenant_key        TEXT NOT NULL DEFAULT '',
+    canonical_id_type TEXT NOT NULL,
+    canonical_id      TEXT NOT NULL,
+    display_name      TEXT,
+    avatar_url        TEXT,
+    email             TEXT,
+    status            TEXT NOT NULL DEFAULT 'active',
+    profile_json      TEXT,
+    merged_into_principal_id TEXT,
+    last_resolved_at  INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    UNIQUE(provider, tenant_key, canonical_id_type, canonical_id)
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_principal_aliases (
+    provider      TEXT NOT NULL,
+    tenant_key    TEXT NOT NULL DEFAULT '',
+    id_type       TEXT NOT NULL,
+    id_value      TEXT NOT NULL,
+    app_id        TEXT NOT NULL DEFAULT '',
+    principal_id  TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY(provider, tenant_key, id_type, id_value, app_id),
+    FOREIGN KEY(principal_id) REFERENCES multitenancy_principals(principal_id)
+);
+"""
+
+# Idempotent migrations for databases created by an earlier schema. SQLite
+# does not support `IF NOT EXISTS` on ADD COLUMN, so probe pragma_table_info.
+_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("kind", "TEXT NOT NULL DEFAULT 'user'"),
+    ("chat_id", "TEXT"),
+    ("owner_open_id", "TEXT"),
+    ("display_label", "TEXT"),
+    ("agent_id", "TEXT"),
+    ("upstream_profile", "TEXT"),
+    ("provenance", "TEXT NOT NULL DEFAULT 'auto'"),
+)
+
+_PENDING_INVITER_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("inviter_union_id", "TEXT"),
+)
+
+_AGENT_SHARE_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("share_id", "TEXT"),
+    ("grantee_principal_id", "TEXT"),
+    ("created_by_principal_id", "TEXT"),
+)
+
+# Old (pre-group) index name to drop before recreating a kind-aware version.
+_LEGACY_OPEN_ID_INDEX = "idx_routing_open_id_active"
+
+_NEW_INDEXES: tuple[tuple[str, str], ...] = (
+    # Sync-root user rows: at most one active row per open_id. Auto/group rows
+    # are exempt so one owner can accumulate multiple owned agents.
+    (
+        "idx_routing_open_id_active_user",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_open_id_active_user "
+        "ON multitenancy_routing(open_id) "
+        "WHERE active = 1 AND kind = 'user' AND provenance = 'sync' "
+        "AND open_id IS NOT NULL",
+    ),
+    # Group rows: at most one active row per chat_id. User rows are exempt.
+    (
+        "idx_routing_chat_id_active_group",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_chat_id_active_group "
+        "ON multitenancy_routing(chat_id) "
+        "WHERE active = 1 AND kind = 'group' AND chat_id IS NOT NULL",
+    ),
+    (
+        "idx_routing_active_user",
+        "CREATE INDEX IF NOT EXISTS idx_routing_active_user "
+        "ON multitenancy_routing(active, user_id)",
+    ),
+    (
+        "idx_routing_owner_open_id",
+        "CREATE INDEX IF NOT EXISTS idx_routing_owner_open_id "
+        "ON multitenancy_routing(owner_open_id, kind) "
+        "WHERE active = 1 AND owner_open_id IS NOT NULL",
+    ),
+    # Agent selection uses agent_id as the stable handle, so active rows must
+    # stay globally unique when agent_id is populated by migration/backfill.
+    (
+        "idx_routing_agent_id_active",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_agent_id_active "
+        "ON multitenancy_routing(agent_id) "
+        "WHERE active = 1 AND agent_id IS NOT NULL",
+    ),
+    # Group/user agent listings derive the immediate upstream profile through
+    # this column, so keep active non-NULL values cheaply queryable.
+    (
+        "idx_routing_upstream",
+        "CREATE INDEX IF NOT EXISTS idx_routing_upstream "
+        "ON multitenancy_routing(upstream_profile) "
+        "WHERE active = 1 AND upstream_profile IS NOT NULL",
+    ),
+    (
+        "idx_agent_shares_grantee_active",
+        "CREATE INDEX IF NOT EXISTS idx_agent_shares_grantee_active "
+        "ON multitenancy_agent_shares(grantee_open_id, agent_id) "
+        "WHERE status = 'active'",
+    ),
+    (
+        "idx_agent_shares_share_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_shares_share_id "
+        "ON multitenancy_agent_shares(share_id) "
+        "WHERE share_id IS NOT NULL",
+    ),
+    (
+        "idx_agent_shares_principal_active",
+        "CREATE INDEX IF NOT EXISTS idx_agent_shares_principal_active "
+        "ON multitenancy_agent_shares(grantee_principal_id, agent_id) "
+        "WHERE status = 'active' AND grantee_principal_id IS NOT NULL",
+    ),
+    (
+        "idx_principal_aliases_principal",
+        "CREATE INDEX IF NOT EXISTS idx_principal_aliases_principal "
+        "ON multitenancy_principal_aliases(principal_id)",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class RoutingRow:
+    user_id: str
+    profile_name: str
+    open_id: Optional[str]
+    union_id: Optional[str]
+    active: bool
+    last_active_at: Optional[int]
+    synced_at: int
+    version: int
+    kind: str = KIND_USER
+    chat_id: Optional[str] = None
+    owner_open_id: Optional[str] = None
+    display_label: Optional[str] = None
+    # Multi-user/multi-agent columns (US-03/US-04). Defaulted + Optional so
+    # callers and column-list SELECTs that predate them keep working; SELECT *
+    # lookups (e.g. lookup_agent) populate them from the row.
+    agent_id: Optional[str] = None
+    provenance: Optional[str] = None
+    upstream_profile: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TenantContext:
+    """Strongly-typed, resolved tenant identity for a single dispatch (P0-2).
+
+    Built only from an ACTIVE routing row (deleted/inactive → no context →
+    caller denies). ``user_key`` is the stable session/memory key (open_id
+    first; the alias is never the primary key). ``route_version`` lets session
+    scopes invalidate when the routing row changes.
+    """
+
+    profile_name: str
+    open_id: Optional[str]
+    union_id: Optional[str]
+    user_key: str
+    kind: str
+    chat_id: Optional[str]
+    owner_open_id: Optional[str]
+    route_version: int
+
+    @property
+    def is_group(self) -> bool:
+        return self.kind == KIND_GROUP
+
+
+@dataclass(frozen=True)
+class AgentShareRow:
+    agent_id: str
+    grantee_open_id: str
+    role: str
+    status: str
+    created_by_open_id: str
+    created_at: int
+    updated_at: int
+    revoked_at: Optional[int] = None
+    share_id: Optional[str] = None
+    grantee_principal_id: Optional[str] = None
+    created_by_principal_id: Optional[str] = None
+    principal_provider: Optional[str] = None
+    principal_tenant_key: Optional[str] = None
+    principal_canonical_id_type: Optional[str] = None
+    principal_canonical_id: Optional[str] = None
+    principal_display_name: Optional[str] = None
+    principal_avatar_url: Optional[str] = None
+    principal_email: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PrincipalRow:
+    principal_id: str
+    provider: str
+    tenant_key: str
+    canonical_id_type: str
+    canonical_id: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    email: Optional[str] = None
+    status: str = "active"
+    profile_json: Optional[str] = None
+    merged_into_principal_id: Optional[str] = None
+    last_resolved_at: int = 0
+    created_at: int = 0
+    updated_at: int = 0
+
+
+@dataclass(frozen=True)
+class SharedAgentRow:
+    route: RoutingRow
+    share: AgentShareRow
+
+
+_AGENT_SHARE_SELECT_SQL = """
+SELECT
+    s.agent_id,
+    s.grantee_open_id,
+    s.share_id,
+    s.grantee_principal_id,
+    s.role,
+    s.status,
+    s.created_by_open_id,
+    s.created_by_principal_id,
+    s.created_at,
+    s.updated_at,
+    s.revoked_at,
+    p.provider AS p_provider,
+    p.tenant_key AS p_tenant_key,
+    p.canonical_id_type AS p_canonical_id_type,
+    p.canonical_id AS p_canonical_id,
+    p.display_name AS p_display_name,
+    p.avatar_url AS p_avatar_url,
+    p.email AS p_email
+FROM multitenancy_agent_shares s
+LEFT JOIN multitenancy_principals p
+  ON p.principal_id = s.grantee_principal_id
+"""
+
+
+def _serialized(method):
+    """Hold the table's RLock for the whole method — one connection, many threads.
+
+    ``check_same_thread=False`` lets several threads share this connection, and
+    they do: the gateway event loop reads routes inline while
+    ``billing_identity.prepare_billing_request`` resolves the payer on an
+    ``asyncio.to_thread`` worker. CPython's sqlite3 caches prepared statements
+    per connection, so two threads running the SAME sql step/reset the same
+    ``sqlite3_stmt`` and sqlite raises ``InterfaceError: bad parameter or other
+    API misuse``. Same RLock pattern ``SessionStore`` already uses.
+
+    Locked per whole method (not per statement) so a cursor is always drained by
+    the thread that opened it. ponytail: that means a write which blocks on the
+    cross-process credential flock also parks other threads' reads for the flock
+    timeout — go per-statement + explicit transactions if that ever bites.
+    """
+
+    @functools.wraps(method)
+    def _locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return _locked
+
+
+def _identity_serialized(method):
+    @functools.wraps(method)
+    def _locked(self, *args, **kwargs):
+        with self.identity_mutation_guard():
+            return method(self, *args, **kwargs)
+    return _locked
+
+
+class RoutingTable:
+    """SQLite-backed routing table.
+
+    Use ``RoutingTable(":memory:")`` in tests for isolation.
+    Use ``RoutingTable()`` (default) in production — points to
+    ``~/.hermes/multitenancy.db``.
+    """
+
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        self.db_path = str(db_path) if db_path is not None else str(DEFAULT_DB_PATH)
+        if self.db_path != ":memory:":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Reentrant: @_serialized methods call each other (e.g. __init__ →
+        # _migrate, upsert → lookup_*).
+        self._lock = threading.RLock()
+        # check_same_thread=False so the same connection survives across the
+        # asyncio task switches that the plugin does. Every connection touch
+        # goes through @_serialized so the threads sharing it never interleave.
+        # lark-bridge fans one Feishu WS out to multiple gateway processes, so
+        # several RoutingTable connections write this DB concurrently
+        # (touch_active_group fires on every group message). connect_shared
+        # sets the wait, WAL and synchronous=NORMAL that every store on this
+        # file now shares — see shared_db.py for the measurements.
+        self._conn = connect_shared(self.db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._migrate()
+        self._conn.commit()
+
+    @contextlib.contextmanager
+    def identity_mutation_guard(self) -> Iterator[None]:
+        # ponytail: one lock per routing DB; partition only if identity changes
+        # contend. Session/heartbeat writes never take this lock or a DB transaction.
+        with self._lock:
+            if self.db_path == ":memory:" or getattr(self, "_identity_guard_depth", 0):
+                yield
+                return
+            path = str(Path(self.db_path).resolve()) + ".identity.lock"
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                    raise RouteIdentityConflictError("routing identity lock is unsafe")
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._identity_guard_depth = 1
+                try:
+                    yield
+                finally:
+                    self._identity_guard_depth = 0
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    @_serialized
+    def _active_user_identity(self, user_id: str) -> tuple[str, str] | None:
+        row = self._conn.execute(
+            "SELECT profile_name, open_id FROM multitenancy_routing "
+            "WHERE user_id = ? AND active = 1 AND kind = 'user' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if row is None or not row["open_id"]:
+            return None
+        return str(row["profile_name"]), str(row["open_id"])
+
+    @contextlib.contextmanager
+    def _credential_identity_locks(
+        self,
+        identities: set[tuple[str, str]],
+    ) -> Iterator[None]:
+        if self.db_path == ":memory:":
+            # In-memory tables are single-process test fixtures and cannot
+            # participate in the profile-local cross-process flock protocol.
+            yield
+            return
+        shared_home = Path(self.db_path).parent
+        with contextlib.ExitStack() as stack:
+            for profile_name, open_id in sorted(identities):
+                try:
+                    stack.enter_context(
+                        credential_identity_lock(
+                            shared_home,
+                            profile_name,
+                            open_id,
+                            timeout_seconds=_ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS,
+                            create_missing=False,
+                        )
+                    )
+                except CredentialIdentityLockTimeout:
+                    logger.warning(
+                        "Timed out acquiring credential identity lock for route update "
+                        "(profile_name=%s, open_id=%s, timeout_seconds=%s)",
+                        profile_name,
+                        open_id,
+                        _ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS,
+                    )
+                    raise
+            yield
+
+    @_identity_serialized
+    def _migrate(self) -> None:
+        """Bring an older DB up to the current schema. Safe to call repeatedly."""
+        cur = self._conn.execute("PRAGMA table_info(multitenancy_routing)")
+        existing_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _NEW_COLUMNS:
+            if col_name not in existing_cols:
+                self._conn.execute(
+                    f"ALTER TABLE multitenancy_routing ADD COLUMN {col_name} {col_def}"
+                )
+
+        cur = self._conn.execute(
+            "PRAGMA table_info(multitenancy_pending_group_inviter)"
+        )
+        existing_pending_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _PENDING_INVITER_NEW_COLUMNS:
+            if col_name not in existing_pending_cols:
+                self._conn.execute(
+                    "ALTER TABLE multitenancy_pending_group_inviter "
+                    f"ADD COLUMN {col_name} {col_def}"
+                )
+
+        cur = self._conn.execute("PRAGMA table_info(multitenancy_agent_shares)")
+        existing_share_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _AGENT_SHARE_NEW_COLUMNS:
+            if col_name not in existing_share_cols:
+                self._conn.execute(
+                    f"ALTER TABLE multitenancy_agent_shares ADD COLUMN {col_name} {col_def}"
+                )
+
+        # Drop the legacy open_id unique index — its predicate doesn't include
+        # `kind`, so it would block group rows that store chat_id in open_id.
+        # The replacement (idx_routing_open_id_active_user) keeps user-row
+        # uniqueness while leaving group rows free.
+        self._conn.execute(f"DROP INDEX IF EXISTS {_LEGACY_OPEN_ID_INDEX}")
+        self._conn.execute("DROP INDEX IF EXISTS idx_routing_open_id_active_user")
+        for _name, sql in _NEW_INDEXES:
+            self._conn.execute(sql)
+
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM multitenancy_routing "
+            "WHERE active = 1 AND agent_id IS NULL"
+        )
+        needs_backfill = int(cur.fetchone()[0]) > 0
+        if needs_backfill:
+            self._conn.execute("BEGIN")
+            try:
+                # Provenance must be derived from stable columns, not profile-name
+                # shape: router auto-provision writes user_id == open_id, while
+                # Feishu sync writes distinct user_id/open_id pairs; sync profile
+                # names only sometimes keep a `feishu_` prefix, so that string
+                # shape is a weak signal and not deterministic enough for migration.
+                self._conn.execute(
+                    """
+                    UPDATE multitenancy_routing
+                    SET agent_id = user_id,
+                        owner_open_id = CASE
+                            WHEN kind = 'user' THEN COALESCE(owner_open_id, open_id)
+                            ELSE owner_open_id
+                        END,
+                        provenance = CASE
+                            WHEN kind = 'group' THEN 'group'
+                            WHEN kind = 'user' AND user_id = open_id THEN 'auto'
+                            ELSE 'sync'
+                        END
+                    WHERE active = 1 AND agent_id IS NULL
+                    """
+                )
+                self._conn.execute(
+                    """
+                    UPDATE multitenancy_routing
+                    SET upstream_profile = (
+                        SELECT u.profile_name
+                        FROM multitenancy_routing AS u
+                        WHERE u.open_id = multitenancy_routing.owner_open_id
+                          AND u.active = 1
+                          AND u.kind = 'user'
+                        LIMIT 1
+                    )
+                    WHERE active = 1
+                      AND kind = 'group'
+                      AND upstream_profile IS NULL
+                      AND agent_id IS NOT NULL
+                    """
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+        cur = self._conn.execute(
+            "SELECT agent_id, grantee_open_id FROM multitenancy_agent_shares "
+            "WHERE share_id IS NULL OR share_id = ''"
+        )
+        rows_missing_share_id = cur.fetchall()
+        for row in rows_missing_share_id:
+            self._conn.execute(
+                "UPDATE multitenancy_agent_shares SET share_id = ? "
+                "WHERE agent_id = ? AND grantee_open_id = ?",
+                (_new_share_id(), row["agent_id"], row["grantee_open_id"]),
+            )
+
+    # -- read path (router) -----------------------------------------------
+
+    @_serialized
+    def lookup_by_open_id(self, open_id: str) -> Optional[RoutingRow]:
+        """Return the active user row for open_id, or None if missing.
+
+        Restricted to ``kind = 'user'`` so group rows (which may carry an
+        owner's open_id for ACL purposes but are not the lookup key) do not
+        shadow real user routes.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE open_id = ? AND active = 1 AND kind = 'user'",
+            (open_id,),
+        )
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
+
+    @_serialized
+    def lookup_by_union_id(self, union_id: str) -> Optional[RoutingRow]:
+        """Return the active user row whose union_id column matches."""
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE union_id = ? AND active = 1 AND kind = 'user'",
+            (union_id,),
+        )
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
+
+    @_serialized
+    def lookup_users_by_union_id(self, union_id: str) -> list[RoutingRow]:
+        """Return every active sync-owned user row for union_id."""
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE union_id = ? AND active = 1 AND kind = 'user' "
+            "AND provenance = 'sync'",
+            (union_id,),
+        )
+        return [_row_to_dataclass(row) for row in cur.fetchall()]
+
+    @_serialized
+    def lookup_by_user_id(self, user_id: str) -> Optional[RoutingRow]:
+        """Return the active row by tenant user_id (PRIMARY KEY).
+
+        Closes the third lookup channel: open_id / union_id / user_id. Used
+        when sync upstream (e.g. Feishu Contact v3) hands router a stable
+        user_id but neither open_id nor union_id, or when callers prefer the
+        canonical PK.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing WHERE user_id = ? AND active = 1 LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    def resolve_context(
+        self,
+        sender: str,
+        *,
+        alt_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> Optional[TenantContext]:
+        """Resolve a dispatch's sender into a typed, ACTIVE TenantContext, or
+        None (caller must deny / auto-provision). Single fail-closed entry: a
+        deleted/inactive/unknown sender yields None because every lookup filters
+        ``active = 1``. The session ``user_key`` is stable (open_id first; the
+        alias is only a last-resort fallback, never the primary key).
+        """
+        sender_key = str(sender or "").strip()
+        row: Optional[RoutingRow] = None
+        # Group dispatch: bind by chat_id (stable owner/profile per chat).
+        if chat_id:
+            row = self.lookup_by_chat_id(str(chat_id))
+        if row is None and sender_key and sender_key != "unknown":
+            row = self.lookup_by_open_id(sender_key) or self.lookup_by_union_id(sender_key)
+        alt_key = str(alt_id or "").strip()
+        if row is None and alt_key:  # legacy alias is a LOOKUP helper only
+            row = self.lookup_by_user_id(alt_key)
+        if row is None or not row.active:
+            return None
+        # Stable user key: open_id first, never the alias as primary.
+        user_key = (
+            (sender_key if sender_key and sender_key != "unknown" else "")
+            or str(row.open_id or "")
+            or str(row.user_id or "")
+            or (alt_key or "unknown")
+        )
+        return TenantContext(
+            profile_name=row.profile_name,
+            open_id=row.open_id,
+            union_id=row.union_id,
+            user_key=user_key,
+            kind=row.kind,
+            chat_id=row.chat_id or (str(chat_id) if chat_id else None),
+            owner_open_id=row.owner_open_id,
+            route_version=int(row.version),
+        )
+
+    @_serialized
+    def lookup_agent(self, agent_id: str) -> Optional[RoutingRow]:
+        """Return the active row for a stable agent_id, or None if missing.
+
+        Agent selection is owner-scoped at higher layers, but the lookup key
+        itself must resolve to exactly one active row across all route kinds.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE agent_id = ? AND active = 1 LIMIT 1",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    @_serialized
+    def lookup_by_profile_name(self, profile_name: str) -> Optional[RoutingRow]:
+        """Return the active row that owns ``profile_name``, if any."""
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE profile_name = ? AND active = 1 "
+            "ORDER BY (provenance = 'sync') DESC, updated_at DESC LIMIT 1",
+            (profile_name,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    @_serialized
+    def lookup_by_chat_id(self, chat_id: str) -> Optional[RoutingRow]:
+        """Return the active group row for chat_id, or None if missing.
+
+        Group profiles are keyed by Feishu ``chat_id`` (``oc_*``). User rows
+        never carry chat_id, so this is restricted to ``kind = 'group'``.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (chat_id,),
+        )
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
+
+    @_serialized
+    def resolve_billing_root(self, employee_id: str, profile_name: str) -> Optional[RoutingRow]:
+        """A billing subject and profile must identify exactly one active root."""
+        rows = self._conn.execute(
+            "SELECT * FROM multitenancy_routing WHERE active = 1 "
+            "AND (user_id = ? OR profile_name = ?)",
+            (employee_id, profile_name),
+        ).fetchmany(2)
+        if len(rows) != 1:
+            return None
+        row = _row_to_dataclass(rows[0])
+        if (row.user_id != employee_id or row.profile_name != profile_name
+                or row.kind != "user" or row.provenance != "sync" or not row.open_id):
+            return None
+        roots = self._conn.execute(
+            "SELECT user_id FROM multitenancy_routing WHERE active = 1 "
+            "AND kind = 'user' AND provenance = 'sync' AND open_id = ?",
+            (row.open_id,),
+        ).fetchmany(2)
+        return row if len(roots) == 1 else None
+
+    @_serialized
+    def resolve_owner_root(self, open_id: str) -> Optional[RoutingRow]:
+        """Return the deterministic sync-root user row for a login open_id.
+
+        Login resolution must target the single sync-owned root, not any
+        auto-provisioned sibling rows that may share the same open_id.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE open_id = ? AND active = 1 "
+            "AND kind = 'user' AND provenance = 'sync' LIMIT 1",
+            (open_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    @_serialized
+    def list_by_owner(
+        self, owner_open_id: str, *, kind: str | None = None
+    ) -> list[RoutingRow]:
+        """Return all active rows belonging to ``owner_open_id``.
+
+        Owner-scoped surfaces need the full active route set for a user, with
+        the sync root first and optional kind narrowing for legacy callers.
+        """
+        sql = (
+            "SELECT * FROM multitenancy_routing "
+            "WHERE owner_open_id = ? AND active = 1"
+        )
+        params: list[str] = [owner_open_id]
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY (provenance = 'sync') DESC, created_at ASC"
+        cur = self._conn.execute(sql, params)
+        return [_row_to_dataclass(row) for row in cur.fetchall()]
+
+    def list_agents_for_owner(self, open_id: str) -> list[RoutingRow]:
+        """Return every active agent owned by ``open_id``.
+
+        This named wrapper makes owner-wide agent enumeration explicit for
+        login-resolution and Web UI call sites that should not imply groups-only.
+        """
+        return self.list_by_owner(open_id, kind=None)
+
+    @_serialized
+    def touch_active(self, open_id: str) -> None:
+        """Update last_active_at — router-only, does NOT bump version."""
+        self._conn.execute(
+            "UPDATE multitenancy_routing SET last_active_at = ? "
+            "WHERE open_id = ? AND active = 1 AND kind = 'user'",
+            (_now(), open_id),
+        )
+        self._conn.commit()
+
+    @_serialized
+    def touch_active_group(self, chat_id: str) -> None:
+        """Update last_active_at for a group row — does NOT bump version."""
+        self._conn.execute(
+            "UPDATE multitenancy_routing SET last_active_at = ? "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (_now(), chat_id),
+        )
+        self._conn.commit()
+
+    @_serialized
+    def put_pending_inviter(
+        self,
+        chat_id: str,
+        inviter_open_id: str,
+        *,
+        inviter_union_id: Optional[str] = None,
+    ) -> None:
+        """Upsert the latest pending inviter hand-off for a group chat.
+
+        Empty ``chat_id`` / ``inviter_open_id`` are ignored so the Feishu
+        ``bot.added`` hook can stay best-effort and never crash callers.
+        """
+        if not chat_id or not inviter_open_id:
+            return
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_pending_group_inviter
+                (chat_id, inviter_open_id, inviter_union_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                inviter_open_id = excluded.inviter_open_id,
+                inviter_union_id = excluded.inviter_union_id,
+                created_at = excluded.created_at
+            """,
+            (chat_id, inviter_open_id, inviter_union_id, now),
+        )
+        self._conn.commit()
+
+    @_serialized
+    def get_pending_inviter(self, chat_id: str) -> Optional[str]:
+        """Return the raw stored inviter_open_id for ``chat_id``, if any.
+
+        This getter intentionally applies no TTL logic: callers must prune
+        explicitly via ``prune_pending_inviters`` at their natural boundaries
+        so expiry stays visible, testable, and deterministic.
+        """
+        cur = self._conn.execute(
+            "SELECT inviter_open_id FROM multitenancy_pending_group_inviter "
+            "WHERE chat_id = ? LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        return str(row["inviter_open_id"]) if row is not None else None
+
+    @_serialized
+    def get_pending_inviter_union_id(self, chat_id: str) -> Optional[str]:
+        """Return the raw stored inviter_union_id for ``chat_id``, if any."""
+        cur = self._conn.execute(
+            "SELECT inviter_union_id FROM multitenancy_pending_group_inviter "
+            "WHERE chat_id = ? LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        value = row["inviter_union_id"]
+        return str(value) if value else None
+
+    @_serialized
+    def clear_pending_inviter(self, chat_id: str) -> None:
+        """Delete a pending inviter hand-off row for ``chat_id`` if present."""
+        self._conn.execute(
+            "DELETE FROM multitenancy_pending_group_inviter WHERE chat_id = ?",
+            (chat_id,),
+        )
+        self._conn.commit()
+
+    @_serialized
+    def prune_pending_inviters(self, now: int, ttl_seconds: int) -> int:
+        """Delete expired pending inviter rows and return how many were removed."""
+        cur = self._conn.execute(
+            "DELETE FROM multitenancy_pending_group_inviter "
+            "WHERE created_at < ?",
+            (now - ttl_seconds,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    # -- write path (feishu-sync) ----------------------------------------
+
+    @_identity_serialized
+    def upsert(
+        self,
+        *,
+        user_id: str,
+        profile_name: str,
+        open_id: str,
+        union_id: Optional[str] = None,
+        provenance: str = "auto",
+    ) -> None:
+        """Insert or refresh a USER route. Bumps version, sets synced_at to now."""
+        for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):
+            previous_identity = self._active_user_identity(user_id)
+            # Known gotcha: _store_uat's in-lock route check is a TOCTOU unless
+            # route writers hold the same old/new credential identity lock(s).
+            lock_identities = {(profile_name, open_id)}
+            if previous_identity is not None:
+                lock_identities.add(previous_identity)
+            with self._credential_identity_locks(lock_identities):
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._active_user_identity(user_id) != previous_identity:
+                        self._conn.rollback()
+                        if attempt + 1 >= _ROUTE_IDENTITY_RETRY_LIMIT:
+                            raise RouteIdentityConflictError(
+                                f"route identity kept changing for user_id={user_id}"
+                            )
+                        continue
+                    now = _now()
+                    self._conn.execute(
+                        """
+                        INSERT INTO multitenancy_routing
+                            (user_id, profile_name, open_id, union_id, active,
+                             synced_at, version, created_at, updated_at, kind, provenance)
+                        VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user', ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            profile_name = excluded.profile_name,
+                            open_id      = excluded.open_id,
+                            union_id     = excluded.union_id,
+                            active       = 1,
+                            deleted_at   = NULL,
+                            synced_at    = excluded.synced_at,
+                            version      = version + 1,
+                            updated_at   = excluded.updated_at,
+                            kind         = 'user',
+                            provenance   = excluded.provenance
+                        """,
+                        (
+                            user_id,
+                            profile_name,
+                            open_id,
+                            union_id,
+                            now,
+                            now,
+                            now,
+                            provenance,
+                        ),
+                    )
+                    self._conn.commit()
+                    return
+                except Exception:
+                    self._conn.rollback()
+                    raise
+        raise RouteIdentityConflictError(
+            f"route identity kept changing for user_id={user_id}"
+        )
+
+    @_identity_serialized
+    def upsert_group(
+        self,
+        *,
+        chat_id: str,
+        profile_name: str,
+        owner_open_id: str,
+        display_label: Optional[str] = None,
+        upstream_profile: Optional[str] = None,
+    ) -> str:
+        """Insert or refresh a GROUP route keyed by chat_id.
+
+        Returns the synthetic ``user_id`` (``group:<chat_id>``) used as the
+        PRIMARY KEY for the row, so callers can soft-delete by it later.
+
+        ``owner_open_id`` is immutable on a resurrected row — if a row with
+        the same chat_id already exists, owner_open_id is preserved.
+        ``display_label`` is mutable (group renames refresh it).
+        ``upstream_profile`` records the owner's root profile when known; if
+        omitted, it is derived from the active sync-root row for owner_open_id.
+        """
+        if not chat_id:
+            raise ValueError("chat_id is required for group routing rows")
+        if not owner_open_id:
+            raise ValueError("owner_open_id is required for group routing rows")
+        synthetic_user_id = f"group:{chat_id}"
+        now = _now()
+        # Atomic upsert mirroring the user `upsert` above. The two-step
+        # SELECT-then-(INSERT|UPDATE) it replaced raced two concurrent
+        # first-provisions into a lost-message DoS (one INSERT won the
+        # chat_id unique index, the other raised IntegrityError that the
+        # caller swallowed into a "no profile" reply). owner_open_id stays
+        # immutable: ON CONFLICT keeps the stored owner whenever it is
+        # already a non-empty value, only adopting the proposed owner when
+        # the row was never owned. display_label keeps its old value when
+        # the caller passes None (excluded.display_label IS NULL).
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_routing
+                (user_id, profile_name, open_id, union_id, active,
+                 synced_at, version, created_at, updated_at,
+                 kind, chat_id, owner_open_id, display_label,
+                 agent_id, provenance, upstream_profile)
+            VALUES (?, ?, '', NULL, 1, ?, 1, ?, ?,
+                    'group', ?, ?, ?, ?, 'group',
+                    COALESCE(
+                        ?,
+                        (
+                            SELECT profile_name
+                            FROM multitenancy_routing
+                            WHERE open_id = ?
+                              AND active = 1
+                              AND kind = 'user'
+                              AND provenance = 'sync'
+                            LIMIT 1
+                        )
+                    ))
+            ON CONFLICT(user_id) DO UPDATE SET
+                profile_name  = excluded.profile_name,
+                chat_id       = excluded.chat_id,
+                owner_open_id = COALESCE(
+                    NULLIF(owner_open_id, ''), excluded.owner_open_id
+                ),
+                display_label = COALESCE(
+                    excluded.display_label, display_label
+                ),
+                active        = 1,
+                deleted_at    = NULL,
+                synced_at     = excluded.synced_at,
+                version       = version + 1,
+                updated_at    = excluded.updated_at,
+                kind          = 'group',
+                agent_id      = COALESCE(agent_id, excluded.agent_id),
+                provenance    = 'group',
+                upstream_profile = COALESCE(
+                    upstream_profile, excluded.upstream_profile
+                ),
+                open_id       = '',
+                union_id      = NULL
+            """,
+            (
+                synthetic_user_id,
+                profile_name,
+                now,
+                now,
+                now,
+                chat_id,
+                owner_open_id,
+                display_label,
+                synthetic_user_id,
+                upstream_profile,
+                owner_open_id,
+            ),
+        )
+        self._conn.commit()
+        return synthetic_user_id
+
+    @_identity_serialized
+    def upsert_owned_agent(
+        self,
+        *,
+        agent_id: str,
+        profile_name: str,
+        owner_open_id: str,
+        display_label: Optional[str] = None,
+        upstream_profile: Optional[str] = None,
+    ) -> str:
+        """Insert or refresh a WebUI-owned agent route keyed by agent_id."""
+        if not agent_id:
+            raise ValueError("agent_id is required for agent routing rows")
+        if not owner_open_id:
+            raise ValueError("owner_open_id is required for agent routing rows")
+        existing = self.lookup_agent(agent_id)
+        if existing is not None and existing.owner_open_id != owner_open_id:
+            raise ValueError("agent_id does not belong to asserted owner")
+
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_routing
+                (user_id, profile_name, open_id, union_id, active,
+                 synced_at, version, created_at, updated_at,
+                 kind, chat_id, owner_open_id, display_label,
+                 agent_id, provenance, upstream_profile)
+            VALUES (?, ?, ?, NULL, 1, ?, 1, ?, ?,
+                    'agent', NULL, ?, ?, ?, 'webui-agent',
+                    COALESCE(
+                        ?,
+                        (
+                            SELECT profile_name
+                            FROM multitenancy_routing
+                            WHERE open_id = ?
+                              AND active = 1
+                              AND kind = 'user'
+                              AND provenance = 'sync'
+                            LIMIT 1
+                        )
+                    ))
+            ON CONFLICT(user_id) DO UPDATE SET
+                profile_name  = excluded.profile_name,
+                open_id       = excluded.open_id,
+                union_id      = NULL,
+                active        = 1,
+                deleted_at    = NULL,
+                synced_at     = excluded.synced_at,
+                version       = version + 1,
+                updated_at    = excluded.updated_at,
+                kind          = 'agent',
+                chat_id       = NULL,
+                owner_open_id = COALESCE(
+                    NULLIF(owner_open_id, ''), excluded.owner_open_id
+                ),
+                display_label = COALESCE(
+                    excluded.display_label, display_label
+                ),
+                agent_id      = excluded.agent_id,
+                provenance    = 'webui-agent',
+                upstream_profile = COALESCE(
+                    excluded.upstream_profile, upstream_profile
+                )
+            """,
+            (
+                agent_id,
+                profile_name,
+                agent_id,
+                now,
+                now,
+                now,
+                owner_open_id,
+                display_label,
+                agent_id,
+                upstream_profile,
+                owner_open_id,
+            ),
+        )
+        self._conn.commit()
+        return agent_id
+
+    @_serialized
+    def update_display_label(self, chat_id: str, display_label: str) -> bool:
+        """Refresh a group row's display_label (e.g. after group rename).
+
+        Does NOT bump version — display label is a presentation-only field.
+        Returns True if a row was updated.
+        """
+        cur = self._conn.execute(
+            "UPDATE multitenancy_routing SET display_label = ?, updated_at = ? "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (display_label, _now(), chat_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_serialized
+    def get_group_reply_mode(self, chat_id: str) -> str:
+        """Return the per-group reply mode ('mention' | 'all'), default 'mention'.
+
+        Reads the dedicated multitenancy_group_reply_mode table — independent
+        of whether the group's routing row has been provisioned yet.
+        """
+        if not chat_id:
+            return _DEFAULT_REPLY_MODE
+        cur = self._conn.execute(
+            "SELECT mode FROM multitenancy_group_reply_mode WHERE chat_id = ? LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        mode = str(row["mode"] or "").strip() if row else ""
+        if mode in _VALID_REPLY_MODES:
+            return mode
+        return _DEFAULT_REPLY_MODE
+
+    @_serialized
+    def set_group_reply_mode(self, chat_id: str, mode: str) -> None:
+        """Upsert the per-group reply mode. Works before the group routing row
+        exists (owner can flip it from the welcome card right after bot-added).
+        """
+        if not chat_id:
+            raise ValueError("chat_id required")
+        if mode not in _VALID_REPLY_MODES:
+            raise ValueError(f"invalid reply mode: {mode}")
+        self._conn.execute(
+            "INSERT INTO multitenancy_group_reply_mode (chat_id, mode, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET mode = excluded.mode, "
+            "updated_at = excluded.updated_at",
+            (chat_id, mode, _now()),
+        )
+        self._conn.commit()
+
+    # -- agent sharing ----------------------------------------------------
+
+    @_serialized
+    def upsert_principal(
+        self,
+        *,
+        provider: str,
+        tenant_key: str = "",
+        canonical_id_type: str,
+        canonical_id: str,
+        display_name: str | None = None,
+        avatar_url: str | None = None,
+        email: str | None = None,
+        status: str = "active",
+        profile_json: str | None = None,
+        aliases: list[dict[str, str]] | None = None,
+    ) -> PrincipalRow:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        canonical_id_type = (canonical_id_type or "").strip()
+        canonical_id = (canonical_id or "").strip()
+        status = (status or "active").strip()
+        if not provider:
+            raise ValueError("provider is required")
+        if not tenant_key:
+            raise ValueError("tenant_key is required")
+        if not canonical_id_type:
+            raise ValueError("canonical_id_type is required")
+        if not canonical_id:
+            raise ValueError("canonical_id is required")
+
+        now = _now()
+        existing = self.find_principal(
+            provider=provider,
+            tenant_key=tenant_key,
+            canonical_id_type=canonical_id_type,
+            canonical_id=canonical_id,
+        )
+        principal_id = existing.principal_id if existing else _new_principal_id()
+        created_at = existing.created_at if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_principals
+                (principal_id, provider, tenant_key, canonical_id_type, canonical_id,
+                 display_name, avatar_url, email, status, profile_json,
+                 last_resolved_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, tenant_key, canonical_id_type, canonical_id) DO UPDATE SET
+                display_name = COALESCE(excluded.display_name, multitenancy_principals.display_name),
+                avatar_url = COALESCE(excluded.avatar_url, multitenancy_principals.avatar_url),
+                email = COALESCE(excluded.email, multitenancy_principals.email),
+                status = excluded.status,
+                profile_json = COALESCE(excluded.profile_json, multitenancy_principals.profile_json),
+                last_resolved_at = excluded.last_resolved_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                principal_id,
+                provider,
+                tenant_key,
+                canonical_id_type,
+                canonical_id,
+                (display_name or "").strip() or None,
+                (avatar_url or "").strip() or None,
+                (email or "").strip() or None,
+                status,
+                profile_json,
+                now,
+                created_at,
+                now,
+            ),
+        )
+        principal = self.find_principal(
+            provider=provider,
+            tenant_key=tenant_key,
+            canonical_id_type=canonical_id_type,
+            canonical_id=canonical_id,
+        )
+        if principal is None:
+            raise RuntimeError("principal upsert did not persist")
+        for alias in aliases or []:
+            self.upsert_principal_alias(
+                provider=provider,
+                tenant_key=tenant_key,
+                id_type=str(alias.get("id_type") or alias.get("type") or ""),
+                id_value=str(alias.get("id_value") or alias.get("value") or ""),
+                principal_id=principal.principal_id,
+                app_id=str(alias.get("app_id") or ""),
+            )
+        self._conn.commit()
+        return principal
+
+    @_serialized
+    def find_principal(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        canonical_id_type: str,
+        canonical_id: str,
+    ) -> Optional[PrincipalRow]:
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_principals "
+            "WHERE provider = ? AND tenant_key = ? AND canonical_id_type = ? AND canonical_id = ? "
+            "LIMIT 1",
+            (
+                (provider or "").strip(),
+                (tenant_key or "").strip(),
+                (canonical_id_type or "").strip(),
+                (canonical_id or "").strip(),
+            ),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
+    @_serialized
+    def lookup_principal(self, principal_id: str) -> Optional[PrincipalRow]:
+        principal_id = (principal_id or "").strip()
+        if not principal_id:
+            return None
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_principals WHERE principal_id = ? LIMIT 1",
+            (principal_id,),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
+    @_serialized
+    def upsert_principal_alias(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        id_type: str,
+        id_value: str,
+        principal_id: str,
+        app_id: str = "",
+    ) -> None:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        id_type = (id_type or "").strip()
+        id_value = (id_value or "").strip()
+        principal_id = (principal_id or "").strip()
+        app_id = (app_id or "").strip()
+        if not (provider and tenant_key and id_type and id_value and principal_id):
+            raise ValueError("principal alias requires provider, tenant_key, id_type, id_value, principal_id")
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_principal_aliases
+                (provider, tenant_key, id_type, id_value, app_id, principal_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, tenant_key, id_type, id_value, app_id) DO UPDATE SET
+                principal_id = excluded.principal_id,
+                updated_at = excluded.updated_at
+            """,
+            (provider, tenant_key, id_type, id_value, app_id, principal_id, now, now),
+        )
+
+    @_serialized
+    def lookup_principal_by_alias(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        id_type: str,
+        id_value: str,
+        app_id: str = "",
+    ) -> Optional[PrincipalRow]:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        id_type = (id_type or "").strip()
+        id_value = (id_value or "").strip()
+        app_id = (app_id or "").strip()
+        if not (provider and tenant_key and id_type and id_value):
+            return None
+        if id_type == "open_id" and not app_id:
+            return None
+        cur = self._conn.execute(
+            """
+            SELECT p.*
+            FROM multitenancy_principal_aliases a
+            JOIN multitenancy_principals p ON p.principal_id = a.principal_id
+            WHERE a.provider = ? AND a.tenant_key = ? AND a.id_type = ?
+              AND a.id_value = ? AND a.app_id = ?
+              AND p.status = 'active'
+            LIMIT 1
+            """,
+            (provider, tenant_key, id_type, id_value, app_id),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
+    @_serialized
+    def grant_agent_share(
+        self,
+        *,
+        agent_id: str,
+        grantee_open_id: str,
+        role: str,
+        created_by_open_id: str,
+    ) -> AgentShareRow:
+        """Grant or update non-owner access to a WebUI-owned agent."""
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        role = (role or "").strip()
+        created_by_open_id = (created_by_open_id or "").strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        if not grantee_open_id:
+            raise ValueError("grantee_open_id is required")
+        if role not in _VALID_AGENT_SHARE_ROLES:
+            raise ValueError(f"invalid agent share role: {role}")
+        if not created_by_open_id:
+            raise ValueError("created_by_open_id is required")
+        agent = self.lookup_agent(agent_id)
+        if agent is None or not agent.active:
+            raise ValueError("agent_id is not an active agent")
+        if grantee_open_id == agent.owner_open_id:
+            raise ValueError("owner is already an implicit manager")
+
+        now = _now()
+        existing = self.lookup_agent_share(agent_id, grantee_open_id)
+        share_id = existing.share_id if existing and existing.share_id else _new_share_id()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_agent_shares
+                (agent_id, grantee_open_id, share_id, role, status,
+                 created_by_open_id, created_at, updated_at, revoked_at)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)
+            ON CONFLICT(agent_id, grantee_open_id) DO UPDATE SET
+                share_id = COALESCE(multitenancy_agent_shares.share_id, excluded.share_id),
+                role = excluded.role,
+                status = 'active',
+                updated_at = excluded.updated_at,
+                revoked_at = NULL
+            """,
+            (
+                agent_id,
+                grantee_open_id,
+                share_id,
+                role,
+                created_by_open_id,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        share = self.lookup_agent_share(agent_id, grantee_open_id)
+        if share is None:
+            raise RuntimeError("agent share grant did not persist")
+        return share
+
+    @_serialized
+    def grant_agent_share_principal(
+        self,
+        *,
+        agent_id: str,
+        grantee_principal_id: str,
+        role: str,
+        created_by_open_id: str,
+        created_by_principal_id: str | None = None,
+    ) -> AgentShareRow:
+        agent_id = (agent_id or "").strip()
+        grantee_principal_id = (grantee_principal_id or "").strip()
+        role = (role or "").strip()
+        created_by_open_id = (created_by_open_id or "").strip()
+        created_by_principal_id = (created_by_principal_id or "").strip() or None
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        if not grantee_principal_id:
+            raise ValueError("grantee_principal_id is required")
+        if role not in _VALID_AGENT_SHARE_ROLES:
+            raise ValueError(f"invalid agent share role: {role}")
+        if not created_by_open_id:
+            raise ValueError("created_by_open_id is required")
+        agent = self.lookup_agent(agent_id)
+        if agent is None or not agent.active:
+            raise ValueError("agent_id is not an active agent")
+        principal = self.lookup_principal(grantee_principal_id)
+        if principal is None or principal.status != "active":
+            raise ValueError("grantee principal is not active")
+
+        now = _now()
+        grantee_key = _principal_share_key(grantee_principal_id)
+        existing = self.lookup_agent_share(agent_id, grantee_key)
+        share_id = existing.share_id if existing and existing.share_id else _new_share_id()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_agent_shares
+                (agent_id, grantee_open_id, share_id, grantee_principal_id, role, status,
+                 created_by_open_id, created_by_principal_id, created_at, updated_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)
+            ON CONFLICT(agent_id, grantee_open_id) DO UPDATE SET
+                share_id = COALESCE(multitenancy_agent_shares.share_id, excluded.share_id),
+                grantee_principal_id = excluded.grantee_principal_id,
+                role = excluded.role,
+                status = 'active',
+                created_by_principal_id = excluded.created_by_principal_id,
+                updated_at = excluded.updated_at,
+                revoked_at = NULL
+            """,
+            (
+                agent_id,
+                grantee_key,
+                share_id,
+                grantee_principal_id,
+                role,
+                created_by_open_id,
+                created_by_principal_id,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        share = self.lookup_agent_share_by_principal(agent_id, grantee_principal_id)
+        if share is None:
+            raise RuntimeError("agent principal share grant did not persist")
+        return share
+
+    @_serialized
+    def lookup_agent_share(
+        self, agent_id: str, grantee_open_id: str
+    ) -> Optional[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        if not agent_id or not grantee_open_id:
+            return None
+        cur = self._conn.execute(
+            _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ? AND s.grantee_open_id = ? LIMIT 1",
+            (agent_id, grantee_open_id),
+        )
+        row = cur.fetchone()
+        return _agent_share_row_to_dataclass(row) if row else None
+
+    @_serialized
+    def lookup_agent_share_by_principal(
+        self, agent_id: str, grantee_principal_id: str
+    ) -> Optional[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        grantee_principal_id = (grantee_principal_id or "").strip()
+        if not agent_id or not grantee_principal_id:
+            return None
+        cur = self._conn.execute(
+            _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ? AND s.grantee_principal_id = ? LIMIT 1",
+            (agent_id, grantee_principal_id),
+        )
+        row = cur.fetchone()
+        return _agent_share_row_to_dataclass(row) if row else None
+
+    def get_agent_share_role(
+        self, agent_id: str, grantee_open_id: str
+    ) -> Optional[str]:
+        share = self.lookup_agent_share(agent_id, grantee_open_id)
+        if share is None or share.status != AGENT_SHARE_STATUS_ACTIVE:
+            return None
+        return share.role
+
+    def get_agent_share_role_for_principal(
+        self, agent_id: str, grantee_principal_id: str
+    ) -> Optional[str]:
+        share = self.lookup_agent_share_by_principal(agent_id, grantee_principal_id)
+        if share is None or share.status != AGENT_SHARE_STATUS_ACTIVE:
+            return None
+        return share.role
+
+    @_serialized
+    def list_agent_shares(
+        self, agent_id: str, *, active_only: bool = True
+    ) -> list[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        if not agent_id:
+            return []
+        sql = _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ?"
+        params: list[str] = [agent_id]
+        if active_only:
+            sql += " AND s.status = ?"
+            params.append(AGENT_SHARE_STATUS_ACTIVE)
+        sql += " ORDER BY s.created_at ASC, s.grantee_open_id ASC"
+        cur = self._conn.execute(sql, params)
+        return [_agent_share_row_to_dataclass(row) for row in cur.fetchall()]
+
+    @_serialized
+    def list_shared_agents_for_actor(self, open_id: str) -> list[SharedAgentRow]:
+        open_id = (open_id or "").strip()
+        if not open_id:
+            return []
+        cur = self._conn.execute(
+            """
+            SELECT
+                r.user_id AS r_user_id,
+                r.profile_name AS r_profile_name,
+                r.open_id AS r_open_id,
+                r.union_id AS r_union_id,
+                r.active AS r_active,
+                r.deleted_at AS r_deleted_at,
+                r.synced_at AS r_synced_at,
+                r.version AS r_version,
+                r.last_active_at AS r_last_active_at,
+                r.created_at AS r_created_at,
+                r.updated_at AS r_updated_at,
+                r.kind AS r_kind,
+                r.chat_id AS r_chat_id,
+                r.owner_open_id AS r_owner_open_id,
+                r.display_label AS r_display_label,
+                r.agent_id AS r_agent_id,
+                r.upstream_profile AS r_upstream_profile,
+                r.provenance AS r_provenance,
+                s.agent_id AS s_agent_id,
+                s.grantee_open_id AS s_grantee_open_id,
+                s.role AS s_role,
+                s.status AS s_status,
+                s.created_by_open_id AS s_created_by_open_id,
+                s.created_at AS s_created_at,
+                s.updated_at AS s_updated_at,
+                s.revoked_at AS s_revoked_at
+            FROM multitenancy_agent_shares s
+            JOIN multitenancy_routing r
+              ON r.agent_id = s.agent_id
+             AND r.active = 1
+             AND r.kind = 'agent'
+            WHERE s.grantee_open_id = ?
+              AND s.status = 'active'
+            ORDER BY r.display_label ASC, r.agent_id ASC
+            """,
+            (open_id,),
+        )
+        rows: list[SharedAgentRow] = []
+        for row in cur.fetchall():
+            route = RoutingRow(
+                user_id=row["r_user_id"],
+                profile_name=row["r_profile_name"],
+                open_id=row["r_open_id"],
+                union_id=row["r_union_id"],
+                active=bool(row["r_active"]),
+                last_active_at=row["r_last_active_at"],
+                synced_at=row["r_synced_at"],
+                version=row["r_version"],
+                kind=row["r_kind"] or KIND_AGENT,
+                chat_id=row["r_chat_id"],
+                owner_open_id=row["r_owner_open_id"],
+                display_label=row["r_display_label"],
+                agent_id=row["r_agent_id"],
+                provenance=row["r_provenance"],
+                upstream_profile=row["r_upstream_profile"],
+            )
+            share = AgentShareRow(
+                agent_id=row["s_agent_id"],
+                grantee_open_id=row["s_grantee_open_id"],
+                role=row["s_role"],
+                status=row["s_status"],
+                created_by_open_id=row["s_created_by_open_id"],
+                created_at=row["s_created_at"],
+                updated_at=row["s_updated_at"],
+                revoked_at=row["s_revoked_at"],
+            )
+            rows.append(SharedAgentRow(route=route, share=share))
+        return rows
+
+    @_serialized
+    def list_shared_agents_for_principal(self, principal_id: str) -> list[SharedAgentRow]:
+        principal_id = (principal_id or "").strip()
+        if not principal_id:
+            return []
+        cur = self._conn.execute(
+            """
+            SELECT
+                r.user_id AS r_user_id,
+                r.profile_name AS r_profile_name,
+                r.open_id AS r_open_id,
+                r.union_id AS r_union_id,
+                r.active AS r_active,
+                r.deleted_at AS r_deleted_at,
+                r.synced_at AS r_synced_at,
+                r.version AS r_version,
+                r.last_active_at AS r_last_active_at,
+                r.created_at AS r_created_at,
+                r.updated_at AS r_updated_at,
+                r.kind AS r_kind,
+                r.chat_id AS r_chat_id,
+                r.owner_open_id AS r_owner_open_id,
+                r.display_label AS r_display_label,
+                r.agent_id AS r_agent_id,
+                r.upstream_profile AS r_upstream_profile,
+                r.provenance AS r_provenance,
+                s.agent_id AS s_agent_id,
+                s.grantee_open_id AS s_grantee_open_id,
+                s.share_id AS s_share_id,
+                s.grantee_principal_id AS s_grantee_principal_id,
+                s.role AS s_role,
+                s.status AS s_status,
+                s.created_by_open_id AS s_created_by_open_id,
+                s.created_by_principal_id AS s_created_by_principal_id,
+                s.created_at AS s_created_at,
+                s.updated_at AS s_updated_at,
+                s.revoked_at AS s_revoked_at
+            FROM multitenancy_agent_shares s
+            JOIN multitenancy_routing r
+              ON r.agent_id = s.agent_id
+             AND r.active = 1
+             AND r.kind = 'agent'
+            WHERE s.grantee_principal_id = ?
+              AND s.status = 'active'
+            ORDER BY r.display_label ASC, r.agent_id ASC
+            """,
+            (principal_id,),
+        )
+        rows: list[SharedAgentRow] = []
+        for row in cur.fetchall():
+            route = RoutingRow(
+                user_id=row["r_user_id"],
+                profile_name=row["r_profile_name"],
+                open_id=row["r_open_id"],
+                union_id=row["r_union_id"],
+                active=bool(row["r_active"]),
+                last_active_at=row["r_last_active_at"],
+                synced_at=row["r_synced_at"],
+                version=row["r_version"],
+                kind=row["r_kind"] or KIND_AGENT,
+                chat_id=row["r_chat_id"],
+                owner_open_id=row["r_owner_open_id"],
+                display_label=row["r_display_label"],
+                agent_id=row["r_agent_id"],
+                provenance=row["r_provenance"],
+                upstream_profile=row["r_upstream_profile"],
+            )
+            share = AgentShareRow(
+                agent_id=row["s_agent_id"],
+                grantee_open_id=row["s_grantee_open_id"],
+                role=row["s_role"],
+                status=row["s_status"],
+                created_by_open_id=row["s_created_by_open_id"],
+                created_at=row["s_created_at"],
+                updated_at=row["s_updated_at"],
+                revoked_at=row["s_revoked_at"],
+                share_id=row["s_share_id"],
+                grantee_principal_id=row["s_grantee_principal_id"],
+                created_by_principal_id=row["s_created_by_principal_id"],
+            )
+            rows.append(SharedAgentRow(route=route, share=share))
+        return rows
+
+    @_serialized
+    def revoke_agent_share(self, agent_id: str, grantee_open_id: str) -> bool:
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        if not agent_id or not grantee_open_id:
+            return False
+        now = _now()
+        cur = self._conn.execute(
+            """
+            UPDATE multitenancy_agent_shares
+            SET status = 'revoked', revoked_at = ?, updated_at = ?
+            WHERE agent_id = ? AND grantee_open_id = ? AND status = 'active'
+            """,
+            (now, now, agent_id, grantee_open_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_serialized
+    def revoke_agent_share_by_id(self, agent_id: str, share_id: str) -> bool:
+        agent_id = (agent_id or "").strip()
+        share_id = (share_id or "").strip()
+        if not agent_id or not share_id:
+            return False
+        now = _now()
+        cur = self._conn.execute(
+            """
+            UPDATE multitenancy_agent_shares
+            SET status = 'revoked', revoked_at = ?, updated_at = ?
+            WHERE agent_id = ? AND share_id = ? AND status = 'active'
+            """,
+            (now, now, agent_id, share_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_identity_serialized
+    def soft_delete(self, user_id: str) -> bool:
+        """Mark a route as inactive (kind-agnostic). Returns True on update."""
+        for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):
+            previous_identity = self._active_user_identity(user_id)
+            lock_identities = {previous_identity} if previous_identity else set()
+            with self._credential_identity_locks(lock_identities):
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._active_user_identity(user_id) != previous_identity:
+                        self._conn.rollback()
+                        if attempt + 1 >= _ROUTE_IDENTITY_RETRY_LIMIT:
+                            raise RouteIdentityConflictError(
+                                f"route identity kept changing for user_id={user_id}"
+                            )
+                        continue
+                    now = _now()
+                    cur = self._conn.execute(
+                        """
+                        UPDATE multitenancy_routing
+                        SET active = 0, deleted_at = ?, updated_at = ?, version = version + 1
+                        WHERE user_id = ? AND active = 1
+                        """,
+                        (now, now, user_id),
+                    )
+                    self._conn.commit()
+                    return cur.rowcount > 0
+                except Exception:
+                    self._conn.rollback()
+                    raise
+        raise RouteIdentityConflictError(
+            f"route identity kept changing for user_id={user_id}"
+        )
+
+    def soft_delete_group(self, chat_id: str) -> bool:
+        """Soft-delete a group row by chat_id. Returns True if a row was updated."""
+        return self.soft_delete(f"group:{chat_id}")
+
+    # -- diagnostics -------------------------------------------------------
+
+    @_serialized
+    def count_active(
+        self, *, kind: Optional[str] = None, provenance: Optional[str] = None
+    ) -> int:
+        clauses = ["active = 1"]
+        params: list[Any] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if provenance is not None:
+            clauses.append("provenance = ?")
+            params.append(provenance)
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM multitenancy_routing WHERE " + " AND ".join(clauses),
+            tuple(params),
+        )
+        return int(cur.fetchone()[0])
+
+    @_serialized
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _row_to_dataclass(row: sqlite3.Row) -> RoutingRow:
+    return RoutingRow(
+        user_id=row["user_id"],
+        profile_name=row["profile_name"],
+        open_id=row["open_id"],
+        union_id=row["union_id"],
+        active=bool(row["active"]),
+        last_active_at=row["last_active_at"],
+        synced_at=row["synced_at"],
+        version=row["version"],
+        kind=(row["kind"] if "kind" in row.keys() else KIND_USER) or KIND_USER,
+        chat_id=row["chat_id"] if "chat_id" in row.keys() else None,
+        owner_open_id=row["owner_open_id"] if "owner_open_id" in row.keys() else None,
+        display_label=row["display_label"] if "display_label" in row.keys() else None,
+        agent_id=row["agent_id"] if "agent_id" in row.keys() else None,
+        provenance=row["provenance"] if "provenance" in row.keys() else None,
+        upstream_profile=row["upstream_profile"] if "upstream_profile" in row.keys() else None,
+    )
+
+
+def _agent_share_row_to_dataclass(row: sqlite3.Row) -> AgentShareRow:
+    return AgentShareRow(
+        agent_id=row["agent_id"],
+        grantee_open_id=row["grantee_open_id"],
+        role=row["role"],
+        status=row["status"],
+        created_by_open_id=row["created_by_open_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        revoked_at=row["revoked_at"],
+        share_id=_row_get(row, "share_id"),
+        grantee_principal_id=_row_get(row, "grantee_principal_id"),
+        created_by_principal_id=_row_get(row, "created_by_principal_id"),
+        principal_provider=_row_get(row, "p_provider"),
+        principal_tenant_key=_row_get(row, "p_tenant_key"),
+        principal_canonical_id_type=_row_get(row, "p_canonical_id_type"),
+        principal_canonical_id=_row_get(row, "p_canonical_id"),
+        principal_display_name=_row_get(row, "p_display_name"),
+        principal_avatar_url=_row_get(row, "p_avatar_url"),
+        principal_email=_row_get(row, "p_email"),
+    )
+
+
+def _principal_row_to_dataclass(row: sqlite3.Row) -> PrincipalRow:
+    return PrincipalRow(
+        principal_id=row["principal_id"],
+        provider=row["provider"],
+        tenant_key=row["tenant_key"],
+        canonical_id_type=row["canonical_id_type"],
+        canonical_id=row["canonical_id"],
+        display_name=row["display_name"],
+        avatar_url=row["avatar_url"],
+        email=row["email"],
+        status=row["status"],
+        profile_json=row["profile_json"],
+        merged_into_principal_id=row["merged_into_principal_id"],
+        last_resolved_at=row["last_resolved_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_get(row: sqlite3.Row, name: str) -> Optional[str]:
+    return row[name] if name in row.keys() else None
+
+
+def _new_principal_id() -> str:
+    return "prn_" + uuid4().hex
+
+
+def _new_share_id() -> str:
+    return "shr_" + uuid4().hex
+
+
+def _principal_share_key(principal_id: str) -> str:
+    return "principal:" + principal_id
+
+
+def _now() -> int:
+    return int(time.time())

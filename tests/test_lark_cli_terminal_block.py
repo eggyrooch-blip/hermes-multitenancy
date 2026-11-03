@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def _write_executable(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _make_real_binary(path: Path, *, sentinel: str) -> Path:
+    return _write_executable(
+        path,
+        "\n".join(
+            [
+                "#!/bin/sh",
+                f"printf '{sentinel}:%s\\n' \"$*\"",
+            ]
+        )
+        + "\n",
+    )
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _strict_env(monkeypatch, tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    node_bin = tmp_path / "node_modules" / ".bin"
+    node_bin.mkdir(parents=True)
+    real_binary = _make_real_binary(shared_home / "bin" / "lark-cli-authsidecar", sentinel="REAL")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(node_bin), "/usr/bin"]))
+    monkeypatch.setenv("HERMES_LARK_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("HERMES_LARK_CLI_PROXY_KEY", "proxy-secret-value")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={"HERMES_FEISHU_USER_OPEN_ID": "ou_secret_open_id"},
+    )
+    return env, profile_home, real_binary
+
+
+def test_strict_on_shim_self_serves_direct_exec_and_audits(monkeypatch, tmp_path: Path) -> None:
+    # 2026-09-11: the strict runtime no longer refuses a direct call (see
+    # lark_cli_guard for why the path gate protected no credential). What must
+    # still hold is the audit trail, and that the audit line leaks nothing —
+    # argv here carries an access token in a query string.
+    from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
+
+    env, profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+    shim_dir = Path(env["PATH"].split(os.pathsep)[0])
+    audit_path = Path(env["HERMES_MT_SECURITY_AUDIT_PATH"])
+    token = env[HERMES_LARK_CLI_RUN_TOKEN]
+    proc = subprocess.run(
+        [str(shim_dir / "lark-cli"), "api", "GET", "/open-apis/authen/v1/user_info?access_token=token-secret-value"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert shim_dir.is_relative_to(profile_home)
+    assert proc.returncode == 0, proc.stderr
+    assert "REAL:api GET /open-apis/authen/v1/user_info?access_token=token-secret-value" in proc.stdout
+    assert token not in proc.stderr
+    assert "proxy-secret-value" not in proc.stderr
+    assert "ou_secret_open_id" not in proc.stderr
+    rows = _read_jsonl(audit_path)
+    assert rows[-1]["event_type"] == "lark_cli.direct_exec.self_served"
+    assert rows[-1]["command_name"] == "lark-cli"
+    assert rows[-1]["profile"] == "alice"
+    assert rows[-1]["open_id_hash"] == hashlib.sha256(b"ou_secret_open_id").hexdigest()[:12]
+    assert rows[-1]["argv_redacted"] == "api GET /open-apis/authen/v1/user_info"
+    serialized = json.dumps(rows[-1], ensure_ascii=False)
+    assert "token-secret-value" not in serialized
+    assert "proxy-secret-value" not in serialized
+    assert token not in serialized
+    assert "ou_secret_open_id" not in serialized
+
+
+def test_strict_on_shim_denies_bot_identity_without_leaking(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
+
+    env, _profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+    shim_dir = Path(env["PATH"].split(os.pathsep)[0])
+    audit_path = Path(env["HERMES_MT_SECURITY_AUDIT_PATH"])
+    token = env[HERMES_LARK_CLI_RUN_TOKEN]
+    proc = subprocess.run(
+        [
+            str(shim_dir / "lark-cli"),
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--content",
+            "token-secret-value",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert proc.returncode == 126
+    assert "Direct execution denied for bot identity" in proc.stderr
+    assert proc.stdout == ""
+    rows = _read_jsonl(audit_path)
+    assert rows[-1]["event_type"] == "lark_cli.direct_exec.denied"
+    assert rows[-1]["argv_redacted"] == "im +messages-send --as <redacted> --content <redacted>"
+    serialized = json.dumps(rows[-1], ensure_ascii=False)
+    assert "token-secret-value" not in serialized
+    assert token not in serialized
+    assert "ou_secret_open_id" not in serialized
+
+
+def test_strict_on_shim_authorized_execs_real_binary(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy.lark_cli_guard import (
+        HERMES_LARK_CLI_AUTHORIZED,
+        HERMES_LARK_CLI_RUN_TOKEN,
+    )
+
+    env, _profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+    shim_dir = Path(env["PATH"].split(os.pathsep)[0])
+    env = dict(env)
+    env[HERMES_LARK_CLI_AUTHORIZED] = env[HERMES_LARK_CLI_RUN_TOKEN]
+
+    proc = subprocess.run(
+        [str(shim_dir / "lark"), "doctor", "--verbose"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "REAL:doctor --verbose" in proc.stdout
+    assert proc.stderr == ""
+
+
+def test_strict_off_build_subprocess_env_keeps_existing_path_behavior(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.lark_cli_guard import (
+        HERMES_LARK_CLI_AUTHORIZED,
+        HERMES_LARK_CLI_REAL_BIN,
+        HERMES_LARK_CLI_RUN_TOKEN,
+    )
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    shared_bin = str(agent_real._resolve_shared_hermes_home(profile_home) / "bin")
+    node_bin = str(tmp_path / "node_modules" / ".bin")
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([node_bin, shared_bin, "/usr/bin"]))
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    path_parts = env["PATH"].split(os.pathsep)
+
+    assert path_parts[0] == shared_bin
+    assert path_parts.count(shared_bin) == 1
+    assert path_parts.index(node_bin) > path_parts.index(shared_bin)
+    assert HERMES_LARK_CLI_RUN_TOKEN not in env
+    assert HERMES_LARK_CLI_AUTHORIZED not in env
+    assert HERMES_LARK_CLI_REAL_BIN not in env
+    assert not (profile_home / "tmp" / "lark-cli-shim").exists()
+
+
+def test_append_security_event_hashes_open_id_and_drops_secret_fields(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy.security_audit import append_security_event
+
+    audit_path = tmp_path / "security-audit.jsonl"
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit_path))
+    # Audit now defaults OFF; this test asserts audit CONTENT so it opts in.
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
+
+    append_security_event(
+        event_type="lark_cli.direct_exec.denied",
+        profile="alice",
+        open_id="ou_secret_open_id",
+        proxy_key="proxy-secret-value",
+        run_token="run-token-secret",
+        reason="denied",
+    )
+
+    rows = _read_jsonl(audit_path)
+    assert rows == [
+        {
+            "@timestamp": rows[0]["@timestamp"],
+            "event_type": "lark_cli.direct_exec.denied",
+            "profile": "alice",
+            "open_id_hash": hashlib.sha256(b"ou_secret_open_id").hexdigest()[:12],
+            "reason": "denied",
+        }
+    ]
+
+
+def test_lark_cli_tool_strict_mode_copies_run_token_into_authorized_env(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import lark_cli_tool
+    from hermes_multitenancy.lark_cli_guard import (
+        HERMES_LARK_CLI_REAL_BIN,
+        HERMES_LARK_CLI_RUN_TOKEN,
+        install_lark_cli_shim,
+    )
+
+    profile_home = tmp_path / "profile"
+    workspace = profile_home / "workspace"
+    workspace.mkdir(parents=True)
+    shim_dir = profile_home / "tmp" / "lark-cli-shim"
+    real_binary = _make_real_binary(tmp_path / "bin" / "real-lark-cli", sentinel="TOOL")
+    install_lark_cli_shim(shim_dir, real_binary=real_binary)
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shim_dir), "/usr/bin"]))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(shim_dir / "lark-cli"))
+    monkeypatch.setenv(HERMES_LARK_CLI_REAL_BIN, str(real_binary))
+    monkeypatch.setenv(HERMES_LARK_CLI_RUN_TOKEN, "run-token-secret")
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["doctor"],
+            "risk": "read",
+            "reason": "smoke",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert "TOOL:doctor" in result["stdout"]
+
+
+def test_lark_cli_tool_rejects_missing_auth_broker_even_when_strict_context_is_off(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy import lark_cli_tool
+    from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
+
+    profile_home = tmp_path / "profile"
+    workspace = profile_home / "workspace"
+    workspace.mkdir(parents=True)
+    real_binary = _make_real_binary(tmp_path / "bin" / "real-lark-cli", sentinel="MUST_NOT_RUN")
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(real_binary))
+    monkeypatch.setenv(HERMES_LARK_CLI_RUN_TOKEN, "run-token-secret")
+    monkeypatch.delenv("LARKSUITE_CLI_AUTH_PROXY", raising=False)
+    monkeypatch.delenv("LARKSUITE_CLI_PROXY_KEY", raising=False)
+    monkeypatch.delenv("LARKSUITE_CLI_APP_ID", raising=False)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["doctor"],
+            "risk": "read",
+            "reason": "smoke",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["error"] == "lark-cli auth broker is unavailable in the current profile runtime"
+
+
+@pytest.mark.parametrize(
+    "auth_argv",
+    [
+        ["auth", "login", "--scope", "calendar:calendar:readonly"],
+        ["--profile", "personal", "auth", "login"],
+        ["-p", "work", "auth", "login"],
+        ["--profile=personal", "auth", "login"],
+        ["-p", "login"],
+        ["--env", "oauth"],
+    ],
+)
+def test_registered_lark_cli_blocks_headless_auth_login_before_spawn_when_policy_is_missing(
+    monkeypatch,
+    tmp_path: Path,
+    auth_argv,
+) -> None:
+    from hermes_multitenancy import lark_cli_tool
+
+    profile_home = tmp_path / "profile"
+    workspace = profile_home / "workspace"
+    workspace.mkdir(parents=True)
+    binary = _make_real_binary(tmp_path / "bin" / "lark-cli-authsidecar", sentinel="MUST_NOT_RUN")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
+    assert not lark_cli_tool.POLICY_PATH.exists()
+
+    spawned: list[list[str]] = []
+
+    def must_not_spawn(command, **_kwargs):
+        spawned.append(command)
+        raise AssertionError("headless auth must stop before subprocess execution")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", must_not_spawn)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": auth_argv,
+            "risk": "write",
+            "reason": "model attempted interactive OAuth",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "FEISHU_AUTH_INTERACTIVE_BLOCKED"
+    assert result["auth_required"] is True
+    assert result["auth_method"] == "official"
+    assert "/feishu_auth" in result["auth_hint"]
+    assert "WebUI" in result["auth_hint"]
+    assert spawned == []
+    visible = json.dumps(result, ensure_ascii=False).lower()
+    assert "paste token" not in visible
+    assert "provide token" not in visible
+    assert "粘贴 token" not in visible
+    assert "提供 token" not in visible
+
+
+def test_strict_env_mirrors_the_self_serve_marker_but_never_the_run_token(monkeypatch, tmp_path: Path) -> None:
+    # Regression guard for 2026-09-11: the shim's self-serve lane is reachable
+    # from terminal children ONLY through the _HERMES_FORCE_ mirror, and the run
+    # token must never travel that channel (a child holding it could mint its
+    # own AUTHORIZED grant and skip the bot-identity narrowing).
+    from hermes_multitenancy.lark_cli_guard import (
+        HERMES_LARK_CLI_RUN_TOKEN,
+        HERMES_LARK_CLI_SELF_SERVE,
+    )
+
+    env, _profile_home, _real_binary = _strict_env(monkeypatch, tmp_path)
+
+    assert env[f"_HERMES_FORCE_{HERMES_LARK_CLI_SELF_SERVE}"] == "1"
+    assert f"_HERMES_FORCE_{HERMES_LARK_CLI_RUN_TOKEN}" not in env
+    token = env[HERMES_LARK_CLI_RUN_TOKEN]
+    forced = {key: value for key, value in env.items() if key.startswith("_HERMES_FORCE_")}
+    assert token not in forced.values()

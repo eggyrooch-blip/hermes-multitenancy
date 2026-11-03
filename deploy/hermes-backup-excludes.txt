@@ -1,0 +1,27 @@
+# profiles 备份排除清单 —— 只排除"机器能重新生成"的东西，员工文件一个不落。
+# sunke 2026-08-01 拍板：排除缓存。
+#
+# 判据：删掉之后，机器能自己重新下载/重建出来的 → 排除。
+#       员工写的、agent 产出的、授权凭证 → 一律保留。
+#
+# 保留的（明确不排）：workspace/ sessions/ logs/ bin/
+#                     home/ 下的真实文件、.agents/ .kep-cli/ .lark-cli/（含授权态）
+
+# ── 每个 profile 顶层的缓存与临时目录 ──
+cache/
+tmp/
+
+# ── 包管理器缓存：npm / pip / uv 随时能重新拉 ──
+node_modules/
+.npm/
+.pylibs/
+.cache/
+.uv/
+.venv/
+
+# ── 语言运行时的编译产物 ──
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

@@ -1,0 +1,1379 @@
+"""Credential hub (`/auth`) — the 归口 aggregation: readers + card + reuse.
+
+`credential_hub` is the single credential-status aggregation in multitenancy.
+The Feishu /auth card and hermes-web-ui CredentialsView are two paths over it.
+These tests pin the read layer (all credentials), card structure, expiry
+rendering, home-dir threading, and device-flow session reuse. Subprocess-backed
+readers (feishu-project/meegle, kep-cli/kep-auth) are exercised via monkeypatch
+so no real binary is required.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+
+import pytest
+
+
+def _write_keepai(home_dir, *, token="jwt", expired_ms=None, username="owner", verified_token=None):
+    keepai = home_dir / ".keepai"
+    keepai.mkdir(parents=True, exist_ok=True)
+    lines = [f"keep_auth_token={token}"]
+    if expired_ms is not None:
+        lines.append(f"keep_auth_token_expired={expired_ms}")
+    if username is not None:
+        lines.append(f"keep_username={username}")
+    (keepai / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if verified_token is not None:
+        import hashlib
+        (keepai / "webui-auth-verified.json").write_text(
+            json.dumps({"token_sha256": hashlib.sha256(verified_token.encode()).hexdigest(),
+                        "account_hint": username}),
+            encoding="utf-8",
+        )
+
+
+# -- keep-record reader ------------------------------------------------------
+
+
+def test_keep_record_authenticated_requires_verification_marker(tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    future = int(time.time() * 1000) + 7 * 24 * 3600 * 1000
+    _write_keepai(tmp_path, token="tok123", expired_ms=future, username="owner", verified_token="tok123")
+    row = credential_hub.keep_record_status(home_dir=tmp_path, installed=True)
+    assert row.id == "keep-record"
+    assert row.status == "authenticated"
+    assert row.expires_at == future
+    assert row.account_hint == "owner"
+
+
+def test_keep_record_token_without_marker_is_unknown(tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    future = int(time.time() * 1000) + 1000
+    _write_keepai(tmp_path, token="tokA", expired_ms=future, verified_token=None)
+    row = credential_hub.keep_record_status(home_dir=tmp_path, installed=True)
+    assert row.status == "unknown"
+
+
+def test_keep_record_verified_is_source_of_truth_and_expiry_unit_normalized(tmp_path):
+    """Matches WebUI: verified marker → authenticated (expiry ignored for status).
+    keep_auth_token_expired is seconds; expires_at must be normalized to ms."""
+    from hermes_multitenancy import credential_hub
+
+    secs = 1_802_602_140  # 10-digit seconds (year ~2027)
+    _write_keepai(tmp_path, token="tokB", expired_ms=secs, verified_token="tokB")
+    row = credential_hub.keep_record_status(home_dir=tmp_path, installed=True)
+    assert row.status == "authenticated"  # verified marker wins, regardless of expiry
+    assert row.expires_at == secs * 1000  # seconds normalized to ms
+
+
+def test_keep_record_missing_when_not_installed(tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    row = credential_hub.keep_record_status(home_dir=tmp_path, installed=False)
+    assert row.status == "missing"
+
+
+def test_keep_record_needs_auth_when_installed_no_token(tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    row = credential_hub.keep_record_status(home_dir=tmp_path, installed=True)
+    assert row.status == "needs_auth"
+
+
+# -- kep-cli reader ----------------------------------------------------------
+
+
+def test_kep_cli_missing_when_not_installed(tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=False,
+    )
+    assert row.id == credential_hub.KEP_CLI_ONLINE
+    assert row.status == "missing"
+
+
+def test_kep_cli_unknown_when_token_present_no_live(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    home = tmp_path / "home"
+    keyring = home / ".kep-cli" / "keyring-fallback"
+    keyring.mkdir(parents=True)
+    (keyring / "token-key:online:p").write_bytes(b"x")
+    # no kep-auth binary present → _kep_auth_bin path won't exist → live None
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(tmp_path / "nope" / "kep-auth"))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=home, profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "unknown"
+
+
+def test_kep_cli_ignores_other_profile_token_when_no_live(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    home = tmp_path / "home"
+    keyring = home / ".kep-cli" / "keyring-fallback"
+    keyring.mkdir(parents=True)
+    (keyring / "token-key:online:other-profile").write_bytes(b"x")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(tmp_path / "nope" / "kep-auth"))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=home,
+        profile_name="p",
+        shared_home=tmp_path,
+        installed=True,
+    )
+    assert row.status == "needs_auth"
+    assert "凭证存在" not in (row.detail or "")
+
+
+def _make_jwt(exp: int) -> str:
+    """Build an unsigned-payload JWT carrying ``exp`` (epoch seconds)."""
+    import base64 as _b64
+    import json as _json
+
+    def _seg(d: dict) -> str:
+        return _b64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
+
+    return f"{_seg({'alg': 'HS256'})}.{_seg({'exp': exp})}.sig"
+
+
+def _kep_run_stub(*, status_out: str, token_out: str, token_rc: int = 0):
+    """A _run replacement that answers the `status` and `token` kep-auth calls."""
+    class _StatusProc:
+        returncode = 0
+        stdout = status_out
+        stderr = ""
+
+    class _TokenProc:
+        returncode = token_rc
+        stdout = token_out
+        stderr = ""
+
+    def _run(cmd, *a, **k):
+        return _TokenProc() if "token" in cmd else _StatusProc()
+
+    return _run
+
+
+def _kep_bin(monkeypatch, tmp_path):
+    bin_path = tmp_path / "bin" / "kep-auth"
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    bin_path.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
+    return bin_path
+
+
+def _mock_kep_identity(
+    monkeypatch,
+    *,
+    profile_name: str = "",
+    expires_at: int = 0,
+    body: dict | None = None,
+    error: Exception | None = None,
+):
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps(body if body is not None else {
+                "errorCode": 0,
+                "ok": True,
+                "data": {"payload": {"name": profile_name, "exp": expires_at}},
+            }).encode()
+
+    from hermes_multitenancy import kep_live_identity
+
+    def fake_urlopen(*_args, **_kwargs):
+        if error is not None:
+            raise error
+        return _Response()
+
+    monkeypatch.setattr(kep_live_identity, "_urlopen", fake_urlopen)
+
+
+def test_decode_jwt_exp_ms():
+    from hermes_multitenancy import credential_hub
+
+    assert credential_hub._decode_jwt_exp_ms(_make_jwt(1781058668)) == 1781058668000
+    assert credential_hub._decode_jwt_exp_ms("not.a.jwt") is None
+    assert credential_hub._decode_jwt_exp_ms("a.b") is None
+    assert credential_hub._decode_jwt_exp_ms("") is None
+    # payload without exp claim
+    import base64 as _b64, json as _json
+    noexp = "h." + _b64.urlsafe_b64encode(_json.dumps({"name": "x"}).encode()).rstrip(b"=").decode() + ".s"
+    assert credential_hub._decode_jwt_exp_ms(noexp) is None
+
+
+def test_kep_cli_authenticated_when_token_live(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600  # +1h
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "authenticated"
+    assert row.account_hint == "owner"
+    assert row.expires_at == future * 1000
+
+
+def test_kep_cli_needs_auth_when_server_rejects_locally_valid_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return b'{"errorCode":400,"ok":false,"data":null}'
+
+    from hermes_multitenancy import kep_live_identity
+    monkeypatch.setattr(kep_live_identity, "_urlopen", lambda *_a, **_k: _Response())
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "needs_auth"
+    assert "重新认证" in row.detail
+
+
+def test_kep_cli_unknown_when_live_identity_mismatches_profile(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, profile_name="another-person", expires_at=future)
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "身份校验不匹配" in row.detail
+    assert "another-person" not in row.detail
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ({"errorCode": 0, "ok": True, "data": {"payload": {"name": "owner"}}}, None),
+        (None, TimeoutError()),
+    ],
+)
+def test_kep_cli_unknown_when_live_identity_cannot_be_proven(
+    monkeypatch, tmp_path, body, error
+):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, body=body, error=error)
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "已停止使用" in row.detail
+
+
+def test_kep_cli_rate_limit_is_unknown_not_needs_auth(monkeypatch, tmp_path):
+    from urllib.error import HTTPError
+
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(
+        monkeypatch,
+        error=HTTPError("https://auth.example.com/ldap/authjwt", 429, "rate limited", {}, None),
+    )
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "暂时无法实时验证" in row.detail
+
+
+def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env = cmd[cmd.index("--env") + 1]
+        if env == "online":
+            return _Proc("state: valid\noperator: dengwenhui <dengwenhui@example.com>\n")
+        if env == "pre":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="dengwenhui", expires_at=future)
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="dengwenhui",
+        shared_home=tmp_path,
+        installed=True,
+        target_env="pre",
+        report_envs=("pre", "online"),
+    )
+
+    assert row.status == "needs_auth"
+    assert row.account_hint == "dengwenhui"
+    assert row.action["env"] == "pre"
+    assert "pre" in row.detail
+    assert "online" in row.detail
+    data = row.to_dict()
+    assert data["environments"]["pre"]["status"] == "needs_auth"
+    assert data["environments"]["online"]["status"] == "authenticated"
+    assert data["environments"]["online"]["account_hint"] == "dengwenhui"
+
+
+def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env_name = cmd[cmd.index("--env") + 1]
+        if env_name == "pre":
+            return _Proc("state: valid\noperator: owner <owner@example.com>\n")
+        if env_name == "online":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is not None
+    assert "勿再自行探活" in line
+    assert "pre=已登录: owner" in line
+    assert "online=未登录" in line
+    assert "HTTP 403" in line
+    assert "接口禁止访问" in line
+    assert "不要要求用户重新登录" in line
+
+
+def test_kep_auth_state_line_preserves_live_unknown(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, error=TimeoutError())
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is not None
+    assert "pre=暂时无法验证" in line
+    assert "online=暂时无法验证" in line
+    assert "未登录" not in line
+
+
+def test_kep_auth_state_line_returns_none_on_failure(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is None
+
+
+def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
+    """The core bug: kep-auth status says valid but the token is server-stale."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    past = int(credential_hub._now_ms() / 1000) - 3600  # expired 1h ago
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=_make_jwt(past) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=past)
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "needs_auth"
+    assert row.expires_at == past * 1000
+
+
+def test_kep_cli_needs_auth_when_token_cannot_be_fetched(monkeypatch, tmp_path):
+    """status valid but token injection fails → require authentication."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out="", token_rc=1,
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "needs_auth"
+
+
+def test_kep_cli_token_whitespace_only_needs_auth(monkeypatch, tmp_path):
+    """rc=0 but whitespace-only stdout must not raise or claim authenticated."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out="   \n\n", token_rc=0,
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "needs_auth"
+
+
+def test_kep_cli_token_with_banner_lines(monkeypatch, tmp_path):
+    """A JWT preceded by banner/warning lines is still found and decoded."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
+        token_out=f"WARNING: using cached key\n{_make_jwt(future)}\n",
+    ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "authenticated"
+    assert row.expires_at == future * 1000
+
+
+# -- feishu-project reader ---------------------------------------------------
+
+
+def test_feishu_project_missing_when_no_cli(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n, path=None: None)  # no npx either
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.id == "feishu-project"
+    assert row.status == "missing"
+    assert row.installed is False
+
+
+def test_feishu_project_npx_only_not_run_for_status(monkeypatch, tmp_path):
+    """M5: npx-only + execution gated off → installed via npx presence, no run."""
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n, path=None: "/usr/bin/npx" if n == "npx" else None)
+    called = {"ran": False}
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: called.__setitem__("ran", True) or None)
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.installed is True
+    assert row.status == "needs_auth"
+    assert called["ran"] is False  # npx must NOT be executed for a status read
+
+
+def test_feishu_project_authenticated(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"authenticated": True, "account": "owner"})
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "authenticated"
+    assert row.account_hint == "owner"
+
+
+def test_feishu_project_status_uses_only_each_profile_home(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    router_home = tmp_path / "router-home"
+    alice = tmp_path / "profiles" / "alice"
+    bob = tmp_path / "profiles" / "bob"
+    for home in (router_home, alice / "home", bob / "home"):
+        (home / ".meegle").mkdir(parents=True)
+    (router_home / ".meegle" / "authenticated").touch()
+    (bob / "home" / ".meegle" / "authenticated").touch()
+
+    meegle = tmp_path / "meegle"
+    meegle.write_text(
+        "#!/bin/sh\n"
+        "if [ -f \"$HOME/.meegle/authenticated\" ]; then\n"
+        "  printf '%s\\n' '{\"authenticated\":true}'\n"
+        "else\n"
+        "  printf '%s\\n' '{\"authenticated\":false}'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    meegle.chmod(0o755)
+    monkeypatch.setenv("HOME", str(router_home))
+    monkeypatch.setenv("HERMES_MEEGLE_BIN", str(meegle))
+
+    alice_status = credential_hub.feishu_project_status(
+        profile_dir=alice, profile_name="alice"
+    )
+    bob_status = credential_hub.feishu_project_status(
+        profile_dir=bob, profile_name="bob"
+    )
+
+    assert alice_status.status == "needs_auth"
+    assert bob_status.status == "authenticated"
+
+
+def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"authenticated": False})
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "needs_auth"
+    assert row.installed is True
+
+
+def test_feishu_project_needs_auth_for_structured_no_local_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = json.dumps({"authenticated": False, "reason": "no local token"})
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "needs_auth"
+
+
+def test_feishu_project_non_object_json_is_error(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = "null"
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "error"
+
+
+def test_feishu_project_transient_error_is_not_needs_auth(monkeypatch, tmp_path):
+    # A transient npx/network failure must NOT be collapsed to needs_auth (finding [5]).
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "npx: network error ETIMEDOUT"
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "error"          # transient → error, not a false re-auth prompt
+    assert row.status != "needs_auth"
+
+
+def test_feishu_project_terminal_error_is_needs_auth(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "token expired, please re-login (401)"
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "needs_auth"
+
+
+def test_meegle_search_path_augments_common_dirs_and_extra(monkeypatch):
+    """Parity with the WebUI reader: lookup PATH includes common node dirs +
+    HERMES_MEEGLE_EXTRA_PATHS so a narrow launchd/systemd PATH still finds npx."""
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MEEGLE_EXTRA_PATHS", "/opt/custom-node/bin")
+    parts = credential_hub._meegle_search_path("/cmd/dir").split(os.pathsep)
+    assert "/opt/homebrew/bin" in parts          # common dir always added
+    assert "/usr/local/bin" in parts
+    assert "/opt/custom-node/bin" in parts        # HERMES_MEEGLE_EXTRA_PATHS honored
+    assert "/cmd/dir" in parts                    # caller-supplied command dir
+    assert parts.count("/usr/bin") == 1           # deduped
+
+
+def test_which_meegle_resolves_npx_via_extra_path(monkeypatch, tmp_path):
+    """_which_meegle finds npx outside the bare PATH via HERMES_MEEGLE_EXTRA_PATHS."""
+    from hermes_multitenancy import credential_hub
+
+    fake = tmp_path / "nodebin"
+    fake.mkdir()
+    npx = fake / "npx"
+    npx.write_text("#!/bin/sh\n")
+    npx.chmod(0o755)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MEEGLE_EXTRA_PATHS", str(fake))
+    assert credential_hub._which_meegle("npx") == str(npx)
+
+
+def test_meegle_npx_fallback_is_version_pinned(monkeypatch):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.delenv("HERMES_MEEGLE_BIN", raising=False)
+    monkeypatch.setattr(
+        credential_hub,
+        "_which_meegle",
+        lambda name: "/usr/bin/npx" if name == "npx" else None,
+    )
+
+    assert credential_hub._meegle_invocation() == [
+        "/usr/bin/npx", "-y", "@lark-project/meegle@1.0.19"
+    ]
+
+
+# -- gitlab reader -----------------------------------------------------------
+
+
+def _gitlab_rows(profile_dir, *, installed=False):
+    """gitlab_status now emits TWO rows — (global, personal). Split them by id so a
+    reordering of the list can never silently swap what a test is asserting on."""
+    from hermes_multitenancy import credential_hub
+
+    rows = credential_hub.gitlab_status(profile_dir=profile_dir, installed=installed)
+    assert isinstance(rows, list) and len(rows) == 2, f"expected 2 gitlab rows, got {rows!r}"
+    by_id = {r.id: r for r in rows}
+    assert set(by_id) == {"gitlab", "gitlab-personal"}
+    return by_id["gitlab"], by_id["gitlab-personal"]
+
+
+def test_gitlab_configured_when_token_readable(tmp_path):
+    cred = tmp_path / "workspace" / "credentials"
+    cred.mkdir(parents=True)
+    (cred / "gitlab.token").write_text("glpat-xxx", encoding="utf-8")
+
+    global_row, personal_row = _gitlab_rows(tmp_path)
+
+    assert global_row.status == "configured"
+    # 全局卡是纯陈述：管理员运维，员工点不了 —— 客户端据 action 为空不渲染按钮
+    assert global_row.action == {}
+    # 有全局 token 不代表他绑了自己的；两张卡的状态互相独立
+    assert personal_row.status == "needs_auth"
+    assert personal_row.action.get("label") == "绑定我的 GitLab"
+
+
+def test_gitlab_missing_when_nothing(tmp_path):
+    global_row, personal_row = _gitlab_rows(tmp_path)
+
+    assert global_row.status == "missing"
+    assert personal_row.status == "needs_auth"
+
+
+def _gitlab_personal_home(tmp_path, monkeypatch, *, expires_at):
+    """A shared home whose 'alice' profile has vaulted her own gitlab token."""
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "alice"
+    profile_dir.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    vault_profile: __self__\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="alice",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "personal-alice"},
+            expires_at=expires_at,
+        )
+    finally:
+        store.close()
+    return profile_dir
+
+
+def test_gitlab_personal_vaulted_token_reads_as_configured_without_any_file(tmp_path, monkeypatch):
+    """The env-only lane must not read as 'missing'.
+
+    A personal token never lands on disk, so a file-only reader would tell the
+    exact users who just configured themselves that they are unconfigured.
+    """
+    future = 4102444800000  # 2100-01-01
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=future)
+    assert not (profile_dir / "workspace" / "credentials" / "gitlab.token").exists()
+
+    global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "configured"
+    assert personal_row.expires_at == future
+    assert "本人" in (personal_row.detail or "")
+    assert personal_row.action.get("label") == "更换"
+    # 他绑了自己的，不代表公司那个全局 token 也在 —— 这里确实没有文件
+    assert global_row.status == "needs_auth"
+
+
+def test_gitlab_expired_personal_token_asks_for_a_new_one(tmp_path, monkeypatch):
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=1000)  # long past
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "needs_auth"
+    assert "过期" in (personal_row.detail or "")
+    assert personal_row.action.get("label") == "更换"
+
+
+def test_gitlab_shared_token_offers_switching_to_a_personal_one(tmp_path, monkeypatch):
+    """有全局 token、没绑个人 token —— 这是绝大多数员工的状态。
+
+    绑定入口必须在这个状态下就可见：以前它是同一张卡上一颗叫「改用我自己的」的按钮，
+    挤在全局 token 的文案旁边，没人认得出那是绑定入口（sunke 2026-08-04 实机反馈）。
+    """
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "bob"
+    cred = profile_dir / "workspace" / "credentials"
+    cred.mkdir(parents=True)
+    (cred / "gitlab.token").write_text("global-token", encoding="utf-8")
+
+    global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert global_row.status == "configured"
+    assert "管理员" in (global_row.detail or "")
+    assert global_row.action == {}
+    assert personal_row.status == "needs_auth"
+    assert personal_row.action.get("label") == "绑定我的 GitLab"
+
+
+# -- lark-cli reader (reuses feishu_uat_auth.credential_status) --------------
+
+
+@pytest.mark.parametrize(
+    "raw_status,expected",
+    # 'expired' collapses to needs_auth — the WebUI SkillCredentialState has no
+    # 'expired'; expiry rides on the additive expires_at field instead.
+    [("valid", "authenticated"), ("expired", "needs_auth"),
+     ("missing", "needs_auth"), ("scope_missing", "needs_auth"), ("weird", "unknown")],
+)
+def test_lark_cli_status_maps_feishu_status(monkeypatch, tmp_path, raw_status, expected):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    exp = int(time.time() * 1000) + 3600_000
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": raw_status, "expires_at": exp})
+    row = credential_hub.lark_cli_status(profile_name="s", open_id="ou_s", shared_home=tmp_path)
+    assert row.id == "lark-cli"
+    assert row.status == expected
+    assert row.expires_at == exp
+
+
+def test_lark_cli_status_degrades_on_error(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    def _boom(**kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", _boom)
+    row = credential_hub.lark_cli_status(profile_name="s", open_id="ou_s", shared_home=tmp_path)
+    assert row.status == "unknown"
+
+
+def test_lark_cli_authenticated_via_file_cache_when_db_missing(monkeypatch, tmp_path):
+    """C1 parity: DB says missing but feishu_uat/*.json cache is valid → authenticated."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {}})
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    (uat / "ou_x.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": int(time.time() * 1000) + 3600_000}),
+        encoding="utf-8",
+    )
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "authenticated"
+
+
+def test_lark_cli_authenticated_via_file_cache_when_status_reader_keyless_error(monkeypatch, tmp_path):
+    """P0: keyless vault status errors must not hide a valid profile-local UAT."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    def _keyless_error(**kw):
+        raise RuntimeError("credential encryption key is required")
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", _keyless_error)
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    future = int(time.time() * 1000) + 3600_000
+    (uat / "ou_s.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": future}),
+        encoding="utf-8",
+    )
+
+    row = credential_hub.lark_cli_status(
+        profile_name="s",
+        open_id="ou_s",
+        shared_home=tmp_path,
+        profile_dir=tmp_path,
+    )
+
+    assert row.status == "authenticated"
+    assert row.expires_at == future
+    assert row.default_identity == "user"
+
+
+def test_lark_cli_not_authenticated_when_keyless_vault_metadata_has_no_runtime_access(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "credential_status",
+        lambda **kw: {
+            "status": "valid",
+            "storage": "multitenancy_db",
+            "has_payload": True,
+            "runtime_available": False,
+            "lark_cli": {},
+        },
+    )
+
+    row = credential_hub.lark_cli_status(
+        profile_name="s",
+        open_id="ou_s",
+        shared_home=tmp_path,
+        profile_dir=tmp_path,
+    )
+
+    assert row.status == "unknown"
+
+
+def test_lark_cli_authenticated_via_default_identity_user(monkeypatch, tmp_path):
+    """C1 parity: DB missing, no file cache, but lark_cli.default_identity == user."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {"default_identity": "user"}})
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "authenticated"
+    assert row.default_identity == "user"
+
+
+def test_lark_cli_file_cache_ignores_expired_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {}})
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    (uat / "ou_x.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": int(time.time() * 1000) - 1000}),
+        encoding="utf-8",
+    )
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "needs_auth"  # expired cache must not count as connected
+
+
+# -- requirement detection parity (M4) ---------------------------------------
+
+
+def test_skillhub_sourced_skill_requires_kep_cli(tmp_path):
+    """M4: a SkillHub-sourced skill forces kep-cli requirement even w/o kep text."""
+    from hermes_multitenancy import credential_hub
+
+    skills_root = tmp_path / "skills"
+    (skills_root / ".hub").mkdir(parents=True)
+    (skills_root / ".hub" / "lock.json").write_text(
+        json.dumps({"installed": {"some-hub-skill": {"version": "1.0.0"}}}), encoding="utf-8"
+    )
+    sk = skills_root / "some-hub-skill"
+    sk.mkdir()
+    (sk / "SKILL.md").write_text("name: some-hub-skill\njust a normal skill\n", encoding="utf-8")
+
+    scanned = credential_hub.scan_profile_skills(tmp_path)
+    hub_skill = next(s for s in scanned if s.name == "some-hub-skill")
+    assert hub_skill.source == "hub"
+    assert "kep-cli" in credential_hub.detect_skill_requirements(hub_skill)
+
+
+def test_resource_delivery_plain_skills_default_kep_cli_to_pre(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    profile = tmp_path / "profiles" / "owner"
+    for name, body in {
+        "using-resource-delivery": "# x\n",
+        "kep-trevi-delivery-orchestrate": "Gates: approve requires confirmation.\n",
+    }.items():
+        skill = profile / "skills" / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"})
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env = cmd[cmd.index("--env") + 1]
+        if env == "online":
+            return _Proc("state: valid\noperator: owner <owner@example.com>\n")
+        if env == "pre":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=tmp_path,
+    )
+    by_id = {row.id: row for row in rows}
+
+    assert by_id["kep-cli-online"].status == "authenticated"
+    assert by_id["kep-cli-online"].required_by == []
+    assert by_id["kep-cli-pre"].status == "needs_auth"
+    assert by_id["kep-cli-pre"].required_by == [
+        "kep-trevi-delivery-orchestrate",
+        "using-resource-delivery",
+    ]
+
+
+def test_requirement_patterns_cover_proximity_and_oauth(tmp_path):
+    """M4: ported TS patterns — lark proximity + gitlab oauth2 inline form."""
+    from hermes_multitenancy.credential_hub import _ProfileSkill, detect_skill_requirements
+
+    lark = _ProfileSkill(name="x", text="this uses feishu docx export", tags=[])
+    assert "lark-cli" in detect_skill_requirements(lark)
+    gl = _ProfileSkill(name="y", text="clone via oauth2:${gitlab_token}@host", tags=[])
+    assert "gitlab" in detect_skill_requirements(gl)
+
+
+# -- aggregation -------------------------------------------------------------
+
+
+def test_collect_returns_all_credentials_in_order(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "valid", "expires_at": int(time.time() * 1000) + 1000})
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    home = tmp_path / "profiles" / "owner" / "home"
+    home.mkdir(parents=True)
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner", open_id="ou_owner", shared_home=tmp_path
+    )
+    assert [r.id for r in rows] == [
+        "lark-cli",
+        "feishu-project",
+        "keep-record",
+        "kep-cli-online",
+        "kep-cli-pre",
+        "gitlab",
+        "gitlab-personal",
+    ]
+    assert rows[0].status == "authenticated"
+    # to_dict shape is SkillCredentialEntry-compatible
+    d = rows[0].to_dict()
+    for key in ("id", "title", "provider", "installed", "status", "action"):
+        assert key in d
+
+
+def test_collect_uses_explicit_home_dir_over_shared(monkeypatch, tmp_path):
+    """M1: explicit home_dir wins over shared_home-derived path; profile_dir = home.parent."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"})
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    explicit_home = tmp_path / "weird_root" / "home"
+    explicit_home.mkdir(parents=True)
+    # keep-record skill installed under profile_dir (= explicit_home.parent)
+    skill = explicit_home.parent / "skills" / "Keep" / "keep-record"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("name: keep-record\nget_qrcode keep_auth_token\n", encoding="utf-8")
+    _write_keepai(explicit_home, token="t", expired_ms=int(time.time() * 1000) + 1000, verified_token="t")
+
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner", open_id="ou_owner", shared_home=tmp_path, home_dir=explicit_home
+    )
+    keep = next(r for r in rows if r.id == "keep-record")
+    assert keep.status == "authenticated"  # found via explicit home_dir + installed via skill scan
+
+
+# -- device-flow session reuse (C2) ------------------------------------------
+
+
+def test_find_active_session_reuses_pending_and_skips_terminal(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth as fa
+
+    now = int(time.time())
+    sessions = {
+        "pending-ok": fa.FeishuAuthSession(
+            session_id="pending-ok", profile_name="owner", open_id="ou_owner",
+            device_code="d", user_code="u", verification_uri="https://x",
+            scope="", client_id="c", client_secret="s",
+            expires_at=now + 600, interval=3, status="pending"),
+        "other-user": fa.FeishuAuthSession(
+            session_id="other-user", profile_name="owner", open_id="ou_other",
+            device_code="d", user_code="u", verification_uri="https://y",
+            scope="", client_id="c", client_secret="s",
+            expires_at=now + 600, interval=3, status="pending"),
+    }
+    monkeypatch.setattr(fa, "_sessions", sessions)
+    found = fa.find_active_session(profile_name="owner", open_id="ou_owner")
+    assert found is not None and found["session_id"] == "pending-ok"
+
+    sessions["pending-ok"].status = "success"
+    assert fa.find_active_session(profile_name="owner", open_id="ou_owner") is None
+    sessions["pending-ok"].status = "pending"
+    sessions["pending-ok"].expires_at = now - 1
+    assert fa.find_active_session(profile_name="owner", open_id="ou_owner") is None
+
+
+# -- expiry rendering --------------------------------------------------------
+
+
+def test_human_expiry_phrases():
+    from hermes_multitenancy.credential_hub import human_expiry
+
+    now = 1_000_000_000_000
+    assert human_expiry(None) == ""
+    assert human_expiry(now - 1, now_ms=now) == "已过期"
+    assert human_expiry(now + 30 * 24 * 3600 * 1000, now_ms=now) == "30天后过期"
+    assert human_expiry(now + 5 * 3600 * 1000, now_ms=now) == "5小时后过期"
+    assert human_expiry(now + 10 * 60 * 1000, now_ms=now) == "10分钟后过期"
+
+
+# -- card builder ------------------------------------------------------------
+
+
+def test_build_hub_card_renders_pregenerated_entries():
+    """方案B：hub card 直接嵌入预生成 URL / QR，不再输出 callback."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [
+        CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True, status="needs_auth"),
+        CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True, status="needs_auth"),
+        CredentialRow(id="gitlab", title="GitLab", provider="gitlab", installed=False, status="missing"),
+    ]
+    card = build_hub_card(
+        rows=rows,
+        auth_urls={"lark-cli": "https://x/lark"},
+        qr_image_keys={"keep-record": "img_k"},
+    )
+    assert card["schema"] == "2.0"
+    blob = json.dumps(card, ensure_ascii=False)
+    assert "Lark-cli" in blob and "Keep-record" in blob and "GitLab" in blob
+    assert "https://x/lark" in blob
+    assert '"multi_url"' in blob
+    assert "img_k" in blob
+    assert '"tag": "img"' in blob
+    assert '"callback"' not in blob
+    assert '"cred"' not in blob
+    assert blob.count('"multi_url"') == 1
+    assert blob.count('"tag": "img"') == 1
+
+
+def test_build_hub_card_authenticated_row_without_minted_entry_has_no_control():
+    """A row with NO minted entry (not in auth_urls / qr_image_keys / pending_note)
+    renders only its status — no dead button/QR. This is the remaining invariant
+    after re-auth entries are offered for authenticated rows (sunke 2026-06-26)."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
+                          status="authenticated", action={"kind": "qr", "label": "重新授权"})]
+    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)  # nothing minted
+    assert "已认证" in blob
+    assert '"tag": "img"' not in blob
+    assert '"multi_url"' not in blob
+    assert '"callback"' not in blob
+
+
+def test_build_hub_card_authenticated_keep_record_offers_reauth_qr():
+    """sunke 2026-06-26: an authenticated keep-record row WITH a minted QR renders
+    the scannable QR (re-authenticate) so the user can re-verify on demand."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
+                          status="authenticated", action={"kind": "qr", "label": "重新认证"})]
+    blob = json.dumps(build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_k"}), ensure_ascii=False)
+    assert "已认证" in blob
+    assert '"tag": "img"' in blob
+    assert "img_k" in blob
+    assert "重新认证" in blob
+
+
+def test_build_hub_card_authenticated_lark_offers_reauth_button():
+    """issue auth-hub-lark-reauth-button: an authenticated lark row WITH a minted
+    URL must render a 重新授权 button (the hub handler always mints lark's URL so the
+    /auth card is never a dead '已认证 but no button' card for lark)."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True,
+                          status="authenticated", action={"kind": "feishu_device_flow", "label": "重新授权"})]
+    blob = json.dumps(build_hub_card(rows=rows, auth_urls={"lark-cli": "https://x"}), ensure_ascii=False)
+    assert "已认证" in blob
+    assert '"multi_url"' in blob
+    assert "https://x" in blob
+    assert "重新授权" in blob
+    assert '"callback"' not in blob
+
+
+def test_filter_hub_rows_for_auth_keeps_only_authable_mvp_creds():
+    import json
+    from hermes_multitenancy import router
+    from hermes_multitenancy.credential_hub import CredentialRow, CREDENTIAL_ORDER
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [
+        CredentialRow(id=cid, title=cid, provider=cid, installed=True, status="needs_auth")
+        for cid in CREDENTIAL_ORDER
+    ]
+    filtered = router._filter_hub_rows_for_auth(rows)
+
+    assert [row.id for row in filtered] == ["lark-cli", "keep-record", "kep-cli-online", "kep-cli-pre"]
+    assert "gitlab" not in [row.id for row in filtered]
+    assert "feishu-project" not in [row.id for row in filtered]
+
+    blob = json.dumps(build_hub_card(rows=filtered), ensure_ascii=False)
+    assert "GitLab" not in blob
+    assert "飞书项目" not in blob
+
+
+def test_qr_and_url_card_builders():
+    import json
+    from hermes_multitenancy.feishu_credential_hub_cards import build_qr_card, build_url_card
+    qr = json.dumps(build_qr_card("Keep-record", "img_v3_demo"), ensure_ascii=False)
+    assert '"tag": "img"' in qr and "img_v3_demo" in qr and "扫码" in qr
+    url = json.dumps(build_url_card("kep-cli", "https://auth.example.com/x", label_zh="前往登录"), ensure_ascii=False)
+    assert "https://auth.example.com/x" in url and "前往登录" in url
+
+
+def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, tmp_path):
+    """The readers run concurrently; output MUST stay in CREDENTIAL_ORDER even
+    when the first reader is the slowest to finish (else the UI columns reorder)."""
+    import time as _t
+    from hermes_multitenancy import credential_hub as ch
+
+    (tmp_path / "profiles" / "owner" / "home").mkdir(parents=True)
+    monkeypatch.setattr(ch, "scan_profile_skills", lambda *a, **k: [])
+    monkeypatch.setattr(ch, "_requirements_by_id", lambda *a, **k: {})
+    monkeypatch.setattr(ch, "_has_skill", lambda *a, **k: False)
+
+    def _row(cid):
+        return ch.CredentialRow(id=cid, title=cid, provider="x", installed=True, status="missing")
+
+    # lark (first) is slowest, gitlab (last) is instant — order must still hold.
+    monkeypatch.setattr(ch, "lark_cli_status", lambda **k: (_t.sleep(0.15), _row(ch.LARK_CLI))[1])
+    monkeypatch.setattr(ch, "feishu_project_status", lambda **k: _row(ch.FEISHU_PROJECT))
+    monkeypatch.setattr(ch, "keep_record_status", lambda **k: _row(ch.KEEP_RECORD))
+    monkeypatch.setattr(ch, "kep_cli_statuses", lambda **k: [_row(ch.KEP_CLI_ONLINE), _row(ch.KEP_CLI_PRE)])
+    monkeypatch.setattr(ch, "gitlab_status", lambda **k: [_row(ch.GITLAB), _row(ch.GITLAB_PERSONAL)])
+
+    rows = ch._collect_credential_rows(profile_name="owner", open_id="o", shared_home=tmp_path)
+    assert [r.id for r in rows] == list(ch.CREDENTIAL_ORDER)
+
+
+def _gitlab_group_home(tmp_path, monkeypatch, *, bound):
+    """A shared home whose 'grp' profile is a routed GROUP profile."""
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "grp"
+    profile_dir.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    vault_profile: __self__\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared / "multitenancy.db")
+    try:
+        table.upsert_group(chat_id="oc_grp", profile_name="grp", owner_open_id="ou_owner")
+    finally:
+        table.close()
+    if bound:
+        store = CredentialStore(shared / "multitenancy.db")
+        try:
+            store.put_credential(
+                profile_name="grp", subject_id="kep-prd-skills",
+                provider="gitlab", secret_kind="token",
+                payload={"token": "group-token"}, expires_at=4102444800000,
+            )
+        finally:
+            store.close()
+    return profile_dir
+
+
+def test_gitlab_group_profile_unbound_speaks_group_language(tmp_path, monkeypatch):
+    profile_dir = _gitlab_group_home(tmp_path, monkeypatch, bound=False)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "needs_auth"
+    assert "群主" in personal_row.detail
+    assert personal_row.action.get("label") == "群主绑定 GitLab"
+
+
+def test_gitlab_group_profile_bound_says_the_whole_group_shares_it(tmp_path, monkeypatch):
+    profile_dir = _gitlab_group_home(tmp_path, monkeypatch, bound=True)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "configured"
+    assert "本群所有会话共用" in personal_row.detail
+    assert personal_row.action.get("label") == "更换"
+
+
+def test_gitlab_user_profile_texts_unchanged_by_group_feature(tmp_path, monkeypatch):
+    """个人 profile 的文案一字不变（回归护栏）。"""
+    future = 4102444800000
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=future)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.detail.startswith("使用你本人提供的 GitLab token")

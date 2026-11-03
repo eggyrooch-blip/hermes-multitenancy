@@ -1,0 +1,25 @@
+# 每 10 分钟把 conversation-audit 里新增的 skill_view 调用映射成 kep-telemetry
+# lifecycle 记录并 POST 到 Hub（client=hermes、surface=cloud、不含内容/身份/路径）。
+# 安装到 hermes-1（跑 hermes 用户的 user unit）。占位符 @PYTHON@ 由 install 脚本替换。
+[Unit]
+Description=Hermes skill usage export to the kep-telemetry Hub
+After=network-online.target
+Wants=network-online.target
+# 失败即告警：模板单元读 prod 环境文件里的飞书群 webhook（URL 不入库）。
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+# 显式钉死环境：定时器不继承交互 shell。PATH 必须含 ~/.local/bin —— 凭据由
+# `kep-auth --env online inject` 现取，kep-auth 装在那里；没有它这一轮只会
+# 停在 auth_unavailable（退出码 2），不会伪造身份上传。
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin
+# 审计文件只读打开；状态（游标/台账/dead-letter）全在 $HERMES_HOME/state/kep-telemetry-export/。
+ExecStart=@PYTHON@ -m hermes_multitenancy.analytics.cli kep-telemetry-export --env online
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

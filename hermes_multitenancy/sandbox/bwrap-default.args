@@ -1,0 +1,137 @@
+# bwrap-default.args — Linux sandbox policy for AIAgent subprocesses
+#
+# Applied by hermes_multitenancy.agent_real._wrap_linux_bwrap when running on
+# Linux with HERMES_USE_SANDBOX=1. Each non-comment, non-blank line is split
+# on whitespace and substituted at runtime; ${KEY} placeholders pull from:
+#
+#   PROFILE_HOME          absolute path of the routed Hermes profile (rw)
+#   SHARED_HOME           ~/.hermes (or HERMES_SHARED_HOME)
+#   USER_HOME             real user home (host CLI dotdirs source)
+#   HERMES_VENV           Python venv root
+#   HERMES_AGENT_INSTALL  venv.parent (editable-install source root)
+#   HERMES_AGENT_REPO     hermes-agent repo (gateway/, tools/, hermes_cli/)
+#   HERMES_MT_REPO        hermes-multitenancy plugin repo
+#
+# Parallel to sandbox/profile-default.sb (macOS). When adding a path here,
+# add the equivalent allow rule there too. See sandbox-cross-platform-design.md
+# §6 for the maintenance checklist.
+
+# ── Process / namespace isolation ───────────────────────────────────
+--die-with-parent
+--new-session
+--unshare-pid
+--unshare-ipc
+--unshare-uts
+--unshare-cgroup-try
+--share-net
+
+# Minimal /dev (bwrap synthesises null/zero/full/random/urandom/tty)
+--dev /dev
+--proc /proc
+--tmpfs /tmp
+
+# ── System (read-only) ──────────────────────────────────────────────
+# RHEL 9 / CentOS Stream 9 is usr-merge: /bin /lib /lib64 /sbin are
+# symlinks into /usr/.../. Use --symlink to recreate the link structure;
+# --ro-bind /lib /lib silently breaks binary RPATHs (verified 2026-05-11
+# on internal-host: produces "execvp /usr/bin/echo: No such file or
+# directory" because ld-linux-x86-64.so.2 lookup goes through /lib64).
+# Pre-usr-merge distros can swap to four --ro-bind /lib /lib lines.
+--ro-bind /usr /usr
+--symlink usr/lib /lib
+--symlink usr/lib64 /lib64
+--symlink usr/bin /bin
+--symlink usr/sbin /sbin
+--ro-bind /etc /etc
+
+# ── Python venv + hermes source trees (read-only) ───────────────────
+# Code must not self-modify; HERMES_AGENT_INSTALL covers editable installs
+# where `import run_agent` resolves outside venv/site-packages.
+--ro-bind ${HERMES_VENV} ${HERMES_VENV}
+--ro-bind ${HERMES_AGENT_INSTALL} ${HERMES_AGENT_INSTALL}
+--ro-bind ${HERMES_AGENT_REPO} ${HERMES_AGENT_REPO}
+--ro-bind ${HERMES_MT_REPO} ${HERMES_MT_REPO}
+
+# uv-managed Python interpreter, if present. On macOS this is the canonical
+# install path; on CentOS 9 (internal-host) venv/bin/python typically symlinks
+# to /usr/bin/python3.11 instead, in which case --ro-bind-try is a no-op.
+--ro-bind-try ${USER_HOME}/.local/share/uv ${USER_HOME}/.local/share/uv
+
+# ── Shared tool binaries + legacy host CLI dotdirs ──────────────────
+# Shared Hermes-managed binaries (kep-auth, hades-cli, keep-record wrappers,
+# etc.) are executable from ${SHARED_HOME}/bin. Token state lives under the
+# routed profile via HOME=/PROFILE_HOME/home or /workspace.
+#
+# Host credential dotdirs (~/.aws, ~/.config/gh, ~/.config/git, ~/.gitconfig)
+# are deliberately NOT mounted. They hold service-account credentials, not
+# tenant-scoped ones, and read-only does not stop exfiltration. The shared
+# control-plane database (multitenancy.db + WAL/SHM) is likewise not mounted:
+# it holds routing, principals, agent shares and encrypted credential rows,
+# and no sandboxed child reads it — the gateway parent owns that access.
+--ro-bind-try ${SHARED_HOME}/bin ${SHARED_HOME}/bin
+--ro-bind-try ${SHARED_HOME}/browser-browsers ${SHARED_HOME}/browser-browsers
+
+# ── Shared hermes home — explicit allowlist only ────────────────────
+# Do NOT bind SHARED_HOME wholesale. That would expose
+# ${SHARED_HOME}/profiles/<other> as read-only and let a tenant enumerate
+# every sibling profile. Instead create the directory skeleton and mount only
+# the shared files/dirs the subprocess actually needs.
+--dir /home
+--dir ${USER_HOME}
+--dir ${SHARED_HOME}
+--dir ${SHARED_HOME}/profiles
+--dir ${PROFILE_HOME}
+--ro-bind-try ${SHARED_HOME}/config.yaml ${SHARED_HOME}/config.yaml
+--ro-bind-try ${SHARED_HOME}/active_profile ${SHARED_HOME}/active_profile
+--ro-bind-try ${SHARED_HOME}/.env ${SHARED_HOME}/.env
+--ro-bind-try ${SHARED_HOME}/auth.json ${SHARED_HOME}/auth.json
+--ro-bind-try ${SHARED_HOME}/auth.lock ${SHARED_HOME}/auth.lock
+--bind-try ${SHARED_HOME}/cron ${SHARED_HOME}/cron
+--bind-try ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
+--bind-try ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
+
+# ── Inline-authorization rendezvous — READ-ONLY, explicitly ─────────
+# The parent publishes the verified authorization result here and the blocked
+# `request_authorization` tool call polls it. Two reasons this line must exist:
+#   1. `--tmpfs /tmp` above gives the child a PRIVATE /tmp, so the old
+#      $TMPDIR-based rendezvous was invisible in here and every inline
+#      authorization timed out on Linux no matter what the parent wrote.
+#   2. Read-only is the enforcement: a writable rendezvous lets the child
+#      publish its own {"state":"success"} — a one-write self-authorization.
+#      Mode bits cannot express that (parent and child share a uid); the mount
+#      can, and the kernel enforces it.
+# `--dir` first so the ro-bind has a mountpoint even before the parent has
+# created any per-run subdirectory.
+--dir ${SHARED_HOME}/authorization
+--ro-bind-try ${SHARED_HOME}/authorization ${SHARED_HOME}/authorization
+
+# ── This profile — read + write ─────────────────────────────────────
+# Placed AFTER the SHARED_HOME ro-bind so it overrides the parent ro
+# mount (bwrap evaluates --bind / --ro-bind in source order, with the
+# last operation winning at any given path).
+--bind ${PROFILE_HOME} ${PROFILE_HOME}
+
+# OpenClaw compatibility: many existing enterprise skills hardcode
+# /workspace/... for credentials and helper scripts. Bind the routed profile's
+# workspace there so those skills run unchanged while staying tenant-scoped.
+--bind ${PROFILE_HOME}/workspace /workspace
+
+# Secret files are deliberately masked from the tool-visible filesystem.
+# agent_real._build_subprocess_env loads required values into the AIAgent
+# process env before bwrap starts; terminal/code subprocesses then strip
+# secret-like env names before executing model-generated commands.
+--ro-bind-try /dev/null ${SHARED_HOME}/.env
+# auth.json is masked with a VALID-but-EMPTY auth store (not /dev/null): the
+# host credential pool stays hidden, but hermes_cli.auth._load_auth_store can
+# parse it cleanly instead of choking on empty bytes and logging a misleading
+# "failed to parse ... Corrupt file preserved" warning on every request.
+--ro-bind-try ${HERMES_MT_REPO}/hermes_multitenancy/sandbox/empty-auth.json ${SHARED_HOME}/auth.json
+--ro-bind-try /dev/null ${SHARED_HOME}/auth.lock
+
+# ── Cross-tenant deny by construction ───────────────────────────────
+# ${SHARED_HOME}/profiles exists only as an empty directory plus the current
+# PROFILE_HOME bind. Sibling tenants are not mounted into this namespace, so
+# `find ${SHARED_HOME}/profiles -maxdepth 1` can only see the active profile.
+
+# ── Working directory pinned to profile home ────────────────────────
+--chdir ${PROFILE_HOME}

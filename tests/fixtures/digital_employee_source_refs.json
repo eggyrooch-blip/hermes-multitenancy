@@ -1,0 +1,51 @@
+{
+  "tool_result": {
+    "source_refs": [
+      {
+        "id": "web-guide",
+        "type": "web",
+        "label": "Product guide",
+        "uri": "https://docs.example.com/guide",
+        "ignored": "drop-me"
+      },
+      {
+        "id": "workspace-report",
+        "type": "workspace",
+        "label": "Run report",
+        "locator": "reports/source.txt"
+      },
+      {
+        "id": "lark-policy",
+        "type": "lark_doc",
+        "label": "Policy document",
+        "locator": "doccnFixture123"
+      }
+    ]
+  },
+  "final_event": {
+    "kind": "done",
+    "text": "",
+    "name": null,
+    "payload": {},
+    "source_refs": [
+      {
+        "id": "web-guide",
+        "type": "web",
+        "label": "Product guide",
+        "uri": "https://docs.example.com/guide"
+      },
+      {
+        "id": "workspace-report",
+        "type": "workspace",
+        "label": "Run report",
+        "locator": "reports/source.txt"
+      },
+      {
+        "id": "lark-policy",
+        "type": "lark_doc",
+        "label": "Policy document",
+        "locator": "doccnFixture123"
+      }
+    ]
+  }
+}

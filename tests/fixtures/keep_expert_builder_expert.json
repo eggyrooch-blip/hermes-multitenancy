@@ -1,0 +1,46 @@
+{
+  "id": "kep-expert-builder",
+  "name": "专家构建专家",
+  "title": "专家构建专家",
+  "tagline": "对话式创建你的业务领域专家：向导收集 → 骨架生成 → 引导填充 → 校验打包 → 送审",
+  "avatar": "/api/run-broker/plugin-assets/keep-expert-builder/kep-expert-builder-100d3e4f5a1a5d98.png",
+  "category": "研发效能",
+  "display_tags": [
+    "专家框架",
+    "元专家"
+  ],
+  "featured": false,
+  "team": null,
+  "sample_prompts": [
+    "我想把我们组的业务做成一个专家，先带我看看要准备什么",
+    "帮我给已发布的专家发个新版本，改动是更新了两个技能",
+    "建专家和写普通 skill 有什么区别？我该选哪个"
+  ],
+  "agent_md": "./agents/kep-expert-builder.md",
+  "skills": [
+    "using-expert-builder",
+    "build-expert",
+    "modify-expert",
+    "publish-expert"
+  ],
+  "governance": {
+    "env_default": "pre",
+    "approval_required": [
+      "publish-aihub --yes 实发送审",
+      "modify-expert 高危变更人工确认"
+    ],
+    "online_requires": "explicit_action"
+  },
+  "requires": {
+    "connectors": [
+      {
+        "id": "kep-cli",
+        "required": true,
+        "env": "online",
+        "purpose": "上架送审时读写 AiDock 技能中心（走 kep-auth cms 凭证）",
+        "resolved_id": "kep-cli-online"
+      }
+    ],
+    "clis": []
+  }
+}

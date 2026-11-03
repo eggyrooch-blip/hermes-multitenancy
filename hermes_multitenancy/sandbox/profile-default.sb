@@ -1,0 +1,307 @@
+;;; profile-default.sb — Hermes-multitenancy 档 B sandbox policy
+;;;
+;;; Applied to every AIAgent subprocess spawned by the multitenancy router.
+;;; Enforced by Apple's sandbox-exec(1). Wraps
+;;; ``hermes_multitenancy.agent_real._run_aiagent_subprocess`` invocation
+;;; when ``HERMES_USE_SANDBOX=1`` (gateway env or per-profile config).
+;;;
+;;; Parameters (passed via sandbox-exec -D KEY=VALUE):
+;;;
+;;;   PROFILE_HOME    — absolute path of the routed Hermes profile.
+;;;                     Writes scoped to this subtree.
+;;;   SHARED_HOME     — ~/.hermes (cron/jobs storage, snapshot cache).
+;;;   USER_HOME       — real user home (/Users/<user>). Needed because the
+;;;                     plugin runs on the host and kep-cli keeps state
+;;;                     under ~/.kep-cli. We allow READ-ONLY traversal of
+;;;                     that one dotdir, NOT the whole home. Host
+;;;                     credential dotdirs (~/.aws, ~/.config/gh,
+;;;                     ~/.config/git, ~/.gitconfig) are explicitly DENIED
+;;;                     below: they hold service-account credentials, not
+;;;                     tenant-scoped ones, and read-only does not stop
+;;;                     exfiltration.
+;;;   HERMES_VENV     — Python venv root (where the interpreter +
+;;;                     site-packages live).
+;;;   HERMES_AGENT_INSTALL — venv.parent. Editable installs leave the
+;;;                     hermes-agent source (run_agent.py, gateway/,
+;;;                     tools/) one directory up from venv/, and
+;;;                     ``import run_agent`` resolves there; allow
+;;;                     reads on this dir or the subprocess cannot
+;;;                     import the AIAgent class.
+;;;   HERMES_AGENT_REPO — hermes-agent main repo (gateway/, tools/,
+;;;                     hermes_cli/ source).
+;;;   HERMES_MT_REPO  — hermes-multitenancy plugin source.
+;;;   CODEX_BIN       — resolved Codex CLI executable for app-server runs.
+;;;   CODEX_CODE_MODE_HOST — version-matched Codex code-mode helper executable.
+;;;
+;;; If a parameter is undefined at sandbox-exec spawn time, sandbox-exec
+;;; refuses to start (visible error). Don't make any of these optional.
+
+(version 1)
+(deny default)
+
+;; Apple's import gives us the syscall baseline (mach traps, signals,
+;; sysctl-read, process-fork/exec, IOKit accesses needed by Python init).
+;; Without it macOS Python won't even boot.
+(import "system.sb")
+
+;; ── Process / IPC ─────────────────────────────────────────────────────
+
+(allow process-fork)
+(allow process-exec*
+    (subpath (param "HERMES_VENV"))
+    (literal "/usr/bin/sandbox-exec")
+    (literal "/usr/bin/env")
+    (subpath "/usr/bin")
+    (subpath "/bin")
+    (subpath "/usr/local/bin")
+    (subpath "/opt/homebrew")
+    ;; kep-cli + hades-cli + tirith live under ~/.hermes/bin/
+    (subpath (string-append (param "SHARED_HOME") "/bin"))
+    ;; Hermes native browser runtime. agent-browser lives under the upstream
+    ;; hermes-agent repo; browser binaries/cache are either profile-local or
+    ;; Hermes-managed shared cache, never the user's desktop Chrome profile.
+    (subpath (string-append (param "HERMES_AGENT_REPO") "/node_modules/.bin"))
+    (subpath (string-append (param "HERMES_AGENT_REPO") "/node_modules/agent-browser"))
+    (subpath (string-append (param "PROFILE_HOME") "/browser"))
+    (subpath (string-append (param "SHARED_HOME") "/browser-browsers"))
+    ;; uv-managed Python interpreters. venv/bin/python is typically a
+    ;; symlink to ~/.local/share/uv/python/cpython-X.Y.../python, and
+    ;; sandbox-exec checks the *resolved* binary path before allowing
+    ;; exec. Without this rule sandboxed spawn fails with
+    ;; "Operation not permitted" on execvp() (gateway 13:59-14:12 logs).
+    (subpath (string-append (param "USER_HOME") "/.local/share/uv"))
+    (subpath (param "CODEX_BIN"))
+    (subpath (param "CODEX_CODE_MODE_HOST")))
+
+;; The agent must be able to terminate child tools it spawned when a
+;; subprocess timeout fires (for example lark-cli-authsidecar). Limiting this
+;; to self blocked subprocess.run(..., timeout=...) cleanup on macOS because
+;; the timed-out child is a separate target.
+(allow signal (target children))
+(allow mach-lookup)
+(allow ipc-posix-shm)
+
+;; ── File reads — system + venv + repos ────────────────────────────────
+
+;; Resolve Homebrew interpreter symlinks without allowing /opt listing.
+(allow file-read-metadata (literal "/opt"))
+
+(allow file-read*
+    (subpath "/usr")
+    (subpath "/System")
+    (subpath "/Library")
+    (subpath "/private/var/db/timezone")
+    (subpath "/private/var/db/dyld")
+    (subpath "/private/etc")
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/urandom")
+    (literal "/dev/random")
+    (literal "/dev/tty")
+    (literal "/dev/dtracehelper")
+    ;; Python venv + source code reads.
+    ;; HERMES_AGENT_INSTALL is venv.parent; an editable install
+    ;; (``pip install -e .``) makes ``import run_agent`` resolve to
+    ;; ``<install>/run_agent.py``, not into venv/site-packages.
+    (subpath (param "HERMES_VENV"))
+    (subpath (param "HERMES_AGENT_INSTALL"))
+    (subpath (param "HERMES_AGENT_REPO"))
+    (subpath (param "HERMES_MT_REPO"))
+    (subpath (param "CODEX_BIN"))
+    (subpath (param "CODEX_CODE_MODE_HOST"))
+    (subpath "/opt/homebrew")
+    (subpath (string-append (param "SHARED_HOME") "/browser-browsers"))
+    ;; uv-managed Python install (venv/bin/python is a symlink into here).
+    ;; Must allow read AND exec — see the process-exec* block above for
+    ;; the exec rule and the rationale.
+    (subpath (string-append (param "USER_HOME") "/.local/share/uv")))
+
+;; ── Host home: ONLY the specific dotdirs host CLI tools need ──────────
+;;
+;; Path.resolve() must stat the two ancestors before reaching PROFILE_HOME.
+;; Exact metadata grants permit traversal only; they do not permit listing or
+;; reading files from the host home.
+(allow file-read-metadata
+    (literal "/Users")
+    (literal (param "USER_HOME")))
+
+;; These are READ-ONLY for the sandboxed subprocess. kep-cli still
+;; *writes* tokens via its own non-sandboxed login flow (the user runs
+;; ``kep-auth login`` in their normal shell, not from inside an AIAgent
+;; subprocess), so read-only is sufficient.
+;;
+;; If a future skill genuinely needs to update ~/.<x> from inside an
+;; agent run, prefer ``skill_storage.write_token()`` into
+;; ``<HERMES_HOME>/tokens/`` rather than widening this allowlist.
+
+(allow file-read*
+    (subpath (string-append (param "USER_HOME") "/.kep-cli")))
+
+;; Explicitly deny sensitive paths under USER_HOME so a typo above
+;; cannot accidentally widen access. Sandbox evaluates DENY rules
+;; ahead of ALLOW with the same specificity, so these win.
+(deny file-read*
+    (subpath (string-append (param "USER_HOME") "/.ssh"))
+    (subpath (string-append (param "USER_HOME") "/Library/Keychains"))
+    (subpath (string-append (param "USER_HOME") "/.password-store"))
+    (subpath (string-append (param "USER_HOME") "/.aws"))
+    (subpath (string-append (param "USER_HOME") "/.config/gh"))
+    (subpath (string-append (param "USER_HOME") "/.config/git"))
+    (literal (string-append (param "USER_HOME") "/.gitconfig")))
+
+;; ── Profile read + write ──────────────────────────────────────────────
+
+(allow file-read* file-write*
+    (subpath (param "PROFILE_HOME")))
+
+;; Shared Hermes home — needed for cron job persistence (router rebinds
+;; cron.jobs to <shared>/cron/jobs.json), and for reading the snapshot
+;; cache. NOT a free pass to read other profiles' tokens — those are
+;; subpath-denied below.
+(allow file-read* file-write*
+    (subpath (string-append (param "SHARED_HOME") "/cron"))
+    (subpath (string-append (param "SHARED_HOME") "/snapshots"))
+    (literal (string-append (param "SHARED_HOME") "/config.yaml"))
+    (literal (string-append (param "SHARED_HOME") "/active_profile"))
+    (literal (string-append (param "SHARED_HOME") "/.env"))
+    ;; Per-profile auth.json is *often* a symlink into the shared root
+    ;; (e.g. ~/.hermes/profiles/<p>/auth.json -> ~/.hermes/auth.json), and
+    ;; sandbox-exec resolves the symlink before checking the allow list.
+    ;; Allow the shared target explicitly. The .lock sibling is the
+    ;; advisory lockfile used by hermes_cli auth helpers.
+    (literal (string-append (param "SHARED_HOME") "/auth.json"))
+    (literal (string-append (param "SHARED_HOME") "/auth.lock")))
+
+;; Read shared feishu_uat (legacy fallback during migration; once OAuth
+;; callback is fixed cross-repo this can become deny).
+(allow file-read*
+    (subpath (string-append (param "SHARED_HOME") "/feishu_uat")))
+
+;; Audio cache directory for tts_tool — read AND write because hermes
+;; populates it at runtime. Verified necessary during sandbox e2e
+;; probe: ``Could not import tool module tools.tts_tool: [Errno 1]
+;; Operation not permitted: '/Users/dev/.hermes/audio_cache'``.
+(allow file-read* file-write*
+    (subpath (string-append (param "SHARED_HOME") "/audio_cache")))
+
+;; Top-level stat/readdir on SHARED_HOME. hermes_cli init scans the
+;; root to load the "permanent allowlist" + discover plugins; without
+;; metadata access it logs a confusing "Failed to load permanent
+;; allowlist" warning. file-read-metadata grants stat/readdir but not
+;; read-data — actual file contents stay denied unless an explicit
+;; literal/subpath above grants file-read*.
+(allow file-read-metadata
+    (subpath (param "SHARED_HOME")))
+
+;; NOTE: other profiles' homes (~/.hermes/profiles/<other>) are denied
+;; automatically by the (deny default) at the top of this file — there's
+;; no explicit allow for them.
+;;
+;; A previous iteration of this policy added an explicit
+;;
+;;   (deny file-read* file-write*
+;;       (subpath (string-append (param "SHARED_HOME") "/profiles")))
+;;
+;; right here, intending to make the cross-tenant denial extra-loud.
+;; That was wrong: sandbox-exec is last-match-wins (verified empirically
+;; at 14:34 — the explicit deny overrode the earlier allow for
+;; PROFILE_HOME itself, so the routed profile's auth.json became
+;; unreadable too). Default-deny + a single positive allow for
+;; PROFILE_HOME is the correct shape.
+
+;; …but re-allow the one profile we're routed to, narrower wins.
+(allow file-read* file-write*
+    (subpath (param "PROFILE_HOME")))
+
+;; ── Temp directories ──────────────────────────────────────────────────
+
+(allow file-read* file-write*
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders"))
+
+;; Path.resolve() stats the /private ancestor before reaching the allowed temp
+;; subtree. Directory metadata alone permits traversal, not file contents.
+(allow file-read-metadata
+    (literal "/private"))
+
+;; ── Inline-authorization rendezvous — readable, NEVER writable ────────
+;;
+;; The parent publishes the verified authorization result under
+;; SHARED_HOME/authorization/<per-run>/ and the blocked `request_authorization`
+;; tool call polls it. The child must read it and must NOT be able to write it:
+;; a writable rendezvous is a one-write self-authorization ("write
+;; {"state":"success"} to the path I already know"). Parent and child share a
+;; uid here, so file modes cannot express that — only the sandbox can.
+;;
+;; Order matters: sandbox-exec is last-match-wins, so the deny must follow the
+;; read allow (and follow the /private/tmp allow above, in case SHARED_HOME is
+;; ever relocated under it). Deleting is a write on the parent directory, so
+;; unlink is covered too.
+(allow file-read*
+    (subpath (string-append (param "SHARED_HOME") "/authorization")))
+(deny file-write*
+    (subpath (string-append (param "SHARED_HOME") "/authorization")))
+
+;; ── Network — outbound HTTPS / HTTP only ──────────────────────────────
+;;
+;; Default policy is "deny network" but with explicit allowance for the
+;; small set of outbound destinations a Hermes agent actually needs:
+;; LLM providers, Feishu OAPI, Lark websocket, GitLab, common web search,
+;; package indexes. Inbound connections stay denied (no servers in a
+;; subprocess), and intranet ranges (10/8, 172.16/12, 192.168/16) stay
+;; denied so a skill cannot reach the internal Keep production hosts.
+;;
+;; Apple's sandbox network grammar is coarse (no per-IP allowlist on
+;; outbound), so we rely on port + protocol filtering. Tighter
+;; per-destination policy belongs at the HTTP client layer.
+
+(allow network-outbound (remote tcp "*:443"))
+(allow network-outbound (remote tcp "*:80"))
+(allow network-outbound (remote udp "*:443"))  ;; HTTP/3
+(allow network-outbound (remote tcp "*:53"))   ;; DNS over TCP
+(allow network-outbound (remote udp "*:53"))   ;; DNS over UDP
+
+;; Allow local UNIX sockets — needed for asyncio internals, mDNS,
+;; potentially launchctl IPC if a tool legitimately introspects launchd.
+(allow network-outbound (remote unix-socket))
+(allow network-outbound (remote tcp "localhost:*"))
+(allow network-bind (local unix-socket))
+(allow network-bind (local tcp "localhost:*"))
+(allow network-bind (local udp "localhost:*"))
+
+;; Intranet egress — explicitly denied. Skills should not be able to
+;; reach 10.0.0.249 (Keep production) or any office subnet from inside
+;; the sandbox. If a legitimate use case shows up, lift this surgically
+;; under the "trusted" policy variant, not in the default.
+;;
+;; sandbox-exec does NOT support deny by IP range natively; the closest
+;; we get is "allow only specific ports / sockets". Intranet block is
+;; therefore advisory at this layer — the *real* containment is that
+;; outbound only goes through the HTTP client which can be additionally
+;; restricted at the application level.
+;;
+;; TODO: pair this policy with an outbound HTTP client interceptor that
+;; rejects RFC1918 destinations unless HERMES_ALLOW_INTRANET=1.
+
+;; Local Harness runs pass real credential paths for these parameters; normal
+;; runs pass a nonexistent sentinel. Kept last so these denies override the
+;; broad routed-profile compatibility allows above.
+(deny file-read* file-write*
+    (literal (param "HARNESS_PROFILE_ENV"))
+    (literal (param "HARNESS_PROFILE_AUTH"))
+    (subpath (param "HARNESS_PROFILE_UAT"))
+    (subpath (param "HARNESS_PROFILE_TOKENS"))
+    (subpath (param "HARNESS_PROFILE_CREDENTIALS"))
+    (subpath (param "HARNESS_PROFILE_USER_HOME"))
+    (literal (param "HARNESS_SHARED_ENV"))
+    (literal (param "HARNESS_SHARED_AUTH"))
+    (subpath (param "HARNESS_SHARED_UAT"))
+    (subpath (param "HARNESS_USER_KEP"))
+    (subpath (param "HARNESS_USER_LARK")))
+
+;; ── Diagnostics: log denied operations to syslog ──────────────────────
+;;
+;; Uncomment when chasing a sandbox violation. Off by default to keep
+;; syslog clean in production.
+;;
+;; (debug deny)

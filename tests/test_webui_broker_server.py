@@ -1,0 +1,6681 @@
+"""WebUI run broker HTTP seam tests."""
+from __future__ import annotations
+
+import asyncio
+import pathlib
+import json
+import os
+import subprocess
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tests._sync import SYNC_TIMEOUT
+
+
+async def _read_sse_data_line(response, *, timeout: float = 2.0):
+    while True:
+        line = await asyncio.wait_for(response.content.readline(), timeout=timeout)
+        if line.startswith(b"data: "):
+            # The lifecycle handshake precedes content/control frames.
+            if json.loads(line[len(b"data: "):]).get("kind") == "run_started":
+                continue
+            return line
+
+
+def test_webui_run_broker_endpoint_streams_channel_neutral_events():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "session_id": "session-webui",
+                "delivery_mode": "socket",
+                "credential_subject": "ou_webui",
+                "requires_host_tools": True,
+                "metadata": {"model": "gpt-5.4"},
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert '"kind": "content"' in body
+        assert '"text": "echo:hello broker"' in body
+        assert '"kind": "done"' in body
+        assert len(seen) == 1
+        assert seen[0].channel == "webui"
+        assert seen[0].profile_name == "owner"
+        assert seen[0].user_key == "ou_webui"
+        assert seen[0].requires_host_tools is True
+
+    asyncio.run(runner())
+
+
+def test_link_preview_endpoint_uses_trusted_owner_for_every_feishu_tenant(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    table = RoutingTable(tmp_path / "routing.db")
+    table.upsert(
+        user_id="owner-user",
+        profile_name="owner",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: table)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile: tmp_path / "profiles" / profile)
+    seen = []
+
+    def resolve(profile_home, owner, urls):
+        seen.append((profile_home, owner, urls))
+        return [
+            {
+                "kind": "wiki",
+                "title": "跨租户规划",
+                "type_label": "知识库文档",
+                "url": urls[0],
+                "status": "resolved",
+            },
+            {
+                "kind": "task",
+                "title": "",
+                "type_label": "飞书任务",
+                "url": urls[1],
+                "status": "generic",
+            },
+        ]
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=resolve)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/link-previews",
+                json={
+                    "profile_name": "owner",
+                    "owner": "ou_forged",
+                    "urls": [
+                        "https://acme.feishu.cn/wiki/wikcnA",
+                        "https://globex.larksuite.com/client/todo/task?guid=task-1",
+                    ],
+                },
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+        return response.status, body
+
+    try:
+        status, body = asyncio.run(runner())
+    finally:
+        table.close()
+
+    assert status == 200
+    assert [item["status"] for item in body["previews"]] == ["resolved", "generic"]
+    assert seen == [
+        (
+            tmp_path / "profiles" / "owner",
+            "ou_owner",
+            [
+                "https://acme.feishu.cn/wiki/wikcnA",
+                "https://globex.larksuite.com/client/todo/task?guid=task-1",
+            ],
+        )
+    ]
+
+
+def test_link_preview_endpoint_fails_closed_without_owner_identity():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    called = []
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=lambda *_args: called.append(True))
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/link-previews",
+                json={"profile_name": "owner", "urls": ["https://acme.feishu.cn/wiki/token"]},
+            )
+            await response.text()
+        finally:
+            await client.close()
+        return response.status
+
+    assert asyncio.run(runner()) == 403
+    assert called == []
+
+
+def test_link_preview_two_actors_resolve_self_and_cannot_select_each_other_profile(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    table = RoutingTable(tmp_path / "routing.db")
+    table.upsert(user_id="user-a", profile_name="profile-a", open_id="ou_a", provenance="sync")
+    table.upsert(user_id="user-b", profile_name="profile-b", open_id="ou_b", provenance="sync")
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: table)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile: tmp_path / "profiles" / profile)
+    resolved = []
+
+    def resolve(profile_home, owner, urls):
+        resolved.append((profile_home.name, owner))
+        return [{"kind": "wiki", "title": owner, "type_label": "知识库文档", "url": urls[0], "status": "resolved"}]
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=resolve)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            statuses = []
+            for owner, requested_profile in (
+                ("ou_a", "profile-a"),
+                ("ou_b", "profile-b"),
+                ("ou_a", "profile-b"),
+            ):
+                response = await client.post(
+                    "/api/run-broker/link-previews",
+                    json={"profile_name": requested_profile, "urls": ["https://acme.feishu.cn/wiki/token"]},
+                    headers={"X-Hermes-Owner-Open-Id": owner},
+                )
+                statuses.append(response.status)
+                await response.text()
+        finally:
+            await client.close()
+        return statuses
+
+    try:
+        assert asyncio.run(runner()) == [200, 200, 200]
+    finally:
+        table.close()
+    assert resolved == [
+        ("profile-a", "ou_a"),
+        ("profile-b", "ou_b"),
+        ("profile-a", "ou_a"),
+    ]
+
+
+def test_link_preview_default_resolver_reads_documents_and_labels_other_products(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    inspected = []
+
+    def inspect_document(profile_home, owner, url):
+        inspected.append((profile_home, owner, url))
+        return {"title": "Hermes 2026 H2 产品规划", "type": "wiki"}
+
+    profile_home = tmp_path / "profiles" / "owner"
+    urls = [
+        "https://acme.feishu.cn/wiki/Q9mXwXqfhi2j5SkR6HjctEpEncf",
+        "https://globex.larksuite.com/client/todo/task?guid=task-1",
+        "https://project.feishu.cn/project/view/abc",
+    ]
+
+    previews = resolve_feishu_link_previews(
+        profile_home,
+        "ou_owner",
+        urls,
+        inspect_document=inspect_document,
+    )
+
+    assert previews == [
+        {
+            "kind": "wiki",
+            "title": "Hermes 2026 H2 产品规划",
+            "type_label": "知识库文档",
+            "url": urls[0],
+            "status": "resolved",
+        },
+        {
+            "kind": "task",
+            "title": "",
+            "type_label": "飞书任务",
+            "url": urls[1],
+            "status": "generic",
+        },
+        {
+            "kind": "meegle",
+            "title": "",
+            "type_label": "飞书项目",
+            "url": urls[2],
+            "status": "generic",
+        },
+    ]
+    assert inspected == [(profile_home, "ou_owner", urls[0])]
+
+
+@pytest.mark.parametrize(
+    ("url", "kind", "label"),
+    [
+        ("https://tenant.feishu.cn/client/todo/task?guid=1", "task", "飞书任务"),
+        ("https://tenant.feishu.cn/calendar/event/1", "calendar", "飞书日历"),
+        ("https://tenant.feishu.cn/approval/instance/1", "approval", "飞书审批"),
+        ("https://tenant.feishu.cn/vc/meeting/1", "meeting", "飞书会议"),
+        ("https://tenant.feishu.cn/minutes/1", "minutes", "飞书妙记"),
+        ("https://tenant.feishu.cn/client/chat/1", "im", "飞书消息"),
+        ("https://project.feishu.cn/project/view/1", "meegle", "飞书项目"),
+    ],
+)
+def test_link_preview_labels_non_document_products(url: str, kind: str, label: str, tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    preview = resolve_feishu_link_previews(tmp_path / "profile", "ou_owner", [url])[0]
+
+    assert (preview["kind"], preview["type_label"], preview["status"]) == (kind, label, "generic")
+
+
+def test_link_preview_resolves_only_public_open_platform_document_pages(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    fetched = []
+
+    def inspect_public_page(url):
+        fetched.append(url)
+        if "open.feishu.cn" in url:
+            return "获取文件元数据 - 服务端 API - 飞书开放平台"
+        return None
+
+    urls = [
+        "https://open.feishu.cn/document/server-docs/docs/drive-v1/file/batch_query",
+        "https://open.larksuite.com/document/server-docs/missing",
+        "https://open.feishu.cn/community/article/123",
+        "https://acme.feishu.cn/document/private-page",
+    ]
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profiles" / "owner",
+        "ou_owner",
+        urls,
+        inspect_public_page=inspect_public_page,
+    )
+
+    assert previews == [
+        {
+            "kind": "open_platform",
+            "title": "获取文件元数据 - 服务端 API - 飞书开放平台",
+            "type_label": "开放平台文档",
+            "url": urls[0],
+            "status": "resolved",
+        },
+        {
+            "kind": "open_platform",
+            "title": "",
+            "type_label": "开放平台文档",
+            "url": urls[1],
+            "status": "generic",
+        },
+        {
+            "kind": "feishu",
+            "title": "",
+            "type_label": "飞书链接",
+            "url": urls[2],
+            "status": "generic",
+        },
+        {
+            "kind": "feishu",
+            "title": "",
+            "type_label": "飞书链接",
+            "url": urls[3],
+            "status": "generic",
+        },
+    ]
+    assert fetched == urls[:2]
+
+
+def test_link_preview_public_fetch_enforces_anonymous_no_redirect_reader(monkeypatch):
+    from hermes_multitenancy import feishu_link_preview as preview_mod
+
+    seen = {}
+
+    class Headers:
+        def get_content_type(self):
+            return "text/html"
+
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            seen["read_size"] = size
+            return b'<html><head><meta property="og:title" content="Public API"></head></html>'
+
+    class Opener:
+        def open(self, request, timeout):
+            seen["url"] = request.full_url
+            seen["headers"] = dict(request.header_items())
+            seen["timeout"] = timeout
+            return Response()
+
+    def build(handler):
+        seen["handler"] = handler
+        return Opener()
+
+    monkeypatch.setattr(preview_mod, "build_opener", build)
+
+    assert preview_mod._inspect_public_page("https://open.feishu.cn/document/test") == "Public API"
+    assert seen["handler"] is preview_mod._NoRedirect
+    assert seen["timeout"] == 2
+    assert seen["read_size"] == preview_mod._MAX_PUBLIC_HTML_BYTES + 1
+    assert "Cookie" not in seen["headers"]
+
+
+def test_link_preview_one_inspector_timeout_does_not_poison_the_batch(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    def timeout(*_args):
+        raise subprocess.TimeoutExpired("lark-cli", 2)
+
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profile",
+        "ou_owner",
+        [
+            "https://tenant.feishu.cn/wiki/token",
+            "https://tenant.feishu.cn/calendar/event",
+        ],
+        inspect_document=timeout,
+    )
+
+    assert [item["status"] for item in previews] == ["forbidden", "generic"]
+
+
+def test_link_preview_normalizes_path_before_product_policy_match(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    seen = []
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profile",
+        "ou_owner",
+        ["https://open.feishu.cn/server/../document/test"],
+        inspect_public_page=lambda url: seen.append(url) or "Public API",
+    )
+
+    assert previews[0]["kind"] == "open_platform"
+    assert previews[0]["status"] == "resolved"
+    assert seen == ["https://open.feishu.cn/server/../document/test"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://acme.feishu.cn/wiki/token",
+        "https://evilfeishu.cn/wiki/token",
+        "https://feishu.cn.evil.example/wiki/token",
+        "https://example.com/wiki/token",
+        "https://user:password@open.feishu.cn/document/server-docs/example",
+        "https://open.feishu.cn:8443/document/server-docs/example",
+    ],
+)
+def test_link_preview_default_resolver_rejects_non_feishu_hosts(url: str, tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    with pytest.raises(ValueError, match="unsupported Feishu link"):
+        resolve_feishu_link_previews(tmp_path / "profile", "ou_owner", [url])
+
+
+def test_webui_workspace_is_profile_relative_and_invalid_paths_never_dispatch(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    (profile_home / "workspace" / "project-a").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (profile_home / "workspace" / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return "ok"
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            valid = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_owner",
+                "content": "hello",
+                "workspace": "project-a",
+            })
+            await valid.text()
+            invalid_statuses = []
+            for workspace in ["../outside", str(outside), "escape", "missing"]:
+                response = await client.post("/api/run-broker/runs", json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_owner",
+                    "content": "hello",
+                    "workspace": workspace,
+                })
+                invalid_statuses.append(response.status)
+                await response.text()
+        finally:
+            await client.close()
+        assert valid.status == 200
+        assert invalid_statuses == [400, 400, 400, 400]
+
+    asyncio.run(runner())
+    assert len(seen) == 1
+    assert seen[0].workspace == "project-a"
+
+
+def test_webui_and_ingest_execution_brokers_prepare_billing(monkeypatch):
+    from dataclasses import replace
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def prepare(request):
+        return replace(
+            request,
+            metadata={**dict(request.metadata or {}), "billing_prepared": True},
+        )
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "ingest-secret")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return "ok"
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            webui = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_owner",
+                "content": "hello",
+            })
+            await webui.text()
+            ingest = await client.post(
+                "/api/run-broker/ingest",
+                json={"content": "ingest"},
+                headers={"Authorization": "Bearer ingest-secret"},
+            )
+            await ingest.text()
+        finally:
+            await client.close()
+        assert (webui.status, ingest.status) == (200, 200)
+
+    asyncio.run(runner())
+    assert [request.metadata["billing_prepared"] for request in seen] == [True, True]
+
+
+def test_webui_billing_failure_keeps_idempotency_key_retryable(monkeypatch):
+    from dataclasses import replace
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_attempts = 0
+    marked = []
+    seen = set()
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_attempts
+        prepare_attempts += 1
+        if prepare_attempts == 1:
+            raise RuntimeError("temporary billing lookup failure")
+        return replace(request, metadata={**request.metadata, "billing_prepared": True})
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        if request.effective_idempotency_key in seen:
+            return False
+        seen.add(request.effective_idempotency_key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=mark_seen,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "channel": "webui",
+            "profile_name": "owner",
+            "user_key": "ou_owner",
+            "content": "hello",
+            "idempotency_key": "webui:session-1:turn-1",
+        }
+        try:
+            failed = await client.post("/api/run-broker/runs", json=payload)
+            failed_body = await failed.text()
+            retry = await client.post("/api/run-broker/runs", json=payload)
+            retry_body = await retry.text()
+            duplicate = await client.post("/api/run-broker/runs", json=payload)
+            duplicate_body = await duplicate.text()
+        finally:
+            await client.close()
+        return failed, failed_body, retry, retry_body, duplicate, duplicate_body
+
+    failed, failed_body, retry, retry_body, duplicate, duplicate_body = asyncio.run(runner())
+
+    assert (failed.status, retry.status, duplicate.status) == (200, 200, 200)
+    assert '"kind": "error"' in failed_body
+    assert '"text": "ok"' in retry_body
+    assert '"kind": "content"' not in duplicate_body
+    assert prepare_attempts == 2
+    assert marked == ["webui:session-1:turn-1"]
+    assert len(dispatched) == 1
+    assert dispatched[0].metadata["billing_prepared"] is True
+
+
+def test_webui_session_store_mark_failure_emits_error_and_retry_succeeds(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity, router
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    class FlakyStore:
+        def __init__(self):
+            self.mark_calls = 0
+            self.seen = set()
+
+        def is_event_processed(self, event_key, _ttl):
+            return event_key in self.seen
+
+        def mark_event_processed(self, event_key, **_kwargs):
+            self.mark_calls += 1
+            if self.mark_calls == 1:
+                raise RuntimeError("session store write failed")
+            self.seen.add(event_key)
+            return True
+
+    store = FlakyStore()
+    prepare_calls = 0
+    dispatches = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    async def dispatch(request):
+        dispatches.append(request.content)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    router.override_session_store(store)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "channel": "webui",
+            "profile_name": "owner",
+            "user_key": "ou_owner",
+            "content": "hello",
+            "idempotency_key": "webui:session-store-retry",
+        }
+        try:
+            responses = []
+            for _ in range(3):
+                response = await client.post("/api/run-broker/runs", json=payload)
+                responses.append((response.status, await response.text()))
+            return responses
+        finally:
+            await client.close()
+
+    try:
+        responses = asyncio.run(runner())
+    finally:
+        router.override_session_store(None)
+
+    assert [status for status, _body in responses] == [200, 200, 200]
+    assert '"kind": "error"' in responses[0][1]
+    assert "Run is unavailable" in responses[0][1]
+    assert "session store write failed" not in responses[0][1]
+    assert '"text": "ok"' in responses[1][1]
+    assert '"kind": "content"' not in responses[2][1]
+    assert prepare_calls == 2
+    assert store.mark_calls == 2
+    assert dispatches == ["hello"]
+
+
+def test_webui_missing_session_store_emits_error_eof_without_dispatch(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity, router
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_calls = []
+    dispatches = []
+
+    async def prepare(request):
+        prepare_calls.append(request.content)
+        return request
+
+    async def dispatch(request):
+        dispatches.append(request.content)
+        return "unexpected"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router, "_get_session_store", lambda: None)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_owner",
+                    "content": "hello",
+                    "idempotency_key": "webui:missing-session-store",
+                },
+            )
+            return response.status, await response.text()
+        finally:
+            await client.close()
+
+    status, body = asyncio.run(runner())
+
+    assert status == 200
+    assert '"kind": "error"' in body
+    assert "Run is unavailable" in body
+    assert "SessionStore unavailable" not in body
+    assert body.endswith("\n\n")
+    assert prepare_calls == []
+    assert dispatches == []
+
+
+def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        captured = {}
+
+        async def dispatch(request):
+            event = broker_mod._build_webui_event(request)
+            captured["metadata"] = dict(request.metadata)
+            captured["event_text"] = event.text
+            captured["raw_event_metadata"] = dict(event.raw_event["metadata"])
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "metadata": {
+                    "trace": "t1",
+                    "ingest_secret_dir": str(tmp_path / "fake-secrets"),
+                    "ingest_secrets": [
+                        {"name": "fake", "type": "opaque", "usage": "spoofed"}
+                    ],
+                },
+            })
+            await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert captured["metadata"]["trace"] == "t1"
+        assert "ingest_secret_dir" not in captured["metadata"]
+        assert "ingest_secrets" not in captured["metadata"]
+        assert "ingest_secret_dir" not in captured["raw_event_metadata"]
+        assert "ingest_secrets" not in captured["raw_event_metadata"]
+        assert captured["event_text"] == "hello broker"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_accepts_image_sized_json_body(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", raising=False)
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return "accepted large body"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                data=json.dumps({
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "image follow-up",
+                    "session_id": "session-large-image",
+                    "metadata": {"input": "x" * (2 * 1024 * 1024)},
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "accepted large body"' in body
+        assert len(seen) == 1
+        assert seen[0].metadata["input"].startswith("xxx")
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_client_max_size_defaults_to_32mb(monkeypatch):
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", raising=False)
+
+    app = create_run_broker_app()
+
+    assert app._client_max_size == 32 * 1024 * 1024
+
+
+def test_webui_run_broker_client_max_size_can_be_overridden(monkeypatch):
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", "8")
+
+    app = create_run_broker_app()
+
+    assert app._client_max_size == 8 * 1024 * 1024
+
+
+def test_internal_session_search_broker_uses_parent_profile_db(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "isolated-hermes-home"))
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session("session-one", source="feishu")
+        db.append_message(
+            session_id="session-one",
+            role="user",
+            content="please remember HERMES_PROXY_SEARCH_MARKER",
+        )
+    finally:
+        db.close()
+
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "HERMES_PROXY_SEARCH_MARKER", "limit": 3, "detail": "full", "after": "2000-01-01", "before": "2100-01-01"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+            for filters in ({"exclude_session_ids": ["session-one"]}, {"before": "2000-01-01"}, {"after": "2100-01-01"}):
+                filtered = await client.post(
+                    "/api/run-broker/internal/session-search",
+                    json={"query": "HERMES_PROXY_SEARCH_MARKER", **filters},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert filtered.status == 200
+                assert json.loads((await filtered.json())["result"])["count"] == 0
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert response.status == 200
+        result = json.loads(body["result"])
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "session-one"
+        assert result["detail"] == "full"
+
+    asyncio.run(runner())
+
+
+def test_internal_session_search_broker_rejects_bad_token_and_profile(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: tmp_path / profile_name)
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            missing = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "x"},
+            )
+            cross = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "x", "profile": "other"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            missing_body = await missing.json()
+            cross_body = await cross.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert missing.status == 401
+        assert missing_body["error"] == "unauthorized"
+        assert cross.status == 403
+        assert "profile" in cross_body["error"]
+
+    asyncio.run(runner())
+
+
+def test_internal_session_search_broker_rejects_implicit_cross_profile_lookup(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+    from tools import session_search_tool
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.close()
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+
+    def fail_locate(_session_id):
+        raise AssertionError("broker must not allow global session_id lookup")
+
+    monkeypatch.setattr(session_search_tool, "_locate_session_db", fail_locate, raising=False)
+
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            bare = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"session_id": "foreign-session"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            embedded = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"session_id": "other/foreign-session"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            bare_body = await bare.json()
+            embedded_body = await embedded.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert bare.status == 200
+        bare_result = json.loads(bare_body["result"])
+        assert bare_result["success"] is False
+        assert "session_id not found" in bare_result["error"]
+        assert embedded.status == 403
+        assert "profile" in embedded_body["error"]
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_rejects_body_over_configured_limit(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", "1024")
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return "should not run"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                data=json.dumps({
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "x" * 2048,
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 400
+        assert (
+            "Request Entity Too Large" in body["error"]
+            or "Content Too Large" in body["error"]
+        )
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner"
+        assert event.raw_event["session_id"] == "session-webui"
+        assert event.source.platform.value == "webui"
+        assert event.source.chat_type == "webui"
+        yield "tool_started", {"name": "lark_cli", "preview": "contact --help"}
+        yield "tool_completed", {"name": "lark_cli", "duration": 0.12, "is_error": False}
+        yield "content", "tool-backed answer"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "tool_started"' in body
+        assert '"name": "lark_cli"' in body
+        assert '"kind": "tool_completed"' in body
+        assert '"kind": "content"' in body
+        assert '"text": "tool-backed answer"' in body
+        assert '"kind": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_forwards_reasoning_effort_metadata(monkeypatch, tmp_path: Path):
+    """WebUI 档位选择器的 `metadata.reasoning_effort` 必须原样到达 agent 事件。
+
+    broker 侧最后一跳（`agent_real/run.py::_reasoning_config_for_event` 把它翻成
+    `agent_kwargs["reasoning_config"]`）只有在这个键活着到达 `event.raw_event`
+    时才有意义；`_sanitize_ingest_metadata` 只剥 `_trusted_*` 和 ingest 保留键，
+    这条用例钉住它不会顺手把未知键也剥掉。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    seen_metadata: list[dict] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        seen_metadata.append(dict(event.raw_event.get("metadata") or {}))
+        yield "content", "ok"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("stream_run_agent should satisfy the request")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "think hard",
+                "session_id": "session-reasoning",
+                "requires_host_tools": True,
+                "metadata": {"reasoning_effort": "high", "model": "glm-5.1"},
+            })
+            body = await response.text()
+            assert response.status == 200
+            assert '"kind": "content"' in body
+
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "no slider",
+                "session_id": "session-reasoning-default",
+                "requires_host_tools": True,
+            })
+            assert response.status == 200
+            await response.text()
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+    assert len(seen_metadata) == 2
+    assert seen_metadata[0]["reasoning_effort"] == "high"
+    assert seen_metadata[0]["model"] == "glm-5.1"
+    # 没带滑杆时不得凭空造一个键 —— 下游据此保持 profile 默认。
+    assert "reasoning_effort" not in seen_metadata[1]
+
+
+def test_webui_run_broker_requests_replay_distinct_child_sessions(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    child_session_ids: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        payload = agent_real._event_to_subprocess_payload(event, profile_home, messages=messages)
+        replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
+        child_session_ids.append(
+            agent_real._resolve_aiagent_session_id(
+                replayed,
+                profile_home,
+                replayed.sender_open_id,
+            )
+        )
+        yield "content", "ok"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("stream_run_agent should satisfy the request")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            for session_id in ("webui-doc-session-one", "webui-doc-session-two"):
+                response = await client.post("/api/run-broker/runs", json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "create a Feishu cloud doc",
+                    "session_id": session_id,
+                    "requires_host_tools": True,
+                })
+                body = await response.text()
+                assert response.status == 200
+                assert '"kind": "content"' in body
+                assert '"text": "ok"' in body
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+    assert child_session_ids == [
+        "agent:profile:owner:platform:webui:session:webui-doc-session-one",
+        "agent:profile:owner:platform:webui:session:webui-doc-session-two",
+    ]
+
+
+def test_webui_run_broker_clarify_response_is_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    response_path = tmp_path / "clarify-response.json"
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner_sync_profile"
+        assert event.raw_event["session_id"] == "session-webui"
+        yield "clarify_required", {
+            "session_key": "agent:profile:owner_sync_profile:platform:webui:session:session-webui",
+            "clarify_id": "clarify_1",
+            "question": "Which report style?",
+            "choices": ["brief", "detailed"],
+            "response_path": str(response_path),
+        }
+        for _ in range(20):
+            if response_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        answer = json.loads(response_path.read_text(encoding="utf-8"))["response"]
+        yield "clarify_resolved", {
+            "session_key": "agent:profile:owner_sync_profile:platform:webui:session:session-webui",
+            "clarify_id": "clarify_1",
+            "response": answer,
+        }
+        yield "content", f"answer:{answer}"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        run_response = None
+        try:
+            run_response = await client.post("/api/run-broker/runs", headers={
+                "X-Hermes-Owner-Open-Id": "ou_owner",
+            }, json={
+                "channel": "webui",
+                "profile_name": "spoofed_client_profile",
+                "user_key": "ou_spoofed",
+                "content": "make a report",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            first_line = await _read_sse_data_line(run_response)
+            clarify_event = json.loads(first_line[len(b"data: "):])
+
+            wrong_owner_response = await client.post(
+                "/api/run-broker/clarify/clarify_1/respond",
+                headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                json={
+                    "profile_name": "owner_sync_profile",
+                    "session_id": "session-webui",
+                    "response": "detailed",
+                },
+            )
+            wrong_owner_body = await wrong_owner_response.json()
+
+            right_owner_response = await client.post(
+                "/api/run-broker/clarify/clarify_1/respond",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "profile_name": "owner_sync_profile",
+                    "session_id": "session-webui",
+                    "response": "brief",
+                },
+            )
+            right_owner_body = await right_owner_response.json()
+            remaining_body = await run_response.text()
+        finally:
+            if run_response is not None:
+                run_response.close()
+            await client.close()
+            router_mod.override_routing_table(None)
+
+        assert run_response.status == 200
+        assert clarify_event["kind"] == "clarify_required"
+        assert clarify_event["payload"]["clarify_id"] == "clarify_1"
+        assert clarify_event["payload"]["question"] == "Which report style?"
+        assert "response_path" not in clarify_event["payload"]
+        assert wrong_owner_response.status == 404
+        assert wrong_owner_body == {"error": "clarify request not found"}
+        assert right_owner_response.status == 200
+        assert right_owner_body == {"ok": True, "clarify_id": "clarify_1"}
+        assert '"kind": "clarify_resolved"' in remaining_body
+        assert '"text": "answer:brief"' in remaining_body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_session_history_commands_are_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.sessions import SessionStore
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    store = SessionStore(tmp_path / "sessions.db")
+    store.append("owner_sync_profile", "ou_owner", "user", "hello")
+    store.append("owner_sync_profile", "ou_owner", "assistant", "hi")
+    store.append("other_sync_profile", "ou_other", "user", "private")
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        router_mod.override_session_store(store)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                wrong_owner_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/reset",
+                    },
+                )
+                wrong_owner_body = await wrong_owner_response.json()
+                status_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "session_id": "session-webui",
+                        "command": "/status",
+                    },
+                )
+                status_body = await status_response.json()
+                reset_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/reset",
+                    },
+                )
+                reset_body = await reset_response.json()
+            finally:
+                await client.close()
+            owner_count = store.count("owner_sync_profile", "ou_owner")
+            other_count = store.count("other_sync_profile", "ou_other")
+        finally:
+            router_mod.override_session_store(None)
+            router_mod.override_routing_table(None)
+
+        assert wrong_owner_response.status == 403
+        assert "asserted owner" in wrong_owner_body["error"]
+        assert status_response.status == 200
+        assert status_body["profile_name"] == "owner_sync_profile"
+        assert status_body["command"] == "status"
+        assert status_body["type"] == "session_history"
+        assert status_body["history_count"] == 2
+        assert "profile: owner_sync_profile" in status_body["message"]
+        assert reset_response.status == 200
+        assert reset_body["action"] == "reset"
+        assert reset_body["history_count"] == 0
+        assert owner_count == 0
+        assert other_count == 1
+        assert str(tmp_path) not in json.dumps(status_body)
+        assert str(tmp_path) not in json.dumps(reset_body)
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_session_command_expands_plan_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner_sync_profile"
+    skill_dir = profile_home / "skills" / "software-development" / "plan"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: plan\n---\nPLAN BODY\n", encoding="utf-8")
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile_name: tmp_path / "profiles" / profile_name)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "session_id": "session-webui",
+                        "command": "/plan build the feature",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["profile_name"] == "owner_sync_profile"
+        assert body["handled"] is True
+        assert body["command"] == "plan"
+        assert body["type"] == "skill"
+        assert body["action"] == "plan"
+        assert "PLAN BODY" in body["message"]
+        assert "relative output paths are relative to the active profile home" in body["message"]
+        assert "User request: build the feature" in body["message"]
+        assert str(tmp_path) not in body["message"]
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_goal_done_matches_real_goal_manager_contract(monkeypatch, tmp_path: Path):
+    goals_mod = pytest.importorskip("hermes_cli.goals")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = goals_mod.GoalManager("session-webui-contract")
+    mark_done = getattr(manager, "mark_done", None)
+
+    assert callable(mark_done)
+    manager.set("fix the tests")
+    mark_done("user-completed")
+    assert manager.state.status == "done"
+
+
+def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner_sync_profile"
+    profile_home.mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    class FakeState:
+        goal = "fix the tests"
+        status = "active"
+        max_turns = 20
+
+    class FakeGoalManager:
+        state = FakeState()
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        def set(self, goal):
+            self.state.goal = goal
+            self.state.status = "active"
+            return self.state
+
+        def evaluate_after_turn(self, final_response, user_initiated=False):
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": f"[Continuing]\\nGoal: {self.state.goal}",
+                "verdict": "continue",
+                "reason": "more work remains",
+                "message": "Continuing toward goal.",
+            }
+
+        def mark_done(self, reason):
+            self.state.status = "done"
+            self.done_reason = reason
+            return self.state
+
+    monkeypatch.setattr(broker_mod, "_goal_manager", lambda session_id: FakeGoalManager(session_id))
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile_name: tmp_path / "profiles" / profile_name)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                wrong_owner_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal fix the tests",
+                    },
+                )
+                wrong_owner_body = await wrong_owner_response.json()
+                set_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal fix the tests",
+                    },
+                )
+                set_body = await set_response.json()
+                evaluate_response = await client.post(
+                    "/api/run-broker/goals/evaluate",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "final_response": "not done yet",
+                    },
+                )
+                evaluate_body = await evaluate_response.json()
+                done_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal done",
+                    },
+                )
+                done_body = await done_response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert wrong_owner_response.status == 403
+        assert "asserted owner" in wrong_owner_body["error"]
+        assert set_response.status == 200
+        assert set_body["handled"] is True
+        assert set_body["command"] == "goal"
+        assert set_body["action"] == "set"
+        assert set_body["message"] == "Goal set."
+        assert set_body["kickoff_prompt"] == "fix the tests"
+        assert evaluate_response.status == 200
+        assert evaluate_body["handled"] is True
+        assert evaluate_body["status"] == "active"
+        assert evaluate_body["should_continue"] is True
+        assert evaluate_body["verdict"] == "continue"
+        assert evaluate_body["reason"] == "more work remains"
+        assert "Goal: fix the tests" in evaluate_body["continuation_prompt"]
+        assert done_response.status == 200
+        assert done_body["handled"] is True
+        assert done_body["command"] == "goal"
+        assert done_body["action"] == "done"
+        assert done_body["message"] == "Goal marked done."
+        assert done_body["clear_goal_continuations"] is True
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_streams_media_as_workspace_alias(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    generated = profile_home / "home" / "generated_art.png"
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"png")
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", f"done\nMEDIA:{generated}"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "generate image",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert "MEDIA:/workspace/Downloads/generated_art.png" in body
+        assert str(generated) not in body
+        assert (profile_home / "workspace" / "Downloads" / "generated_art.png").read_bytes() == b"png"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_buffers_split_media_directives(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    generated = profile_home / "home" / "plasma_art.png"
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"png")
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", "\n\n图片生成成功：\n\nMEDIA:"
+        yield "content", str(generated)
+        yield "content", "\n\n完成"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "generate image",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "MEDIA:/workspace/Downloads/plasma_art.png" in body
+        assert str(generated) not in body
+        assert (profile_home / "workspace" / "Downloads" / "plasma_art.png").read_bytes() == b"png"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_hides_and_materializes_split_artifact_protocol(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    writes: list[Path] = []
+    write_artifact = router_mod._write_response_artifact
+
+    def record_write(path, spec):
+        writes.append(path)
+        return write_artifact(path, spec)
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", "done\n"
+        artifact = '```hermes-artifact-json\n{"filename":"out.md","format":"md","content":"# title\\n"}\n```'
+        for character in artifact:
+            yield "content", character
+        yield "content", "\nafter"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+    monkeypatch.setattr(router_mod, "_write_response_artifact", record_write)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "hermes-artifact-json" not in body
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        content = [event["text"] for event in events if event["kind"] == "content"]
+        assert "hermes-artifact-json" not in "".join(content)
+        assert sum("MEDIA:/workspace/Downloads/out.md" in text for text in content) == 1
+        assert writes == [profile_home / "workspace" / "Downloads" / "out.md"]
+        assert "done" in body
+        assert "after" in body
+        assert (profile_home / "workspace" / "Downloads" / "out.md").read_text() == "# title\n"
+
+    asyncio.run(runner())
+
+
+def test_webui_artifact_parser_uses_raw_string_offsets_and_drops_partial_terminal_marker(tmp_path: Path):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as server
+
+    profile_home = tmp_path / "profiles" / "owner"
+    artifact = '```hermes-artifact-json\n{"filename":"unicode.md","content":"ok"}\n```'
+    pending, items = server._webui_streamable_media_text(
+        f"önİce {artifact} son",
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+
+    joined = "".join(items)
+    assert pending == ""
+    assert "hermes-artifact-json" not in joined
+    assert "önİce" in joined and "son" in joined
+    assert "MEDIA:/workspace/Downloads/unicode.md" in joined
+    assert (profile_home / "workspace" / "Downloads" / "unicode.md").read_text() == "ok"
+
+    pending, items = server._webui_streamable_media_text(
+        "tail text ```hermes-artifact-jso",
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+    assert pending == ""
+    assert "".join(items) == "tail text "
+
+    for ordinary in ("Use `ls`", "value is ``", "```python\nprint(1)\n```"):
+        pending, items = server._webui_streamable_media_text(
+            ordinary,
+            router_mod=router_mod,
+            profile_home=profile_home,
+            terminal=True,
+        )
+        assert pending == ""
+        assert "".join(items) == ordinary
+
+    unicode_marker = artifact.replace("hermes", "hermeſ")
+    split_at = unicode_marker.index("ſ") + 1
+    pending, items = server._webui_streamable_media_text(
+        unicode_marker[:split_at],
+        router_mod=router_mod,
+        profile_home=profile_home,
+    )
+    pending, tail_items = server._webui_streamable_media_text(
+        pending + unicode_marker[split_at:],
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+    joined = "".join(items + tail_items)
+    assert pending == ""
+    assert "hermeſ-artifact-json" not in joined
+    assert '"filename":"unicode.md"' not in joined
+    assert "MEDIA:/workspace/Downloads/unicode.md" in joined
+
+
+def test_webui_run_broker_does_not_retry_or_leak_an_unterminated_artifact(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    fallback_calls = 0
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", '```hermes-artifact-json\n{"filename":"secret.md","content":"private"}'
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return "must not run"
+
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert fallback_calls == 0
+        assert "hermes-artifact-json" not in body
+        assert "private" not in body
+        assert "must not run" not in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_one_shot_fallback_uses_the_artifact_seam(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        if False:
+            yield "content", ""
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):
+        return '```hermes-artifact-json\n{"filename":"fallback.md","content":"safe"}\n```'
+
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "hermes-artifact-json" not in body
+        assert "MEDIA:/workspace/Downloads/fallback.md" in body
+        assert (profile_home / "workspace" / "Downloads" / "fallback.md").read_text() == "safe"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_materializes_split_remote_markdown_image(monkeypatch, tmp_path: Path):
+    import socket
+    import urllib.request
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    payload = b"\xff\xd8\xff\xe0fake-remote-jpeg"
+
+    class FakeHTTPResponse:
+        _hermes_peer_ip = "93.184.216.34"
+        headers = {
+            "Content-Type": "image/jpeg",
+            "Content-Length": str(len(payload)),
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size=-1):
+            return payload
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "cdn.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    def fake_urlopen(request, timeout=0):
+        return FakeHTTPResponse()
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", "海报生成成功\n![poster]("
+        yield "content", "https://cdn.example.com/generated/poster.jpg"
+        yield "content", ")"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "generate image",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "MEDIA:/workspace/Downloads/remote-images/" in body
+        assert "https://cdn.example.com/generated/poster.jpg" in body
+        image_files = list((profile_home / "workspace" / "Downloads" / "remote-images").glob("*.jpg"))
+        assert len(image_files) == 1
+        assert image_files[0].read_bytes() == payload
+
+    asyncio.run(runner())
+
+
+def test_webui_streamed_remote_media_additions_runs_scoping_off_event_loop(tmp_path: Path):
+    import threading
+
+    from hermes_multitenancy import webui_broker_server as server
+
+    loop_thread = threading.get_ident()
+    scoped_threads: list[int] = []
+
+    def fake_scoped_response(raw: str, profile_home: Path):
+        assert raw == "生成完成\n![poster](https://cdn.example.com/poster.jpg)"
+        assert profile_home == tmp_path
+        scoped_threads.append(threading.get_ident())
+        return f"{raw}\nMEDIA:/workspace/Downloads/remote-images/poster.jpg"
+
+    router_mod = SimpleNamespace(_webui_profile_scoped_media_response=fake_scoped_response)
+
+    result = asyncio.run(
+        server._webui_streamed_remote_media_additions(
+            "生成完成\n![poster](https://cdn.example.com/poster.jpg)",
+            router_mod=router_mod,
+            profile_home=tmp_path,
+        )
+    )
+
+    assert result == "MEDIA:/workspace/Downloads/remote-images/poster.jpg"
+    assert scoped_threads
+    assert all(thread_id != loop_thread for thread_id in scoped_threads)
+
+
+def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monkeypatch, tmp_path):
+    import threading
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import cron_api
+    from hermes_multitenancy import cron_worker
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver now verifies X-Hermes-User-Key against routing state; seed
+    # ou_owner→owner and point the resolver at it (conftest resets to ":memory:" post-test).
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+
+    release_lock = threading.Event()
+    list_started = threading.Event()
+    lock_timed_out = threading.Event()
+
+    def start_lock_holder():
+        held = threading.Event()
+
+        def holder():
+            with cron_worker._cron_module_patch_lock:
+                held.set()
+                if not release_lock.wait(timeout=SYNC_TIMEOUT):
+                    lock_timed_out.set()
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        assert held.wait(timeout=SYNC_TIMEOUT)
+        return thread
+
+    async def runner():
+        list_jobs_calls: list[tuple[str, bool, int]] = []
+        loop_thread = threading.get_ident()
+
+        def blocking_list_jobs(profile_name, include_disabled=False):
+            list_jobs_calls.append((profile_name, include_disabled, threading.get_ident()))
+            list_started.set()
+            with cron_worker._cron_module_patch_lock:
+                return [{"id": "abc123abc123"}]
+
+        monkeypatch.setattr(cron_api, "list_jobs", blocking_list_jobs)
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            route_holder = start_lock_holder()
+            try:
+                async def sentinel():
+                    while not list_started.is_set():
+                        await asyncio.sleep(0.01)
+                    # The route is inside list_jobs and the lock is still held.
+                    # Only a live event loop can make these five turns and release it.
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    release_lock.set()
+
+                sentinel_task = asyncio.create_task(sentinel())
+                response = await client.get(
+                    "/api/run-broker/jobs?include_disabled=true",
+                    headers={
+                        "Authorization": "Bearer broker-secret",
+                        "X-Hermes-Profile": "owner",
+                        "X-Hermes-User-Key": "ou_owner",
+                    },
+                )
+                await asyncio.wait_for(sentinel_task, timeout=SYNC_TIMEOUT)
+                body = await response.json()
+            finally:
+                release_lock.set()
+                route_holder.join(timeout=SYNC_TIMEOUT)
+        finally:
+            await client.close()
+
+        # Regression for the 2026-06-16 gateway deadlock: waiting on the cron
+        # patch lock must happen off the aiohttp event loop.
+        assert not lock_timed_out.is_set()
+        assert response.status == 200
+        assert body == {"jobs": [{"id": "abc123abc123"}]}
+        assert list_jobs_calls == [("owner", True, list_jobs_calls[0][2])]
+        assert list_jobs_calls[0][2] != loop_thread
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    release = asyncio.Event()
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner"
+        yield "thinking", "正在连接模型和工具运行环境..."
+        await release.wait()
+        yield "content", "done"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        response = None
+        try:
+            post_task = asyncio.create_task(client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            }))
+            response = await asyncio.wait_for(post_task, timeout=SYNC_TIMEOUT)
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=SYNC_TIMEOUT)
+            assert b'"kind": "run_started"' in first_line
+            assert await response.content.readline() == b"\n"
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=SYNC_TIMEOUT)
+            assert b'"kind": "thinking"' in first_line
+            assert "正在连接模型".encode("utf-8") in first_line
+            release.set()
+            body = await response.text()
+        finally:
+            release.set()
+            if response is not None:
+                response.close()
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_passes_messages_to_aiagent(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    expected_messages = [
+        {"role": "user", "content": "查看下明天的天气"},
+        {"role": "assistant", "content": "你在哪个城市？"},
+        {"role": "user", "content": "北京"},
+    ]
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert messages == expected_messages
+        yield "content", "北京明天的天气..."
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "北京",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+                "messages": expected_messages,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "北京明天的天气..."' in body
+        assert '"kind": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_streams_thinking_separately(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "thinking", "The user wants me to call lark_cli first."
+        yield "tool_started", {"name": "lark_cli", "preview": "calendar --help"}
+        yield "tool_completed", {"name": "lark_cli", "duration": 0.12, "is_error": False}
+        yield "content", "日历已创建成功。"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "帮我创建一个日历",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "thinking"' in body
+        assert "The user wants me to call lark_cli first." in body
+        assert body.count('"kind": "content"') == 1
+        assert '"kind": "done"' in body
+        assert '"kind": "done", "text": ""' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_continues_after_sse_disconnect(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_models import RunEvent, RunRequest
+    from hermes_multitenancy.webui_broker_server import _default_dispatch_agent
+
+    consumed: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "tool_started", {"name": "delegate_task"}
+        consumed.append("tool_started")
+        yield "tool_completed", {"name": "delegate_task", "duration": 337.79, "is_error": False}
+        consumed.append("tool_completed")
+        yield "content", "final answer after delegate_task"
+        consumed.append("content")
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    emitted: list[str] = []
+
+    async def disconnected_emit(event: RunEvent):
+        emitted.append(event.kind)
+        if event.kind == "tool_completed":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        result = await _default_dispatch_agent(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="ou_webui",
+                content="long task",
+                session_id="session-webui",
+                requires_host_tools=True,
+            ),
+            emit_event=disconnected_emit,
+        )
+
+        assert result == ""
+        assert consumed == ["tool_started", "tool_completed", "content"]
+        assert emitted == ["tool_started", "tool_completed"]
+
+    asyncio.run(runner())
+
+
+def test_webui_disconnect_tolerant_emitter_propagates_cancellation():
+    from hermes_multitenancy.run_models import RunEvent
+    from hermes_multitenancy.webui_broker_server import _DisconnectTolerantEmitter
+
+    async def cancelled_emit(event: RunEvent):
+        raise asyncio.CancelledError()
+
+    async def runner():
+        emitter = _DisconnectTolerantEmitter(cancelled_emit)
+        with pytest.raises(asyncio.CancelledError):
+            await emitter.emit(RunEvent(kind="content", text="partial"))
+
+    asyncio.run(runner())
+
+
+def test_webui_disconnect_tolerant_emitter_reraises_non_transport_errors():
+    from hermes_multitenancy.run_models import RunEvent
+    from hermes_multitenancy.webui_broker_server import _DisconnectTolerantEmitter
+
+    async def failed_emit(event: RunEvent):
+        raise RuntimeError("unrelated write failure")
+
+    async def runner():
+        emitter = _DisconnectTolerantEmitter(failed_emit)
+        with pytest.raises(RuntimeError, match="unrelated write failure"):
+            await emitter.emit(RunEvent(kind="content", text="partial"))
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_http_client_disconnect_keeps_agent_running(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    client_disconnected = asyncio.Event()
+    stream_finished = asyncio.Event()
+    consumed: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "carol"
+        consumed.append("tool_started")
+        yield "tool_started", {"name": "delegate_task"}
+        consumed.append("tool_completed")
+        yield "tool_completed", {"name": "delegate_task", "duration": 337.79, "is_error": False}
+        await client_disconnected.wait()
+        consumed.append("content")
+        yield "content", "final answer after browser refresh"
+        consumed.append("after_content")
+        stream_finished.set()
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        response = None
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "carol",
+                "user_key": "ou_carol",
+                "content": "long delegate task",
+                "session_id": "mpgl63gwl57asf",
+                "requires_host_tools": True,
+            })
+            assert response.status == 200
+
+            first_line = await _read_sse_data_line(response)
+            second_line = await _read_sse_data_line(response)
+            assert b'"kind": "tool_started"' in first_line
+            assert b'"kind": "tool_completed"' in second_line
+
+            response.close()
+            client_disconnected.set()
+
+            await asyncio.wait_for(stream_finished.wait(), timeout=SYNC_TIMEOUT)
+        finally:
+            client_disconnected.set()
+            if response is not None:
+                response.close()
+            await client.close()
+
+        assert consumed == ["tool_started", "tool_completed", "content", "after_content"]
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_endpoint_rejects_missing_bearer_key(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            missing = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+            })
+            authorized = await client.post("/api/run-broker/runs", headers={
+                "Authorization": "Bearer broker-secret",
+            }, json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+            })
+        finally:
+            await client.close()
+
+        assert missing.status == 401
+        assert authorized.status == 200
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_health_endpoint_requires_bearer_and_no_owner(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            missing = await client.get("/api/run-broker/health")
+            authorized = await client.get("/api/run-broker/health", headers={
+                "Authorization": "Bearer broker-secret",
+            })
+            body = await authorized.json()
+        finally:
+            await client.close()
+
+        assert missing.status == 401
+        assert authorized.status == 200
+        assert body == {
+            "ok": True,
+            "service": "hermes-multitenancy-run-broker",
+        }
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_event_preserves_webui_session_boundary():
+    from hermes_multitenancy.agent_real import _resolve_aiagent_session_id
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+    from hermes_multitenancy.run_models import RunRequest
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="feishu_group_dfe8bc83167b_e18e",
+        user_key="ou_webui",
+        content="hello",
+        session_id="matrix_t1_group_webui_doc_123",
+    )
+
+    event = _build_webui_event(request)
+    session_id = _resolve_aiagent_session_id(
+        event,
+        profile_home=types.SimpleNamespace(name=request.profile_name),
+        sender_open_id=request.user_key,
+    )
+
+    assert event.source.platform.value == "webui"
+    assert event.raw_event["session_id"] == "matrix_t1_group_webui_doc_123"
+    assert "platform:webui" in session_id
+    assert "session:matrix_t1_group_webui_doc_123" in session_id
+    assert "platform:feishu" not in session_id
+
+
+def test_webui_run_broker_event_exposes_owner_open_id_for_lark_cli_identity():
+    from hermes_multitenancy.agent_real import _resolve_subprocess_sender_open_id
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        content="创建一个飞书云文档",
+        session_id="webui-lark-cli-identity",
+    )
+
+    event = _build_webui_event(request)
+
+    assert event.sender_open_id == "ou_owner"
+    assert _resolve_subprocess_sender_open_id(event) == "ou_owner"
+
+
+def test_webui_event_carries_only_an_explicit_sealed_runtime_principal():
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        credential_subject="ou_owner",
+        content="analyze repository",
+    )
+    assert _build_webui_event(request).trusted_runtime_principal is None
+
+    principal = issue_webui_principal(
+        profile_name="owner",
+        actor_subject="ou_owner",
+        credential_subject="ou_owner",
+    )
+    event = _build_webui_event(request, trusted_principal=principal)
+    assert event.trusted_runtime_principal is principal
+    assert event.trusted_runtime_principal.is_authentic() is True
+
+
+def test_webui_authenticated_owner_is_sealed_before_default_dispatch(
+    monkeypatch,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    captured = {}
+
+    def prepare_codex_evidence(_event, _profile_home):  # pragma: no cover
+        raise AssertionError("dispatch stub should only capture this callback")
+
+    async def dispatch(request, **kwargs):
+        captured["request"] = request
+        captured["principal"] = kwargs.get("trusted_principal")
+        captured["prepare_codex_evidence"] = kwargs.get("prepare_codex_evidence")
+        return "ok"
+
+    monkeypatch.setattr(broker, "_default_dispatch_agent", dispatch)
+    monkeypatch.setattr(
+        broker,
+        "_resolve_owner_scoped_profile",
+        lambda _request, _payload: ("owner", None),
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+            prepare_codex_evidence=prepare_codex_evidence,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "channel": "webui",
+                    "profile_name": "ignored",
+                    "user_key": "ignored",
+                    "credential_subject": "ignored",
+                    "content": "analyze repository",
+                },
+            )
+            await response.text()
+        finally:
+            await client.close()
+        assert response.status == 200
+
+    asyncio.run(runner())
+    principal = captured["principal"]
+    assert captured["request"].profile_name == "owner"
+    assert captured["request"].user_key == "ou_owner"
+    assert principal.is_authentic() is True
+    assert principal.profile_name == "owner"
+    assert principal.actor_subject == "ou_owner"
+    assert principal.credential_subject == "ou_owner"
+    assert captured["prepare_codex_evidence"] is prepare_codex_evidence
+
+
+def test_webui_harness_header_mints_server_admission_after_owner_binding(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.agent_real import harness_webui_runtime
+
+    captured = {}
+    admission = object()
+
+    def issue(**kwargs):
+        captured["issue"] = kwargs
+        return admission
+
+    async def dispatch(_request, **kwargs):
+        captured["admission"] = kwargs.get("trusted_harness_admission")
+        captured["prepare_codex_evidence"] = kwargs.get("prepare_codex_evidence")
+        return "ok"
+
+    monkeypatch.setattr(harness_webui_runtime, "issue_webui_harness_admission", issue)
+    monkeypatch.setattr(broker, "_default_dispatch_agent", dispatch)
+    monkeypatch.setattr(
+        broker,
+        "_resolve_owner_scoped_profile",
+        lambda _request, _payload: ("owner", None),
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+            prepare_codex_evidence=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("Harness must not use GitLab Codex evidence")
+            ),
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                    "X-Hermes-Expert-Engine": "harness",
+                },
+                json={
+                    "channel": "webui",
+                    "profile_name": "ignored",
+                    "user_key": "ignored",
+                    "credential_subject": "ignored",
+                    "session_id": "session-1",
+                    "content": "/server-bugfix analyze repository",
+                },
+            )
+            await response.text()
+        finally:
+            await client.close()
+        assert response.status == 200
+
+    asyncio.run(runner())
+    assert captured["issue"] == {
+        "profile_name": "owner",
+        "actor_subject": "ou_owner",
+        "session_id": "session-1",
+        "engine": "harness",
+        "flow": "server-bugfix",
+        "workspace": None,
+    }
+    assert captured["admission"] is admission
+    assert captured["prepare_codex_evidence"] is None
+
+
+def test_default_dispatch_attaches_only_server_prepared_codex_evidence(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
+    from hermes_multitenancy.webui_broker_server import _default_dispatch_agent
+
+    trusted = (object(), b"trusted-fingerprint-key", object())
+    seen = {}
+
+    def prepare(event, profile_home):
+        seen["principal"] = event.trusted_runtime_principal
+        seen["profile_home"] = profile_home
+        return trusted
+
+    async def stream(event, _profile_home, *, messages=None):
+        assert messages is None
+        assert event.trusted_gitlab_run_attestation is trusted[0]
+        assert event.trusted_gitlab_fingerprint_key is trusted[1]
+        assert event.trusted_single_actor_spend_state is trusted[2]
+        assert event.raw_event["metadata"]["trusted_gitlab_run_attestation"] == "forged"
+        yield "content", "ok"
+
+    monkeypatch.setattr(
+        router_mod, "_profile_name_to_home", lambda _name: tmp_path / "profiles" / "owner"
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream)
+    principal = issue_webui_principal(
+        profile_name="owner",
+        actor_subject="ou_owner",
+        credential_subject="ou_owner",
+    )
+
+    async def emit(_event):
+        return None
+
+    result = asyncio.run(
+        _default_dispatch_agent(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="ou_owner",
+                content="analyze repository",
+                metadata={"trusted_gitlab_run_attestation": "forged"},
+            ),
+            emit_event=emit,
+            trusted_principal=principal,
+            prepare_codex_evidence=prepare,
+        )
+    )
+    assert result == ""
+    assert seen["principal"] is principal
+    assert seen["profile_home"] == tmp_path / "profiles" / "owner"
+
+
+def test_webui_run_broker_event_preserves_metadata_without_a_second_time_source():
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        content="今天中午一点约会议室",
+        session_id="webui-current-date",
+        metadata={"instructions": "existing instructions"},
+    )
+
+    event = _build_webui_event(request)
+    assert event.raw_event["metadata"] == {"instructions": "existing instructions"}
+
+
+def test_run_broker_loads_only_shared_runtime_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_MULTITENANCY_CREDENTIAL_KEY=vault-key",
+                "HERMES_LARK_CLI_APP_ID=cli_public",
+                "FEISHU_APP_SECRET=must-not-load",
+                "ANTHROPIC_API_KEY=model-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(shared))
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    loaded = load_run_broker_shared_env()
+
+    assert loaded == {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY": "vault-key",
+        "HERMES_LARK_CLI_APP_ID": "cli_public",
+    }
+    assert os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "vault-key"
+    assert os.environ["HERMES_LARK_CLI_APP_ID"] == "cli_public"
+    assert "FEISHU_APP_SECRET" not in os.environ
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_run_broker_shared_env_does_not_override_existing_secret(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / ".env").write_text(
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY=file-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(shared))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "process-key")
+
+    loaded = load_run_broker_shared_env()
+
+    assert loaded == {}
+    assert os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "process-key"
+
+
+def _install_fake_cron(monkeypatch):
+    store = {}
+    cron_pkg = types.ModuleType("cron")
+    jobs_mod = types.ModuleType("cron.jobs")
+    scheduler_mod = types.ModuleType("cron.scheduler")
+
+    jobs_mod.HERMES_DIR = None
+    jobs_mod.CRON_DIR = None
+    jobs_mod.JOBS_FILE = None
+    jobs_mod.OUTPUT_DIR = None
+    scheduler_mod._hermes_home = None
+    scheduler_mod._LOCK_DIR = None
+    scheduler_mod._LOCK_FILE = None
+
+    def bucket():
+        key = str(jobs_mod.JOBS_FILE)
+        store.setdefault(key, [])
+        return store[key]
+
+    def create_job(
+        *,
+        prompt,
+        schedule,
+        name=None,
+        repeat=None,
+        deliver=None,
+        skills=None,
+        model=None,
+        provider=None,
+        base_url=None,
+        workdir=None,
+        profile=None,
+    ):
+        del model, provider, base_url, workdir, profile
+        job = {
+            "id": "abc123abc123",
+            "job_id": "abc123abc123",
+            "name": name,
+            "prompt": prompt,
+            "schedule": schedule,
+            "schedule_display": schedule,
+            "repeat": {"times": repeat, "completed": 0},
+            "deliver": deliver or "local",
+            "enabled": True,
+            "state": "scheduled",
+            "skills": skills or [],
+        }
+        bucket().append(job)
+        return job
+
+    def list_jobs(include_disabled=False):
+        jobs = list(bucket())
+        return jobs if include_disabled else [j for j in jobs if j.get("enabled", True)]
+
+    def get_job(job_id):
+        return next((j for j in bucket() if j["id"] == job_id), None)
+
+    def update_job(job_id, updates):
+        job = get_job(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        return job
+
+    def remove_job(job_id):
+        jobs = bucket()
+        before = len(jobs)
+        jobs[:] = [j for j in jobs if j["id"] != job_id]
+        return len(jobs) != before
+
+    def pause_job(job_id):
+        return update_job(job_id, {"enabled": False, "state": "paused"})
+
+    def resume_job(job_id):
+        return update_job(job_id, {"enabled": True, "state": "scheduled"})
+
+    def trigger_job(job_id):
+        return update_job(
+            job_id,
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": "now",
+            },
+        )
+
+    jobs_mod.create_job = create_job
+    jobs_mod.list_jobs = list_jobs
+    jobs_mod.get_job = get_job
+    jobs_mod.update_job = update_job
+    jobs_mod.remove_job = remove_job
+    jobs_mod.pause_job = pause_job
+    jobs_mod.resume_job = resume_job
+    jobs_mod.trigger_job = trigger_job
+    cron_pkg.jobs = jobs_mod
+    cron_pkg.scheduler = scheduler_mod
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs_mod)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler_mod)
+    return store
+
+
+def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_owner→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+
+    async def runner():
+        store = _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Profile": "owner",
+            "X-Hermes-User-Key": "ou_owner",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
+        }
+        try:
+            created = await client.post("/api/run-broker/jobs", headers=headers, json={
+                "name": "cron canary",
+                "schedule": "*/5 * * * *",
+                "prompt": "ping",
+                "deliver": "feishu",
+                "owner_open_id": "spoofed",
+                "owner_profile": "other",
+            })
+            create_body = await created.json()
+            listed = await client.get("/api/run-broker/jobs?include_disabled=true", headers=headers)
+            list_body = await listed.json()
+            paused = await client.post("/api/run-broker/jobs/abc123abc123/pause", headers=headers)
+            pause_body = await paused.json()
+            triggered = await client.post("/api/run-broker/jobs/abc123abc123/run", headers=headers)
+            trigger_body = await triggered.json()
+            deleted = await client.delete("/api/run-broker/jobs/abc123abc123", headers=headers)
+            delete_body = await deleted.json()
+        finally:
+            await client.close()
+
+        expected_jobs_file = tmp_path / ".hermes" / "profiles" / "owner" / "cron" / "jobs.json"
+        assert created.status == 200
+        assert create_body["job"]["owner_open_id"] == "ou_owner"
+        assert create_body["job"]["owner_profile"] == "owner"
+        assert str(expected_jobs_file) in store
+        assert listed.status == 200
+        assert list_body["jobs"][0]["id"] == "abc123abc123"
+        assert paused.status == 200
+        assert pause_body["job"]["state"] == "paused"
+        assert triggered.status == 200
+        assert trigger_body["queued"] is True
+        assert trigger_body["job"]["state"] == "scheduled"
+        assert trigger_body["job"]["next_run_at"] == "now"
+        assert deleted.status == 200
+        assert delete_body == {"ok": True}
+        assert store[str(expected_jobs_file)] == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_expert_job_is_authoritative_and_idempotent(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import expert_overlay, router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+    monkeypatch.setattr(expert_overlay, "resolve_caller_departments", lambda *a, **k: ["42"])
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_expert",
+        lambda _home, expert_id, **_kwargs: (
+            SimpleNamespace(expert_id="expert-visible")
+            if expert_id == "expert-visible"
+            else None
+        ),
+    )
+
+    async def runner():
+        store = _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+        app = create_run_broker_app(sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
+            "X-Hermes-Profile": "owner",
+            "X-Hermes-User-Key": "forged-owner",
+        }
+        payload = {
+            "name": "expert cron",
+            "schedule": "*/5 * * * *",
+            "prompt": "ping",
+            "expert_id": "expert-visible",
+            "idempotency_key": "schedule-session-1",
+            "owner_open_id": "ou_victim",
+            "owner_profile": "victim",
+            "source_app": "cli_forged",
+        }
+        try:
+            first, retry = await asyncio.gather(
+                client.post("/api/run-broker/jobs", headers=headers, json=payload),
+                client.post("/api/run-broker/jobs", headers=headers, json=payload),
+            )
+            first_body, retry_body = await first.json(), await retry.json()
+            rejected = await client.post(
+                "/api/run-broker/jobs",
+                headers=headers,
+                json={**payload, "expert_id": "expert-hidden", "idempotency_key": "hidden"},
+            )
+            rejected_body = await rejected.json()
+            local_delivery = await client.post(
+                "/api/run-broker/jobs",
+                headers=headers,
+                json={**payload, "deliver": "local", "idempotency_key": "local"},
+            )
+            local_delivery_body = await local_delivery.json()
+            changed_delivery = await client.patch(
+                "/api/run-broker/jobs/abc123abc123",
+                headers=headers,
+                json={"deliver": "local"},
+            )
+            changed_delivery_body = await changed_delivery.json()
+        finally:
+            await client.close()
+
+        jobs = next(iter(store.values()))
+        assert first.status == retry.status == 200
+        assert first_body["job"]["id"] == retry_body["job"]["id"]
+        assert len(jobs) == 1
+        assert jobs[0]["owner_open_id"] == "ou_owner"
+        assert jobs[0]["owner_profile"] == "owner"
+        assert jobs[0]["expert_id"] == "expert-visible"
+        assert jobs[0]["create_idempotency_key"] == "schedule-session-1"
+        assert "source_app" not in jobs[0]
+        assert rejected.status == 403
+        assert rejected_body == {"error": "expert not available for this agent"}
+        assert local_delivery.status == 400
+        assert local_delivery_body == {"error": "scheduled expert delivery must use feishu"}
+        assert changed_delivery.status == 400
+        assert changed_delivery_body == {"error": "scheduled expert delivery must use feishu"}
+        assert jobs[0]["deliver"] == "feishu"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_job_run_requires_authorization(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        store = _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            unauthorized = await client.post("/api/run-broker/jobs/abc123abc123/run")
+            body = await unauthorized.json()
+        finally:
+            await client.close()
+
+        assert unauthorized.status == 401
+        assert body == {"error": "unauthorized"}
+        assert store == {}
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_yaojunhua→yaojunhua.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="yaojunhua", profile_name="yaojunhua", open_id="ou_yaojunhua", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+
+    async def runner():
+        _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Profile": "yaojunhua",
+            "X-Hermes-User-Key": "ou_yaojunhua",
+            "X-Hermes-Owner-Open-Id": "ou_yaojunhua",
+        }
+        try:
+            created = await client.post("/api/run-broker/jobs", headers=headers, json={
+                "name": "cron canary",
+                "schedule": "*/5 * * * *",
+                "prompt": "ping",
+            })
+            create_body = await created.json()
+        finally:
+            await client.close()
+
+        assert created.status == 200
+        assert create_body["job"]["deliver"] == "feishu"
+        assert create_body["job"]["owner_open_id"] == "ou_yaojunhua"
+        assert create_body["job"]["owner_profile"] == "yaojunhua"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_jobs_expose_shadow_plan(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_owner→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+
+    async def runner():
+        _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Profile": "owner",
+            "X-Hermes-User-Key": "ou_owner",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
+        }
+        try:
+            created = await client.post("/api/run-broker/jobs", headers=headers, json={
+                "name": "cron canary",
+                "schedule": "*/5 * * * *",
+                "prompt": "ping",
+            })
+            plan_response = await client.get("/api/run-broker/jobs/abc123abc123/plan?shadow=1&due=1", headers=headers)
+            plan_body = await plan_response.json()
+        finally:
+            await client.close()
+
+        assert created.status == 200
+        assert plan_response.status == 200
+        assert plan_body["plan"]["mode"] == "shadow"
+        assert plan_body["plan"]["will_execute"] is False
+        assert plan_body["plan"]["would_execute"] is True
+        assert plan_body["plan"]["profile_name"] == "owner"
+        assert plan_body["plan"]["user_key"] == "ou_owner"
+        assert plan_body["plan"]["deliver_target"] == {
+            "platform": "feishu",
+            "chat_id": "ou_owner",
+            "thread_id": None,
+        }
+        assert plan_body["plan"]["secret_free"] is True
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_jobs_reject_invalid_profile(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get("/api/run-broker/jobs", headers={
+                "X-Hermes-Profile": "../shared",
+                "X-Hermes-User-Key": "ou_owner",
+            })
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 400
+        assert body == {"error": "invalid profile_name"}
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    # An owned non-root agent has its own open_id (router auto-provision writes
+    # user_id == open_id) and an owner_open_id pointing back at the owner — the
+    # production-equivalent state the routing backfill / self-agent provisioning
+    # produces. Sharing the owner's open_id here would make the backfill rewrite
+    # both rows to provenance='sync', tripping the one-sync-root-per-open_id
+    # unique index — an invalid topology, not a real ownership case.
+    seeded.upsert(
+        user_id="agent-owned",
+        profile_name="owned_agent_profile",
+        open_id="agent-owned",
+        provenance="auto",
+    )
+    seeded._conn.execute(
+        "UPDATE multitenancy_routing SET owner_open_id = 'ou_owner' "
+        "WHERE user_id = 'agent-owned'"
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            table = router_mod._get_routing_table()
+            assert table is not None
+            owned = table.lookup_agent("agent-owned")
+            assert owned is not None
+            assert owned.owner_open_id == "ou_owner"
+
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                    "X-Hermes-Agent-Id": " agent-owned ",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owned_agent_profile"
+        assert seen[0].user_key == "ou_owner"
+        assert seen[0].credential_subject == "ou_owner"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_agent_share_viewer_can_run_owned_agent(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-shared",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared analyst",
+    )
+    seeded.grant_agent_share(
+        agent_id="agent-shared",
+        grantee_open_id="ou_viewer",
+        role="viewer",
+        created_by_open_id="ou_owner",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_viewer",
+                    "X-Hermes-Agent-Id": "agent-shared",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "content": "hello shared agent",
+                })
+                body = await response.text()
+                revoke_table = RoutingTable(db_path)
+                try:
+                    revoke_table.revoke_agent_share("agent-shared", "ou_viewer")
+                finally:
+                    revoke_table.close()
+                revoked_response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_viewer",
+                    "X-Hermes-Agent-Id": "agent-shared",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "content": "hello after revoke",
+                })
+                revoked_body = await revoked_response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owned_agent_profile"
+        assert seen[0].user_key == "ou_viewer"
+        assert seen[0].credential_subject == "ou_viewer"
+        assert revoked_response.status == 403
+        assert "does not belong" in revoked_body["error"]
+        assert len(seen) == 1
+
+    asyncio.run(runner())
+
+
+def test_ingest_metadata_strips_client_agent_share_context():
+    from hermes_multitenancy.webui_broker_server import _sanitize_ingest_metadata
+
+    sanitized = _sanitize_ingest_metadata({
+        "agent_share_context": {
+            "actor_open_id": "ou_attacker",
+            "share_role": "manager",
+        },
+        "keep": "visible",
+    })
+
+    assert sanitized == {"keep": "visible"}
+
+
+def test_shared_agent_credential_lease_blocks_owner_provider_env(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import provider_adapter
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-shared-provider-key")
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+    monkeypatch.setattr(
+        provider_adapter,
+        "provider_env_for_aiagent",
+        lambda _profile_home: {"OPENAI_API_KEY": "owner-provider-secret"},
+    )
+
+    token = "shared-provider-token"
+    run_id = "run-shared-provider"
+    lease = mint_lease(
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        secret=lease_signing_secret(),
+    )
+    broker.register_credential_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        agent_id="agent-shared",
+        share_role="viewer",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/credentials/lease",
+                json={
+                    "lease": lease,
+                    "kind": "provider_env",
+                    "profile_name": "owned_agent_profile",
+                    "open_id": "ou_viewer",
+                    "run_id": run_id,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_credential_broker_token(token)
+
+        assert response.status == 200
+        assert body["payload"] == {}
+
+    asyncio.run(runner())
+
+
+def test_shared_agent_credential_lease_uses_actor_feishu_uat(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import provider_adapter
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-shared-uat-key")
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+    monkeypatch.setattr(provider_adapter, "_resolve_shared_home", lambda _profile_home: tmp_path)
+
+    calls: list[tuple[Path, str, str]] = []
+
+    def fake_load_best(shared_home: Path, profile_name: str, open_id: str):
+        calls.append((shared_home, profile_name, open_id))
+        return {"access_token": f"token-for-{open_id}", "open_id": open_id}
+
+    monkeypatch.setattr(feishu_uat_auth, "_load_best_uat_payload", fake_load_best)
+
+    token = "shared-uat-token"
+    run_id = "run-shared-uat"
+    lease = mint_lease(
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        secret=lease_signing_secret(),
+    )
+    broker.register_credential_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        agent_id="agent-shared",
+        share_role="viewer",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/credentials/lease",
+                json={
+                    "lease": lease,
+                    "kind": "feishu_uat",
+                    "profile_name": "owned_agent_profile",
+                    "open_id": "ou_viewer",
+                    "run_id": run_id,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_credential_broker_token(token)
+
+        assert response.status == 200
+        assert body["payload"] == {"access_token": "token-for-ou_viewer", "open_id": "ou_viewer"}
+
+    asyncio.run(runner())
+    assert calls == [(tmp_path, "owned_agent_profile", "ou_viewer")]
+
+
+@pytest.mark.parametrize("share_role", ["viewer", "editor"])
+def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path, share_role):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+    from tools import session_search_tool
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session("owner-session", source="api_server", user_id="ou_owner")
+        db.set_session_title("owner-session", "OWNER_PRIVATE_TITLE")
+        db.append_message(
+            session_id="owner-session",
+            role="user",
+            content="SHARED_SCOPE_MARKER owner-only context",
+        )
+        db.create_session("viewer-session", source="api_server", user_id="ou_viewer")
+        db.append_message(
+            session_id="viewer-session",
+            role="user",
+            content="SHARED_SCOPE_MARKER viewer context",
+        )
+    finally:
+        db.close()
+
+    async def fake_summarize(text, query, meta):
+        return text[:80]
+
+    monkeypatch.setattr(session_search_tool, "_summarize_session", fake_summarize, raising=False)
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+
+    token = "shared-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id="run-search",
+        agent_id="agent-shared",
+        share_role=share_role,
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "SHARED_SCOPE_MARKER", "limit": 5},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+            for query in ("", "OWNER_PRIVATE_TITLE"):
+                scoped = await client.post(
+                    "/api/run-broker/internal/session-search",
+                    json={"query": query, "limit": 5},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert scoped.status == 200
+                scoped_result = json.loads((await scoped.json())["result"])
+                assert scoped_result["success"] is True
+                assert "owner-session" not in json.dumps(scoped_result)
+                assert "owner-only context" not in json.dumps(scoped_result)
+                assert all(row.get("title") != "OWNER_PRIVATE_TITLE" for row in scoped_result["results"])
+                if not query:
+                    assert [row["session_id"] for row in scoped_result["results"]] == ["viewer-session"]
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert response.status == 200
+        result = json.loads(body["result"])
+        assert result["success"] is True
+        assert [row["session_id"] for row in result["results"]] == ["viewer-session"]
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-shared",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared analyst",
+    )
+    seeded.grant_agent_share(
+        agent_id="agent-shared",
+        grantee_open_id="ou_manager",
+        role="manager",
+        created_by_open_id="ou_owner",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                owner_grant = await client.post(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={"grantee_open_id": "ou_editor", "role": "editor"},
+                )
+                owner_grant_body = await owner_grant.json()
+
+                owner_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                owner_members_body = await owner_members.json()
+
+                editor_shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_shared_body = await editor_shared.json()
+
+                editor_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_members_body = await editor_members.json()
+
+                manager_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_manager"},
+                )
+                manager_members_body = await manager_members.json()
+
+                manager_revoke = await client.delete(
+                    "/api/run-broker/agents/agent-shared/shares/ou_editor",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_manager"},
+                )
+                manager_revoke_body = await manager_revoke.json()
+
+                editor_after_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_after_revoke_body = await editor_after_revoke.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert owner_grant.status == 200
+        assert owner_grant_body["share"]["role"] == "editor"
+        assert owner_members.status == 200
+        assert owner_members_body["actor_role"] == "owner"
+        assert editor_shared.status == 200
+        assert editor_shared_body["agents"] == [{
+            "agent_id": "agent-shared",
+            "profile_name": "owned_agent_profile",
+            "owner_open_id": "ou_owner",
+            "display_label": "Shared analyst",
+            "role": "editor",
+        }]
+        assert editor_members.status == 403
+        assert "manager" in editor_members_body["error"]
+        assert manager_members.status == 200
+        assert manager_members_body["actor_role"] == "manager"
+        assert {share["grantee_open_id"] for share in manager_members_body["shares"]} == {
+            "ou_editor",
+            "ou_manager",
+        }
+        assert manager_revoke.status == 200
+        assert manager_revoke_body == {"ok": True}
+        assert editor_after_revoke.status == 200
+        assert editor_after_revoke_body["agents"] == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_agent_share_principal_management_endpoints(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-principal",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared principal analyst",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-other",
+        profile_name="other_agent_profile",
+        owner_open_id="ou_other_owner",
+        display_label="Other principal analyst",
+    )
+    owner_principal = seeded.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_owner",
+        aliases=[{"id_type": "open_id", "id_value": "ou_owner", "app_id": "cli_web"}],
+    )
+    other_principal = seeded.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_other_viewer",
+    )
+    other_share = seeded.grant_agent_share_principal(
+        agent_id="agent-other",
+        grantee_principal_id=other_principal.principal_id,
+        role="viewer",
+        created_by_open_id="ou_other_owner",
+    )
+    seeded.close()
+
+    def fake_resolve_identity_lookup(table, lookup, requester):
+        assert requester.principal_id == owner_principal.principal_id
+        assert lookup == {"provider": "feishu", "type": "email", "value": "editor@example.test"}
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_editor",
+            display_name="Editor User",
+            avatar_url="https://example.test/editor.png",
+            email="editor@example.test",
+            aliases=[
+                {"id_type": "email", "id_value": "editor@example.test"},
+                {"id_type": "open_id", "id_value": "ou_editor_current", "app_id": "cli_web"},
+            ],
+        )
+
+    monkeypatch.setattr(broker_mod, "_resolve_identity_lookup", fake_resolve_identity_lookup)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                owner_headers = {
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                    "X-Hermes-Actor-Principal-Id": owner_principal.principal_id,
+                    "X-Hermes-Actor-Provider": "feishu",
+                    "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                    "X-Hermes-Actor-App-Id": "cli_web",
+                }
+                grant = await client.post(
+                    "/api/run-broker/agents/agent-principal/shares",
+                    headers=owner_headers,
+                    json={
+                        "grantee": {
+                            "provider": "feishu",
+                            "type": "email",
+                            "value": "editor@example.test",
+                        },
+                        "role": "editor",
+                    },
+                )
+                grant_body = await grant.json()
+
+                cross_agent_revoke = await client.delete(
+                    f"/api/run-broker/agents/agent-principal/shares/{other_share.share_id}",
+                    headers=owner_headers,
+                )
+                other_after_cross_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_other_viewer_current",
+                        "X-Hermes-Actor-Principal-Id": other_principal.principal_id,
+                    },
+                )
+                other_after_cross_revoke_body = await other_after_cross_revoke.json()
+
+                principal_id = grant_body["share"]["grantee_principal_id"]
+                shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_editor_current",
+                        "X-Hermes-Actor-Principal-Id": principal_id,
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                    },
+                )
+                shared_body = await shared.json()
+
+                members = await client.get(
+                    "/api/run-broker/agents/agent-principal/shares",
+                    headers=owner_headers,
+                )
+                members_body = await members.json()
+
+                revoke = await client.delete(
+                    f"/api/run-broker/agents/agent-principal/shares/{grant_body['share']['share_id']}",
+                    headers=owner_headers,
+                )
+                after_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_editor_current",
+                        "X-Hermes-Actor-Principal-Id": principal_id,
+                    },
+                )
+                after_revoke_body = await after_revoke.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert grant.status == 200
+        assert grant_body["share"]["share_id"].startswith("shr_")
+        assert grant_body["share"]["grantee_principal_id"].startswith("prn_")
+        assert cross_agent_revoke.status == 200
+        assert other_after_cross_revoke.status == 200
+        assert other_after_cross_revoke_body["agents"] == [{
+            "agent_id": "agent-other",
+            "profile_name": "other_agent_profile",
+            "owner_open_id": "ou_other_owner",
+            "display_label": "Other principal analyst",
+            "role": "viewer",
+        }]
+        assert grant_body["share"]["principal"] == {
+            "provider": "feishu",
+            "display_name": "Editor User",
+            "avatar_url": "https://example.test/editor.png",
+            "email": "editor@example.test",
+            "user_id": "u_editor",
+        }
+        assert shared.status == 200
+        assert shared_body["agents"] == [{
+            "agent_id": "agent-principal",
+            "profile_name": "owned_agent_profile",
+            "owner_open_id": "ou_owner",
+            "display_label": "Shared principal analyst",
+            "role": "editor",
+        }]
+        assert members.status == 200
+        assert members_body["shares"][0]["principal"]["display_name"] == "Editor User"
+        assert "ou_editor_current" not in str(members_body["shares"][0])
+        assert revoke.status == 200
+        assert after_revoke_body["agents"] == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_materializes_actor_principal_from_trusted_headers(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-trusted-headers",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Trusted header analyst",
+    )
+    seeded.close()
+
+    def fake_resolve_identity_lookup(table, lookup, requester):
+        assert requester.provider == "feishu"
+        assert requester.tenant_key == "tenant_a"
+        assert requester.canonical_id_type == "user_id"
+        assert requester.canonical_id == "u_owner"
+        assert requester.display_name == "孙可"
+        assert lookup == {"provider": "feishu", "type": "email", "value": "viewer@example.test"}
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_viewer",
+            display_name="Viewer User",
+            email="viewer@example.test",
+            aliases=[{"id_type": "email", "id_value": "viewer@example.test"}],
+        )
+
+    monkeypatch.setattr(broker_mod, "_resolve_identity_lookup", fake_resolve_identity_lookup)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                grant = await client.post(
+                    "/api/run-broker/agents/agent-trusted-headers/shares",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_owner",
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                        "X-Hermes-Actor-User-Id": "u_owner",
+                        "X-Hermes-Actor-Display-Name-Encoded": "%E5%AD%99%E5%8F%AF",
+                        "X-Hermes-Actor-Avatar-Url": "https://example.test/owner.png",
+                        "X-Hermes-Actor-Email": "owner@example.test",
+                    },
+                    json={
+                        "grantee": {
+                            "provider": "feishu",
+                            "type": "email",
+                            "value": "viewer@example.test",
+                        },
+                        "role": "viewer",
+                    },
+                )
+                grant_body = await grant.json()
+
+                shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_viewer_current",
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                        "X-Hermes-Actor-User-Id": "u_viewer",
+                    },
+                )
+                shared_body = await shared.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert grant.status == 200
+        assert grant_body["share"]["principal"]["display_name"] == "Viewer User"
+        assert shared.status == 200
+        assert shared_body["agents"][0]["agent_id"] == "agent-trusted-headers"
+
+        table = RoutingTable(db_path)
+        try:
+            owner = table.find_principal(
+                provider="feishu",
+                tenant_key="tenant_a",
+                canonical_id_type="user_id",
+                canonical_id="u_owner",
+            )
+            assert owner is not None
+            assert owner.display_name == "孙可"
+            assert table.lookup_principal_by_alias(
+                provider="feishu",
+                tenant_key="tenant_a",
+                id_type="open_id",
+                id_value="ou_owner",
+                app_id="cli_web",
+            ).principal_id == owner.principal_id
+        finally:
+            table.close()
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_resolves_feishu_email_lookup_from_contact_directory(monkeypatch):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.sync import feishu_org
+
+    table = RoutingTable(":memory:")
+    try:
+        table.upsert(
+            user_id="u_owner",
+            profile_name="owner_profile",
+            open_id="ou_owner",
+            provenance="sync",
+        )
+        table.upsert(
+            user_id="u_editor",
+            profile_name="editor_profile",
+            open_id="ou_editor",
+            provenance="sync",
+        )
+        requester = table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_owner",
+        )
+        monkeypatch.setattr(feishu_org, "fetch_contact_directory", lambda **_kwargs: {
+            "ou_editor": {
+                "email": "editor@example.test",
+                "name": "Editor User",
+            },
+        })
+
+        principal = broker_mod._resolve_identity_lookup(
+            table,
+            {"provider": "feishu", "type": "email", "value": "editor@example.test"},
+            requester,
+        )
+
+        assert principal.provider == "feishu"
+        assert principal.tenant_key == "tenant_a"
+        assert principal.canonical_id_type == "user_id"
+        assert principal.canonical_id == "u_editor"
+        assert principal.display_name == "Editor User"
+        assert principal.email == "editor@example.test"
+        assert table.lookup_principal_by_alias(
+            provider="feishu",
+            tenant_key="tenant_a",
+            id_type="email",
+            id_value="editor@example.test",
+        ).principal_id == principal.principal_id
+    finally:
+        table.close()
+
+
+def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    owner_skill = shared / "profiles" / "owned_agent_profile" / "skills" / "Keep" / "kep-prd-analysis"
+    victim_skill = shared / "profiles" / "victim_profile" / "skills" / "Private" / "secret-runbook"
+    owner_skill.mkdir(parents=True)
+    victim_skill.mkdir(parents=True)
+    (owner_skill / "SKILL.md").write_text(
+        "\n".join([
+            "---",
+            "name: kep-prd-analysis",
+            "description: PRD analysis helper",
+            "---",
+            "# KEP PRD Analysis",
+            "",
+            "Internal runbook body that must never be returned.",
+        ]),
+        encoding="utf-8",
+    )
+    (victim_skill / "SKILL.md").write_text("# Secret Runbook\nvictim-only command\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="agent-owned",
+        profile_name="owned_agent_profile",
+        open_id="agent-owned",
+        provenance="auto",
+    )
+    seeded.upsert(
+        user_id="victim-root",
+        profile_name="victim_profile",
+        open_id="ou_victim",
+        provenance="sync",
+    )
+    seeded._conn.execute(
+        "UPDATE multitenancy_routing SET owner_open_id = 'ou_owner' "
+        "WHERE user_id = 'agent-owned'"
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands?profile_name=victim_profile",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_owner",
+                        "X-Hermes-Agent-Id": "agent-owned",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["ok"] is True
+        assert body["profile_name"] == "owned_agent_profile"
+        assert [command["name"] for command in body["commands"][:6]] == [
+            "new",
+            "reset",
+            "status",
+            "plan",
+            "goal",
+            "subgoal",
+        ]
+        assert all(command["type"] == "session_history" for command in body["commands"][:3])
+        assert [command["type"] for command in body["commands"][3:6]] == ["skill", "goal", "goal"]
+        assert body["commands"][-1] == {
+            "name": "kep-prd-analysis",
+            "slash": "/kep-prd-analysis",
+            "title": "kep-prd-analysis",
+            "description": "PRD analysis helper",
+            "source": "skill",
+            "type": "skill",
+            "category": "Keep",
+        }
+        encoded = json.dumps(body, ensure_ascii=False)
+        assert "secret-runbook" not in encoded
+        assert "victim-only" not in encoded
+        assert "KEP PRD Analysis" not in encoded
+        assert "Internal runbook body" not in encoded
+        assert str(shared) not in encoded
+
+    asyncio.run(runner())
+
+
+def test_webui_slash_registry_returns_empty_list_for_profile_without_skills(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "owner_sync_profile").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["ok"] is True
+        assert body["profile_name"] == "owner_sync_profile"
+        assert [command["name"] for command in body["commands"]] == [
+            "new",
+            "reset",
+            "status",
+            "plan",
+            "goal",
+            "subgoal",
+        ]
+        assert [command["type"] for command in body["commands"]] == [
+            "session_history",
+            "session_history",
+            "session_history",
+            "skill",
+            "goal",
+            "goal",
+        ]
+
+    asyncio.run(runner())
+
+
+def test_webui_slash_registry_dedupes_builtin_and_skill_slashes(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    plan_skill = shared / "profiles" / "owner_sync_profile" / "skills" / "software-development" / "plan"
+    plan_skill.mkdir(parents=True)
+    (plan_skill / "SKILL.md").write_text(
+        "---\nname: plan\ndescription: local plan skill should not duplicate builtin /plan\n---\n# Plan\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        plan_rows = [command for command in body["commands"] if command["slash"] == "/plan"]
+        assert plan_rows == [{
+            "name": "plan",
+            "slash": "/plan",
+            "title": "Plan",
+            "description": "Expand the profile's plan skill for the current request",
+            "source": "builtin",
+            "type": "skill",
+            "category": "Session",
+        }]
+
+    asyncio.run(runner())
+
+
+def test_webui_slash_registry_requires_owner_header(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "owner_sync_profile").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands?profile_name=owner_sync_profile",
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_creates_owner_scoped_agent_route(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="feishu_g41a5b5g",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                    "display_label": "Coder",
+                    "description": "Software engineering agent",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+
+            table = router_mod._get_routing_table()
+            assert table is not None
+            row = table.lookup_agent(body["agent_id"])
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["profile_name"] == "web_coder"
+        assert body["routed_profile_name"].startswith("webui_")
+        assert body["owner_open_id"] == "ou_owner"
+        assert body["agent_id"] == "webui:ou_owner:web_coder"
+        assert row is not None
+        assert row.profile_name == body["routed_profile_name"]
+        assert row.kind == "agent"
+        assert row.provenance == "webui-agent"
+        assert row.owner_open_id == "ou_owner"
+        assert row.upstream_profile == "feishu_g41a5b5g"
+        assert row.display_label == "Coder"
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "feishu_g41a5b5g").mkdir(parents=True)
+    (shared_home / "skills" / "lark-docs").mkdir(parents=True)
+    (shared_home / "skills" / "lark-docs" / "SKILL.md").write_text("# Lark Docs\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        "skills:\n  - lark-docs\n",
+        encoding="utf-8",
+    )
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platforms:\n"
+        "  feishu:\n"
+        "    enabled: true\n"
+        "    extra:\n"
+        "      app_id: cli_should_not_copy\n"
+        "      app_secret: secret_should_not_copy\n"
+        "      connection_mode: websocket\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="feishu_g41a5b5g",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                    "display_label": "Coder",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["agent_id"] == "webui:ou_owner:web_coder"
+        return body
+
+    body = asyncio.run(runner())
+
+    profile_home = shared_home / "profiles" / body["routed_profile_name"]
+    marker = json.loads((profile_home / "group_profile.json").read_text(encoding="utf-8"))
+    assert marker == {
+        "kind": "group",
+        "chat_id": "webui:ou_owner:web_coder",
+        "owner_open_id": "ou_owner",
+        "display_label": "Coder",
+        "feishu_auth_disabled": True,
+        "source": "webui-agent",
+    }
+    assert (profile_home / "feishu_uat").is_dir()
+    assert list((profile_home / "feishu_uat").glob("*.json")) == []
+    assert (profile_home / "skills" / "lark-docs").is_symlink()
+
+    config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    import yaml
+
+    config = yaml.safe_load(config_text)
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
+    assert "lark-cli" in config_text
+    assert "platform_toolsets_mode" in config_text
+    assert "enabled: false" in config_text
+    assert "cli_should_not_copy" not in config_text
+    assert "secret_should_not_copy" not in config_text
+    assert "connection_mode" not in config_text
+
+    env_text = (profile_home / ".env").read_text(encoding="utf-8")
+    assert "FEISHU_HOME_CHANNEL" not in env_text
+
+
+def test_webui_profile_provisioning_isolates_same_name_across_owners(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owner_b").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert(user_id="root-b", profile_name="owner_b", open_id="ou_owner_b", provenance="sync")
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response_a = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "display_label": "Coder",
+                })
+                body_a = await response_a.json()
+                response_b = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_b",
+                }, json={
+                    "profile_name": "web_coder",
+                    "display_label": "Coder",
+                })
+                body_b = await response_b.json()
+            finally:
+                await client.close()
+
+            table = router_mod._get_routing_table()
+            assert table is not None
+            row_a = table.lookup_agent(body_a["agent_id"])
+            row_b = table.lookup_agent(body_b["agent_id"])
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response_a.status == 200
+        assert response_b.status == 200
+        assert row_a is not None
+        assert row_b is not None
+        return body_a, body_b, row_a.profile_name, row_b.profile_name
+
+    body_a, body_b, profile_a, profile_b = asyncio.run(runner())
+
+    assert body_a["agent_id"] == "webui:ou_owner_a:web_coder"
+    assert body_b["agent_id"] == "webui:ou_owner_b:web_coder"
+    assert profile_a != profile_b
+    assert profile_a != "web_coder"
+    assert profile_b != "web_coder"
+    assert (shared_home / "profiles" / profile_a / "group_profile.json").is_file()
+    assert (shared_home / "profiles" / profile_b / "group_profile.json").is_file()
+    assert not (shared_home / "profiles" / "web_coder").exists()
+
+
+def test_webui_profile_provisioning_isolates_truncated_names_for_same_owner(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.close()
+
+    base = "a" * 109
+    logical_a = base + ("x" * 19)
+    logical_b = base + ("y" * 19)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response_a = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={"profile_name": logical_a})
+                body_a = await response_a.json()
+                response_b = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={"profile_name": logical_b})
+                body_b = await response_b.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response_a.status == 200
+        assert response_b.status == 200
+        return body_a, body_b
+
+    body_a, body_b = asyncio.run(runner())
+
+    assert body_a["agent_id"] != body_b["agent_id"]
+    assert body_a["routed_profile_name"] != body_b["routed_profile_name"]
+    assert len(body_a["routed_profile_name"]) <= 128
+    assert len(body_b["routed_profile_name"]) <= 128
+    assert (shared_home / "profiles" / body_a["routed_profile_name"] / "group_profile.json").is_file()
+    assert (shared_home / "profiles" / body_b["routed_profile_name"] / "group_profile.json").is_file()
+
+
+def test_webui_profile_provisioning_requires_owner_header(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    RoutingTable(db_path).close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "owner identity required" in body
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_rejects_cross_owner_upstream_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owner_b").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert(user_id="root-b", profile_name="owner_b", open_id="ou_owner_b", provenance="sync")
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "owner_b",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "upstream_profile" in body
+        assert not any((shared_home / "profiles").glob("webui_*_web_coder_*"))
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_allows_owned_upstream_agent_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owned_template").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert_owned_agent(
+        agent_id="webui:ou_owner_a:template",
+        profile_name="owned_template",
+        owner_open_id="ou_owner_a",
+        display_label="Template",
+        upstream_profile="owner_a",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "owned_template",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["upstream_profile"] == "owned_template"
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_rejects_cross_owner_agent_id(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="root-other",
+        profile_name="other_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded._conn.execute(
+        """
+        INSERT INTO multitenancy_routing
+            (user_id, profile_name, open_id, active, synced_at, version,
+             created_at, updated_at, kind, owner_open_id, display_label,
+             agent_id, provenance, upstream_profile)
+        VALUES
+            ('webui:ou_other:web_coder', 'web_coder', 'webui:ou_other:web_coder',
+             1, 1, 1, 1, 1, 'agent', 'ou_other', 'Other Coder',
+             'webui:ou_other:web_coder', 'webui-agent', 'other_profile')
+        """
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "profile_name": "web_coder",
+                    "agent_id": "webui:ou_other:web_coder",
+                    "upstream_profile": "owner_profile",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "does not belong" in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_rejects_cross_owner_agent_id(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-agent",
+        profile_name="other_agent_profile",
+        open_id="ou_other",
+        provenance="auto",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            table = router_mod._get_routing_table()
+            assert table is not None
+            assert table.lookup_agent("other-agent") is not None
+
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "agent_id": "other-agent",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "does not belong" in body
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_uses_owner_scoped_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    skill_source.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/skills/install",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "spoofed_profile",
+                        "skill_path": "hub/weather",
+                        "version": "v1",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["profile_name"] == "owner_sync_profile"
+        assert body["install"]["installed"] is True
+        assert body["install"]["skill_path"] == "hub/weather"
+        assert (profile / "skills" / "hub" / "weather").is_symlink()
+        assert not (shared / "profiles" / "spoofed_profile").exists()
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_without_owner_header_rejects_spoofed_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    skill_source.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", raising=False)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/skills/install",
+                json={
+                    "profile_name": "victim",
+                    "skill_path": "hub/weather",
+                    "version": "v1",
+                },
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 403
+        assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
+        assert not (shared / "profiles" / "victim").exists()
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_blocks_external_source_without_policy_allow(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    skill_source.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    (shared / "discovery-policy.yaml").write_text(
+        """
+        enabled: true
+        audit:
+          enabled: true
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/skills/install",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "skill_path": "hub/weather",
+                        "version": "v1",
+                        "discovery_source": "skills-sh",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        audit_path = shared / "audit" / "discovery-policy.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8").strip())
+
+        assert response.status == 403
+        assert body["error"] == "discovery source blocked by policy"
+        assert body["discovery_policy"]["source"] == "skills-sh"
+        assert body["discovery_policy"]["allowed"] is False
+        assert not (profile / "skills" / "hub" / "weather").exists()
+        assert record["profile_name"] == "owner_sync_profile"
+        assert record["user_key"] == "ou_owner"
+        assert record["sources"]["blocked"] == ["skills-sh"]
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_allows_external_source_for_matching_owner(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    skill_source.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    (shared / "discovery-policy.yaml").write_text(
+        """
+        enabled: true
+        audit:
+          enabled: true
+        sources:
+          skills-sh:
+            action: allow
+            audience:
+              users:
+                - ou_owner
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/skills/install",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "skill_path": "hub/weather",
+                        "version": "v1",
+                        "discovery_source": "skills-sh",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        audit_path = shared / "audit" / "discovery-policy.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8").strip())
+
+        assert response.status == 200
+        assert body["profile_name"] == "owner_sync_profile"
+        assert body["discovery_policy"]["source"] == "skills-sh"
+        assert body["discovery_policy"]["allowed"] is True
+        assert body["install"]["installed"] is True
+        assert (profile / "skills" / "hub" / "weather").is_symlink()
+        assert record["sources"]["allowed"] == ["skills-sh"]
+
+    asyncio.run(runner())
+
+
+def test_webui_skill_audit_collects_all_profiles(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    alice_skill = shared / "profiles" / "alice" / "skills" / "managed" / "weather"
+    group_skill = shared / "profiles" / "feishu_group_sales" / "skills" / "shared" / "readonly"
+    alice_skill.mkdir(parents=True)
+    group_skill.mkdir(parents=True)
+    (alice_skill / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    (group_skill / "SKILL.md").write_text("# Readonly\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get("/api/run-broker/skills/audit")
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert sorted(body["profiles"]) == ["alice", "feishu_group_sales"]
+        assert body["profiles"]["alice"]["skills"][0]["skill_path"] == "managed/weather"
+        assert body["profiles"]["feishu_group_sales"]["skills"][0]["skill_path"] == "shared/readonly"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_without_agent_id_resolves_sync_root(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "user_key": "ou_webui",
+                    "content": "hello owner root",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owner_sync_profile"
+        assert seen[0].user_key == "ou_owner"
+        assert seen[0].credential_subject == "ou_owner"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_without_owner_header_keeps_legacy_profile_resolution():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "legacy_client_profile",
+                "agent_id": "ignored-without-owner-header",
+                "user_key": "ou_webui",
+                "content": "hello legacy path",
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "legacy_client_profile"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_enforced_without_owner_header_returns_403(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "legacy_client_profile",
+                "user_key": "ou_webui",
+                "content": "hello enforced path",
+            })
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 403
+        assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_enforced_with_whitespace_owner_header_returns_403(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", headers={
+                "X-Hermes-Owner-Open-Id": "   ",
+            }, json={
+                "channel": "webui",
+                "profile_name": "legacy_client_profile",
+                "user_key": "ou_webui",
+                "content": "hello enforced path",
+            })
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 403
+        assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_enforced_with_owner_header_resolves_owned_profile(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="agent-owned",
+        profile_name="owned_agent_profile",
+        open_id="agent-owned",
+        provenance="auto",
+    )
+    seeded._conn.execute(
+        "UPDATE multitenancy_routing SET owner_open_id = 'ou_owner' "
+        "WHERE user_id = 'agent-owned'"
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                    "X-Hermes-Agent-Id": " agent-owned ",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owned_agent_profile"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_enforcement_disabled_keeps_legacy_resolution():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "legacy_client_profile",
+                "agent_id": "ignored-without-owner-header",
+                "user_key": "ou_webui",
+                "content": "hello legacy path",
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "legacy_client_profile"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_enforced_cross_owner_error_is_not_masked(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-agent",
+        profile_name="other_agent_profile",
+        open_id="ou_other",
+        provenance="auto",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "agent_id": "other-agent",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert body == {"error": "agent_id 'other-agent' does not belong to asserted owner"}
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_start_run_broker_server_refuses_without_key(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_PORT", "0")
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+        with pytest.raises(SystemExit) as excinfo:
+            await broker_mod.start_run_broker_server()
+        assert excinfo.value.code not in (None, 0)
+        assert broker_mod._runner is None
+        assert broker_mod._site is None
+
+    asyncio.run(runner())
+
+
+def test_start_run_broker_server_starts_with_key(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_PORT", "0")
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+        try:
+            await broker_mod.start_run_broker_server()
+            assert broker_mod._runner is not None
+            assert broker_mod._site is not None
+            assert broker_mod.run_broker_server_ready() is True
+        finally:
+            await broker_mod.stop_run_broker_server()
+
+    asyncio.run(runner())
+
+
+def test_ensure_run_broker_server_started_binds_without_dispatch(monkeypatch):
+    import json
+    import socket
+    from urllib.request import Request, urlopen
+
+    import hermes_multitenancy.webui_broker_server as broker_mod
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_PORT", str(port))
+
+    broker_mod.ensure_run_broker_server_started()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{port}/api/run-broker/health",
+            headers={"Authorization": "Bearer broker-secret"},
+        )
+        with urlopen(request, timeout=2) as response:
+            body = json.loads(response.read())
+        assert body == {"ok": True, "service": "hermes-multitenancy-run-broker"}
+        assert broker_mod.run_broker_server_ready() is True
+    finally:
+        asyncio.run(broker_mod.stop_run_broker_server())
+
+
+def test_ensure_run_broker_server_started_clears_failed_task_and_retries(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker import periphery
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+    attempts: list[str] = []
+
+    async def fail_start():
+        attempts.append("start")
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(periphery, "start_run_broker_server", fail_start)
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+        broker_mod.ensure_run_broker_server_started()
+        first_task = broker_mod._server_task
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert first_task is not None
+        assert first_task.done()
+        assert attempts == ["start"]
+        assert broker_mod._server_task is None
+        assert broker_mod.run_broker_server_ready() is False
+
+        broker_mod.ensure_run_broker_server_started()
+        second_task = broker_mod._server_task
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert second_task is not None
+        assert second_task is not first_task
+        assert second_task.done()
+        assert attempts == ["start", "start"]
+        assert broker_mod._server_task is None
+        await broker_mod.stop_run_broker_server()
+
+    asyncio.run(runner())
+
+
+def test_failed_run_broker_callback_does_not_clear_newer_task(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker import periphery
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+
+        async def fail_start():
+            raise OSError("old bind failed")
+
+        old_task = asyncio.create_task(fail_start())
+        try:
+            await old_task
+        except OSError:
+            pass
+        newer_task = asyncio.create_task(asyncio.sleep(60))
+        broker_mod._server_task = newer_task
+
+        periphery._log_run_broker_start_failure(old_task)
+
+        assert broker_mod._server_task is newer_task
+        newer_task.cancel()
+        try:
+            await newer_task
+        except asyncio.CancelledError:
+            pass
+        broker_mod._server_task = None
+
+    asyncio.run(runner())
+
+
+def test_ensure_run_broker_server_started_is_noop_when_disabled(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+        broker_mod.ensure_run_broker_server_started()
+        await asyncio.sleep(0)
+        assert broker_mod._server_task is None
+        assert broker_mod._runner is None
+        assert broker_mod._site is None
+        assert broker_mod.run_broker_server_ready() is False
+
+    asyncio.run(runner())
+
+
+def test_connectors_handler_maps_fresh_query_to_use_cache(monkeypatch, tmp_path):
+    """The /connectors handler must map ?fresh=1 → use_cache=False (live read) and
+    its absence → use_cache=True (serve from the short-TTL cache)."""
+    import asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+    from hermes_multitenancy.connectors import registry
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)  # _authorized → open
+
+    # Owner-scoped resolver verifies the query user_key owns the profile; seed ou_o→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="ou_o", profile_name="owner", open_id="ou_o", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+    captured: list[bool] = []
+
+    def fake_collect(*, profile_name, open_id, use_cache=False, **kw):
+        captured.append(use_cache)
+        return []
+
+    monkeypatch.setattr(registry, "collect_connector_statuses", fake_collect)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _r: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r1 = await client.get("/api/run-broker/connectors?profile_name=owner&user_key=ou_o")
+            await r1.text()
+            r2 = await client.get("/api/run-broker/connectors?profile_name=owner&user_key=ou_o&fresh=1")
+            await r2.text()
+            assert r1.status == 200 and r2.status == 200
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+    assert captured == [True, False]  # cached by default; fresh=1 bypasses
+
+
+def test_webui_experts_endpoint_always_carries_use_count(monkeypatch, tmp_path: Path):
+    """SPEC contract: every experts row has int use_count; bumped id shows N,
+    unmatched catalog experts 0; usage failure still returns the catalog."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import expert_overlay, expert_usage
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    usage_db = tmp_path / "usage.db"
+    assert expert_usage.bump("kep-a", usage_db)
+    assert expert_usage.bump("kep-a", usage_db)
+    monkeypatch.setattr(expert_usage, "DEFAULT_DB_PATH", usage_db)
+
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_caller_departments",
+        lambda *_a, **_k: [],
+    )
+    monkeypatch.setattr(
+        expert_overlay,
+        "list_experts",
+        lambda *_a, **_k: [
+            {"id": "kep-a", "name": "A", "release_version": "1.0.9"},
+            {"id": "kep-b", "name": "B"},
+        ],
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                headers = {"X-Hermes-Owner-Open-Id": "ou_owner"}
+                ok = await client.get("/api/run-broker/experts", headers=headers)
+                ok_body = await ok.json()
+
+                # usage read failure → catalog still served with use_count 0
+                monkeypatch.setattr(
+                    expert_usage,
+                    "counts",
+                    lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+                )
+                degraded = await client.get("/api/run-broker/experts", headers=headers)
+                degraded_body = await degraded.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert ok.status == 200
+        rows = {r["id"]: r for r in ok_body["experts"]}
+        assert rows["kep-a"]["use_count"] == 2
+        assert rows["kep-a"]["release_version"] == "1.0.9"
+        assert rows["kep-b"]["use_count"] == 0
+        assert all("agent_md" not in r for r in ok_body["experts"])
+
+        assert degraded.status == 200
+        assert all(r["use_count"] == 0 for r in degraded_body["experts"])
+
+    asyncio.run(runner())
+
+
+def test_run_scoped_broker_token_binds_owner_and_rejects_spoofed_peer(monkeypatch, tmp_path: Path):
+    """A sandboxed agent's run-scoped broker token may only act as its own owner.
+
+    Regression for the 2026-08-04 security review finding: the sandbox child was
+    handed the SHARED master broker key while the owner identity was taken
+    verbatim from caller-supplied headers/query, so any agent shell could list or
+    mutate a colleague's cron jobs by passing their open_id. The run-scoped token
+    now carries the (profile, open_id) binding server-side; self-reported owner
+    fields are ignored, and a mismatching assertion is refused.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    (tmp_path / "profiles" / "alice_profile").mkdir(parents=True)
+    (tmp_path / "profiles" / "bob_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="alice",
+        profile_name="alice_profile",
+        open_id="ou_alice",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="bob",
+        profile_name="bob_profile",
+        open_id="ou_bob",
+        provenance="sync",
+    )
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    # The real job store needs hermes-agent's `cron` package; this test is about
+    # the auth/owner seam, so record which tenant the handler resolved instead.
+    from hermes_multitenancy import cron_api
+
+    listed_for: list[str] = []
+
+    def fake_list_jobs(profile_name, include_disabled=False):
+        listed_for.append(profile_name)
+        return []
+
+    monkeypatch.setattr(cron_api, "list_jobs", fake_list_jobs)
+
+    run_scoped = "run-scoped-token-for-alice"
+    register_run_broker_scoped_token(
+        token=run_scoped,
+        profile_name="alice_profile",
+        open_id="ou_alice",
+        run_id="run-1",
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            # 1. run-scoped token + a colleague's open_id must NOT reach his jobs.
+            spoofed = await client.get(
+                "/api/run-broker/jobs",
+                params={"user_key": "ou_bob"},
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            spoofed_body = await spoofed.json()
+
+            # 2. Same token with the header form of the spoof.
+            spoofed_header = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": f"Bearer {run_scoped}",
+                    "X-Hermes-Owner-Open-Id": "ou_bob",
+                },
+            )
+
+            # 3. Same token asserting a foreign profile on its own route family.
+            spoofed_profile = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": f"Bearer {run_scoped}",
+                    "X-Hermes-Profile": "bob_profile",
+                },
+            )
+
+            # 3b. The token is pinned to the cron route family: every other
+            # `_authorized`-only handler (agent shares, kanban dispatch, profile
+            # provisioning …) is unreachable with it, even for its own tenant.
+            off_route = await client.get(
+                "/api/run-broker/connectors",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            off_route_kanban = await client.get(
+                "/api/run-broker/kanban/tasks",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+
+            # 4. The token acting as itself, asserting nothing, still works.
+            own = await client.get(
+                "/api/run-broker/jobs",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            own_body = await own.json()
+
+            # 5. The WebUI path (master key + server-stamped owner) is unchanged.
+            webui = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": "Bearer master-key-for-webui",
+                    "X-Hermes-Owner-Open-Id": "ou_bob",
+                },
+            )
+        finally:
+            await client.close()
+            router_mod.override_routing_table(None)
+            unregister_run_broker_scoped_token(run_scoped)
+
+        return (
+            spoofed.status,
+            spoofed_body,
+            spoofed_header.status,
+            spoofed_profile.status,
+            off_route.status,
+            off_route_kanban.status,
+            own.status,
+            own_body,
+            webui.status,
+        )
+
+    (
+        spoofed_status,
+        spoofed_body,
+        spoofed_header_status,
+        spoofed_profile_status,
+        off_route_status,
+        off_route_kanban_status,
+        own_status,
+        own_body,
+        webui_status,
+    ) = asyncio.run(runner())
+
+    assert spoofed_status == 403, spoofed_body
+    assert "jobs" not in spoofed_body
+    assert spoofed_header_status == 403
+    assert spoofed_profile_status == 403
+    assert off_route_status == 401
+    assert off_route_kanban_status == 401
+    assert own_status == 200, own_body
+    assert "jobs" in own_body
+    assert webui_status == 200
+    # The run-scoped token only ever reached its own tenant; the master-key
+    # (WebUI) call still resolves the owner it stamped.
+    assert listed_for == ["alice_profile", "bob_profile"]
+
+
+def test_revoked_run_scoped_token_never_falls_back_to_header_trust(monkeypatch):
+    """A dead run-scoped token must fail closed, not demote to the master path.
+
+    Regression for codex review RBOS-SCOPE-REVOCATION-TOCTOU. `_authorized` runs
+    before a handler `await request.json()`, so a run finishing in between made
+    the second lookup miss; the resolver then treated the caller as a master-key
+    client and honoured its forged `X-Hermes-Owner-Open-Id`. Probed before the
+    fix: `_owner_scoped_tenant` returned ('bob_profile', 'ou_bob') for a token
+    bound to alice.
+    """
+    from types import SimpleNamespace
+
+    import pytest as _pytest
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import (
+        _authorized,
+        _owner_scoped_tenant,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master")
+
+    class Req:
+        path = "/api/run-broker/jobs"
+        headers = {
+            "Authorization": "Bearer scoped",
+            "X-Hermes-Owner-Open-Id": "ou_bob",
+            "X-Hermes-Profile": "bob_profile",
+        }
+        query: dict[str, str] = {}
+
+    class Table:
+        def resolve_owner_root(self, owner):
+            return SimpleNamespace(profile_name="bob_profile") if owner == "ou_bob" else None
+
+        def list_agents_for_owner(self, owner):
+            return []
+
+        def lookup_by_profile_name(self, profile):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: Table())
+
+    register_run_broker_scoped_token(
+        token="scoped", profile_name="alice_profile", open_id="ou_alice", run_id="run"
+    )
+    try:
+        assert _authorized(Req()) is True
+        # The run ends between auth and the handler's tenant resolution.
+        unregister_run_broker_scoped_token("scoped")
+        with _pytest.raises(PermissionError):
+            _owner_scoped_tenant(Req())
+        # And it is no longer authorized at all on a fresh request.
+        assert _authorized(Req()) is False
+    finally:
+        unregister_run_broker_scoped_token("scoped")
+
+
+def test_cron_bridge_key_lookup_has_no_shared_dotenv_fallback(monkeypatch, tmp_path: Path):
+    """The cron bridge must not recover the master key from the shared .env.
+
+    Regression for codex review RBOS-DOTENV-FALLBACK: probed before the fix, this
+    returned 'master-from-dotenv' with both env vars unset — i.e. a child that was
+    deliberately given no broker bearer could read the shared credential back off
+    disk. Only Linux bwrap's file mask was hiding it.
+    """
+    from hermes_multitenancy.cron.run_broker_bridge import _run_broker_key_for_profile
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "HERMES_MULTITENANCY_RUN_BROKER_KEY=master-from-dotenv\n", encoding="utf-8"
+    )
+
+    monkeypatch.delenv("HERMES_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+
+    assert _run_broker_key_for_profile(profile) == ""
+
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "scoped-token-from-env")
+    assert _run_broker_key_for_profile(profile) == "scoped-token-from-env"
+
+
+def test_cron_trigger_end_to_end_over_http_with_run_scoped_token(monkeypatch, tmp_path: Path):
+    """End-to-end: the real cron bridge, over real HTTP, with a run-scoped token.
+
+    This is the functional half of the fix — the 2026-06-10 incident was the
+    sandboxed `cronjob(action=run)` tool failing to authenticate, so locking the
+    credential down must not resurrect it. Drives the actual
+    `trigger_profile_cron_job_via_run_broker` (urllib POST) against a live broker
+    app, then repeats it while asserting a colleague's identity.
+    """
+    from aiohttp.test_utils import TestServer
+
+    from hermes_multitenancy import cron_api, router as router_mod
+    from hermes_multitenancy.cron import run_broker_bridge
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    profile_home = tmp_path / "profiles" / "alice_profile"
+    profile_home.mkdir(parents=True)
+    (tmp_path / "profiles" / "bob_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="alice", profile_name="alice_profile", open_id="ou_alice", provenance="sync")
+    seeded.upsert(user_id="bob", profile_name="bob_profile", open_id="ou_bob", provenance="sync")
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    triggered: list[tuple[str, str]] = []
+
+    def fake_trigger_job(profile_name, job_id):
+        triggered.append((profile_name, job_id))
+        return {"id": job_id, "profile": profile_name}
+
+    monkeypatch.setattr(cron_api, "trigger_job", fake_trigger_job)
+
+    scoped = "run-scoped-token-alice"
+    register_run_broker_scoped_token(
+        token=scoped, profile_name="alice_profile", open_id="ou_alice", run_id="run-1"
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        server = TestServer(
+            create_run_broker_app(mark_seen=lambda _r: True, sandbox_available=lambda: True)
+        )
+        await server.start_server()
+        try:
+            base = f"http://127.0.0.1:{server.port}"
+            # This is exactly what the sandboxed child's env looks like now.
+            monkeypatch.setenv("HERMES_RUN_BROKER_URL", base)
+            monkeypatch.setenv("HERMES_RUN_BROKER_KEY", scoped)
+
+            own = await asyncio.to_thread(
+                run_broker_bridge.trigger_profile_cron_job_via_run_broker,
+                job_id="job-abc",
+                profile_home=profile_home,
+                owner_open_id="ou_alice",
+            )
+
+            spoof_error = ""
+            try:
+                await asyncio.to_thread(
+                    run_broker_bridge.trigger_profile_cron_job_via_run_broker,
+                    job_id="job-abc",
+                    profile_home=tmp_path / "profiles" / "bob_profile",
+                    owner_open_id="ou_bob",
+                )
+            except RuntimeError as exc:
+                spoof_error = str(exc)
+            return own, spoof_error
+        finally:
+            await server.close()
+            router_mod.override_routing_table(None)
+
+    try:
+        own, spoof_error = asyncio.run(runner())
+    finally:
+        unregister_run_broker_scoped_token(scoped)
+
+    # The owner's own cron trigger still works, end to end.
+    assert own["profile"] == "alice_profile"
+    assert triggered == [("alice_profile", "job-abc")]
+    # Asserting a colleague's identity with the same token is refused, and the
+    # colleague's job store is never touched.
+    assert "403" in spoof_error
+    assert triggered == [("alice_profile", "job-abc")]
+
+
+def test_viewer_share_role_token_cannot_mutate_owner_cron(monkeypatch, tmp_path: Path):
+    """A shared-agent `viewer` token is read-only on the owner's cron store.
+
+    Regression for codex review RBOS-SHARED-VIEWER-JOBS-WRITE: the run-scoped
+    token recorded `share_role` but jobs auth ignored it and authorised the whole
+    prefix, so a viewer got 200 on `DELETE /api/run-broker/jobs/job-owner` and
+    really reached `delete_job` on the owner's profile.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import cron_api, router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    (tmp_path / "profiles" / "owner_agent_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="owner",
+        profile_name="owner_agent_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    deleted: list[tuple[str, str]] = []
+    listed: list[str] = []
+
+    monkeypatch.setattr(
+        cron_api, "delete_job", lambda profile, job_id: deleted.append((profile, job_id))
+    )
+    monkeypatch.setattr(
+        cron_api,
+        "list_jobs",
+        lambda profile, include_disabled=False: (listed.append(profile) or []),
+    )
+
+    viewer = "run-scoped-token-viewer"
+    register_run_broker_scoped_token(
+        token=viewer,
+        profile_name="owner_agent_profile",
+        open_id="ou_owner",
+        run_id="run-1",
+        agent_id="agent-1",
+        share_role="viewer",
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _r: True, sandbox_available=lambda: True
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            delete = await client.delete(
+                "/api/run-broker/jobs/job-owner",
+                headers={"Authorization": f"Bearer {viewer}"},
+            )
+            read = await client.get(
+                "/api/run-broker/jobs",
+                headers={"Authorization": f"Bearer {viewer}"},
+            )
+            return delete.status, read.status
+        finally:
+            await client.close()
+            router_mod.override_routing_table(None)
+
+    try:
+        delete_status, read_status = asyncio.run(runner())
+    finally:
+        unregister_run_broker_scoped_token(viewer)
+
+    assert delete_status == 401
+    assert deleted == []          # the owner's job store was never touched
+    assert read_status == 200     # reading stays allowed for a viewer
+    assert listed == ["owner_agent_profile"]
+
+
+# --- POST /api/run-broker/credentials/gitlab -------------------------------
+# 员工提交自己的 GitLab token。这个端点收的是凭据，身份解析是历史事故高发区
+# （2026-08-04 安全评审：run-broker owner 自报 + 共享 Bearer），所以这里逐条钉死
+# 鉴权、身份来源、以及"请求体不能冒充身份"。
+
+
+def _gitlab_app(monkeypatch, *, capture=None, raises=None, resolve_to=None):
+    """起一个只关心 gitlab 端点的 broker app，并把入库逻辑换成探针。"""
+    from hermes_multitenancy import webui_broker_server as mod
+
+    def fake_submit(**kwargs):
+        if capture is not None:
+            capture.update(kwargs)
+        if raises is not None:
+            raise raises
+        return {"stored": True, "profile_name": kwargs.get("profile_name"),
+                "expires_at": 4102444800000, "tier": kwargs.get("tier"),
+                "scopes": ["read_api", "read_repository"]}
+
+    import hermes_multitenancy.gitlab_token_intake as intake
+    monkeypatch.setattr(intake, "submit_personal_token", fake_submit)
+    monkeypatch.setattr(mod, "_shared_home_from_env", lambda: pathlib.Path("/tmp/shared-home-probe"))
+    if resolve_to is not None:
+        # 真实解析器要求 owner 有 sync-root profile，测试环境没有 —— 不桩掉的话请求会
+        # 停在 403，后面的断言全部空过（本轮第一版就是这么假绿的）。
+        monkeypatch.setattr(mod, "_resolve_owner_scoped_profile", lambda request, payload: (resolve_to, None))
+    return mod.create_run_broker_app(
+        dispatch_agent=lambda request: "",
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+
+def _run(coro_factory):
+    import asyncio
+    return asyncio.run(coro_factory())
+
+
+def test_gitlab_token_endpoint_rejects_a_request_with_no_owner_identity(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    captured = {}
+    app = _gitlab_app(monkeypatch, capture=captured)
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                json={"token": "glpat-x", "expires_on": "2030-01-01", "tier": "read"},
+            )
+            body = await res.json()
+        finally:
+            await client.close()
+        # 无身份必须拒，且绝不回落到任何默认 profile
+        assert res.status in (401, 403), body
+        assert not captured, "无身份时不得调用入库逻辑"
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_ignores_identity_fields_smuggled_in_the_body(monkeypatch):
+    """请求体里塞 profile_name/open_id 试图冒充别人 —— 必须完全不生效。
+
+    身份只从 X-Hermes-Owner-Open-Id 走 _resolve_owner_scoped_profile（且传空 payload）。
+    这条是本端点最该守住的边界：BFF 已在上游把身份字段丢掉，broker 若从 body 取就等于
+    把那道边界拆了。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    captured = {}
+    app = _gitlab_app(monkeypatch, capture=captured, resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "token": "glpat-x", "expires_on": "2030-01-01", "tier": "read",
+                    "profile_name": "victim", "open_id": "ou_victim",
+                },
+            )
+            await res.text()
+        finally:
+            await client.close()
+        # 无论放行与否，都绝不能拿 body 里的 victim 去入库
+        assert captured.get("profile_name") == "owner_profile", captured
+        assert captured.get("open_id") is None
+        assert captured.get("credential_subject") == "ou_owner"
+        # 老客户端仍会在 payload 里带 expires_on；端点必须静默丢掉它，
+        # 到期日只有一个来源 —— GitLab 上 token 自己那一行。
+        assert "expires_on" not in captured, captured
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_relays_the_employee_facing_rejection_reason(monkeypatch):
+    """TokenRejected 必须原样回给员工，而不是变成 500/无法解析。
+
+    今天 sunke 撞到的就是链路错（403 → 404「无法解析的响应」），那种报错对他毫无用处。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.gitlab_token_intake import TokenRejected
+
+    reason = "你选了只读，但这个 token 带 api 权限，比你以为的大。"
+    app = _gitlab_app(monkeypatch, raises=TokenRejected(reason), resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={"token": "glpat-x", "expires_on": "2030-01-01", "tier": "read"},
+            )
+            body = await res.json()
+        finally:
+            await client.close()
+        assert res.status == 400, body
+        assert body.get("error") == reason
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_never_echoes_the_token(monkeypatch):
+    """回执与错误信息都不得带 token 明文。"""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    secret = "glpat-super-secret-value"
+    app = _gitlab_app(monkeypatch, resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={"token": secret, "expires_on": "2030-01-01", "tier": "read"},
+            )
+            text = await res.text()
+        finally:
+            await client.close()
+        assert res.status == 200, text
+        assert secret not in text, "响应体里不得出现 token 明文"
+
+    _run(runner)

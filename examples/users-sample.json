@@ -1,0 +1,14 @@
+[
+  {
+    "user_id": "alice",
+    "profile_name": "alice_profile",
+    "open_id": "ou_REPLACE_WITH_ALICE_OPEN_ID",
+    "union_id": "on_REPLACE_WITH_ALICE_UNION_ID"
+  },
+  {
+    "user_id": "bob",
+    "profile_name": "bob_profile",
+    "open_id": "ou_REPLACE_WITH_BOB_OPEN_ID",
+    "union_id": "on_REPLACE_WITH_BOB_UNION_ID"
+  }
+]

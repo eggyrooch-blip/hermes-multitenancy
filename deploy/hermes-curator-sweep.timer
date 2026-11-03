@@ -1,0 +1,11 @@
+# 每周日低峰跑一次（排在 kep-sync / lark-skill-sync 之后，随机错峰）。
+[Unit]
+Description=Run the Hermes per-tenant curator sweep weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
